@@ -139,6 +139,11 @@ interface Filter extends Closeable {
 
     abstract ServerInfo serverInfo();
 
+    @Nullable
+    abstract Integer recursionDepth();
+
+    abstract Builder toBuilder();
+
     static Builder builder() {
       return new AutoValue_Filter_FilterConfigParseContext.Builder();
     }
@@ -148,6 +153,8 @@ interface Filter extends Closeable {
       abstract Builder bootstrapInfo(BootstrapInfo info);
 
       abstract Builder serverInfo(ServerInfo info);
+
+      abstract Builder recursionDepth(Integer depth);
 
       abstract FilterConfigParseContext build();
     }

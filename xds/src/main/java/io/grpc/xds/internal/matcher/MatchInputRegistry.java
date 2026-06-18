@@ -35,7 +35,11 @@ final class MatchInputRegistry {
     if (instance == null) {
       instance = newRegistry().register(
           new HeaderMatchInput.Provider(),
-          new HttpAttributesCelMatchInput.Provider()
+          new HttpAttributesCelMatchInput.Provider(),
+          new NetworkMatchInputs.SourceIpInput.Provider(),
+          new NetworkMatchInputs.SourcePortInput.Provider(),
+          new NetworkMatchInputs.DirectSourceIpInput.Provider(),
+          new NetworkMatchInputs.ServerNameInput.Provider()
       );
     }
     return instance;

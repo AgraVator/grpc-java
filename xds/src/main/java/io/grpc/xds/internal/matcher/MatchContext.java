@@ -18,82 +18,126 @@ package io.grpc.xds.internal.matcher;
 
 import com.google.common.base.Preconditions;
 import io.grpc.Metadata;
+import javax.annotation.Nullable;
 
-final class MatchContext {
+public final class MatchContext {
   private final Metadata metadata;
+  @Nullable 
   private final String path;
+  @Nullable 
   private final String host;
+  @Nullable 
   private final String method;
+  @Nullable 
   private final String id;
+  private final io.grpc.Attributes attributes;
+  @Nullable
+  private final io.grpc.CallOptions callOptions;
 
-  MatchContext(Metadata metadata, String path,
-      String host, String method,
-      String id) {
+  public MatchContext(Metadata metadata, @Nullable String path,
+      @Nullable String host, @Nullable String method,
+      @Nullable String id) {
+    this(metadata, path, host, method, id, io.grpc.Attributes.EMPTY, null);
+  }
+
+  public MatchContext(Metadata metadata, @Nullable String path,
+      @Nullable String host, @Nullable String method,
+      @Nullable String id, io.grpc.Attributes attributes,
+      @Nullable io.grpc.CallOptions callOptions) {
     this.metadata = Preconditions.checkNotNull(metadata, "metadata");
     this.path = path;
     this.host = host;
     this.method = method;
     this.id = id;
+    this.attributes = attributes != null ? attributes : io.grpc.Attributes.EMPTY;
+    this.callOptions = callOptions;
   }
 
-  Metadata getMetadata() {
+  public Metadata getMetadata() {
     return metadata;
   }
   
-  String getPath() {
+  @Nullable
+  public String getPath() {
     return path;
   }
   
-  String getHost() {
+  @Nullable
+  public String getHost() {
     return host;
   }
   
-  String getMethod() {
+  @Nullable
+  public String getMethod() {
     return method;
   }
   
-  String getId() {
+  @Nullable
+  public String getId() {
     return id;
   }
 
-  static Builder newBuilder() {
+  public io.grpc.Attributes getAttributes() {
+    return attributes;
+  }
+
+  @Nullable
+  public io.grpc.CallOptions getCallOptions() {
+    return callOptions;
+  }
+
+  public static Builder newBuilder() {
     return new Builder();
   }
 
-  static final class Builder {
+  public static final class Builder {
     private Metadata metadata = new Metadata();
     private String path;
     private String host;
     private String method;
     private String id;
+    private io.grpc.Attributes attributes = io.grpc.Attributes.EMPTY;
+    private io.grpc.CallOptions callOptions;
 
-    Builder setMetadata(Metadata metadata) {
+    public Builder setMetadata(Metadata metadata) {
       this.metadata = metadata;
       return this;
     }
 
-    Builder setPath(String path) {
+    public Builder setPath(String path) {
       this.path = path;
       return this;
     }
 
-    Builder setHost(String host) {
+    public Builder setHost(String host) {
       this.host = host;
       return this;
     }
 
-    Builder setMethod(String method) {
+    public Builder setMethod(String method) {
       this.method = method;
       return this;
     }
 
-    Builder setId(String id) {
+    public Builder setId(String id) {
       this.id = id;
       return this;
     }
 
-    MatchContext build() {
-      return new MatchContext(metadata, path, host, method, id);
+    public Builder setAttributes(io.grpc.Attributes attributes) {
+      if (attributes != null) {
+        this.attributes = attributes;
+      }
+      return this;
+    }
+
+    public Builder setCallOptions(io.grpc.CallOptions callOptions) {
+      this.callOptions = callOptions;
+      return this;
+    }
+
+    public MatchContext build() {
+      return new MatchContext(metadata, path, host, method, id, attributes, callOptions);
     }
   }
 }

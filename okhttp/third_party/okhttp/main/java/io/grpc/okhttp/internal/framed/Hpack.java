@@ -490,7 +490,7 @@ final class Hpack {
           out.writeByte(0x40);
           writeByteString(name);
           writeByteString(value);
-          insertIntoDynamicTable(new io.grpc.okhttp.internal.framed.Header(name, value));
+          insertIntoDynamicTable(canonicalHeader(header, name, value));
         } else if (name.startsWith(PSEUDO_PREFIX)
             && !io.grpc.okhttp.internal.framed.Header.TARGET_AUTHORITY.equals(name)
             && !io.grpc.okhttp.internal.framed.Header.TARGET_PATH.equals(name)) {
@@ -504,9 +504,23 @@ final class Hpack {
           // Literal Header Field with Incremental Indexing - Indexed Name.
           writeInt(headerNameIndex, PREFIX_6_BITS, 0x40);
           writeByteString(value);
-          insertIntoDynamicTable(new io.grpc.okhttp.internal.framed.Header(name, value));
+          insertIntoDynamicTable(canonicalHeader(header, name, value));
         }
       }
+    }
+
+    /**
+     * Returns {@code header} as-is when its name is already the lowercase {@code name} used for
+     * indexing, avoiding an extra Header allocation on the common path where header names are
+     * already lowercase (e.g. gRPC's generated headers and the {@code :path}/{@code :authority}
+     * pseudo headers). A value comparison detects that case while also avoiding an allocation if
+     * an equivalent lowercase name is represented by a different {@link ByteString} instance.
+     */
+    private static io.grpc.okhttp.internal.framed.Header canonicalHeader(
+        io.grpc.okhttp.internal.framed.Header header, ByteString name, ByteString value) {
+      return name.equals(header.name)
+          ? header
+          : new io.grpc.okhttp.internal.framed.Header(name, value);
     }
 
     // http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-12#section-4.1.1

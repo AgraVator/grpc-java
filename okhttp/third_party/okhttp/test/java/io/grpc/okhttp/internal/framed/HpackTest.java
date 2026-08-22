@@ -18,6 +18,7 @@ package io.grpc.okhttp.internal.framed;
 
 import static okio.ByteString.decodeHex;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -1138,6 +1139,28 @@ public class HpackTest {
     hpackWriter.writeHeaders(headerEntries(":authority", "bar.com"));
     assertBytes(0xbe);
     assertEquals(3, hpackWriter.dynamicTableHeaderCount);
+  }
+
+  @Test
+  public void mixedCaseHeaderNameIndexedOnRepeat() throws IOException {
+    hpackWriter.writeHeaders(Arrays.asList(new Header("FoO", "BaR")));
+    assertBytes(0x40, 3, 'f', 'o', 'o', 3, 'B', 'a', 'R');
+    assertEquals(1, hpackWriter.dynamicTableHeaderCount);
+
+    // Even though the header name is mixed case again, the dynamic table entry was stored
+    // with the lowercase name, so the repeat is emitted as an indexed reference.
+    hpackWriter.writeHeaders(Arrays.asList(new Header("FoO", "BaR")));
+    assertBytes(0xbe);
+    assertEquals(1, hpackWriter.dynamicTableHeaderCount);
+  }
+
+  @Test
+  public void lowercaseHeaderIsReusedInDynamicTable() throws IOException {
+    Header header = new Header("custom-key", "custom-value");
+
+    hpackWriter.writeHeaders(Arrays.asList(header));
+
+    assertSame(header, hpackWriter.dynamicTable[hpackWriter.dynamicTable.length - 1]);
   }
 
   @Test

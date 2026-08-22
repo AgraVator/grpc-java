@@ -18,6 +18,7 @@ package io.grpc.okhttp.internal.framed;
 
 import static okio.ByteString.decodeHex;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -1151,6 +1152,15 @@ public class HpackTest {
     hpackWriter.writeHeaders(Arrays.asList(new Header("FoO", "BaR")));
     assertBytes(0xbe);
     assertEquals(1, hpackWriter.dynamicTableHeaderCount);
+  }
+
+  @Test
+  public void lowercaseHeaderIsReusedInDynamicTable() throws IOException {
+    Header header = new Header("custom-key", "custom-value");
+
+    hpackWriter.writeHeaders(Arrays.asList(header));
+
+    assertSame(header, hpackWriter.dynamicTable[hpackWriter.dynamicTable.length - 1]);
   }
 
   @Test

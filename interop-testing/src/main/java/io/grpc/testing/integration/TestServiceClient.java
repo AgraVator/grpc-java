@@ -317,14 +317,20 @@ public class TestServiceClient {
   @VisibleForTesting
   @IgnoreJRERequirement // OpenTelemetry uses Java 8+ APIs
   void setUp() {
+    System.out.println("[OTEL_DEBUG][JAVA_CLIENT] setUp called. enableOpentelemetry=" + enableOpentelemetry
+        + ", otelCollectorAddress=" + otelCollectorAddress);
     if (enableOpentelemetry) {
+      System.out.println("[OTEL_DEBUG][JAVA_CLIENT] Calling OpenTelemetryUtil.setupOpenTelemetry...");
       this.openTelemetrySdk = OpenTelemetryUtil.setupOpenTelemetry(otelCollectorAddress);
+    } else {
+      System.out.println("[OTEL_DEBUG][JAVA_CLIENT] OpenTelemetry is not enabled.");
     }
     tester.setUp();
   }
 
   private synchronized void tearDown() {
     try {
+      System.out.println("[OTEL_DEBUG][JAVA_CLIENT] tearDown called.");
       tester.tearDown();
       if (customBackendMetricsLoadBalancerProvider != null) {
         LoadBalancerRegistry.getDefaultRegistry()

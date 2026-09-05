@@ -166,8 +166,13 @@ public class TestServiceServer {
   @VisibleForTesting
   @IgnoreJRERequirement // OpenTelemetry uses Java 8+ APIs
   void start() throws Exception {
+    System.out.println("[OTEL_DEBUG][JAVA_SERVER] start called. enableOpentelemetry=" + enableOpentelemetry
+        + ", otelCollectorAddress=" + otelCollectorAddress);
     if (enableOpentelemetry) {
+      System.out.println("[OTEL_DEBUG][JAVA_SERVER] Calling OpenTelemetryUtil.setupOpenTelemetry...");
       this.openTelemetrySdk = OpenTelemetryUtil.setupOpenTelemetry(otelCollectorAddress);
+    } else {
+      System.out.println("[OTEL_DEBUG][JAVA_SERVER] OpenTelemetry is not enabled.");
     }
     executor = Executors.newSingleThreadScheduledExecutor();
     ServerCredentials serverCreds;

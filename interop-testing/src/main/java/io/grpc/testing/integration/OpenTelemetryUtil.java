@@ -40,6 +40,7 @@ public final class OpenTelemetryUtil {
    */
   @IgnoreJRERequirement // OpenTelemetry uses Java 8+ APIs
   public static OpenTelemetrySdk setupOpenTelemetry(String otelCollectorAddress) {
+    System.out.println("[OTEL_DEBUG][JAVA] >>> setupOpenTelemetry called with otelCollectorAddress=" + otelCollectorAddress);
     AutoConfiguredOpenTelemetrySdkBuilder sdkBuilder =
         AutoConfiguredOpenTelemetrySdk.builder();
     Map<String, String> properties = new HashMap<>();
@@ -49,21 +50,31 @@ public final class OpenTelemetryUtil {
     properties.put("otel.bsp.schedule.delay", "100");
     if (otelCollectorAddress != null && !otelCollectorAddress.isEmpty()) {
       String endpoint = otelCollectorAddress;
+      System.out.println("[OTEL_DEBUG][JAVA] Processing otelCollectorAddress: " + endpoint);
       if (endpoint.startsWith("https://")) {
         endpoint = "http://" + endpoint.substring(8);
+        System.out.println("[OTEL_DEBUG][JAVA] Detected https:// prefix. Converted to: " + endpoint);
       } else if (!endpoint.startsWith("http://")) {
         endpoint = "http://" + endpoint;
+        System.out.println("[OTEL_DEBUG][JAVA] No scheme prefix. Added http:// -> " + endpoint);
+      } else {
+        System.out.println("[OTEL_DEBUG][JAVA] Detected http:// prefix as-is: " + endpoint);
       }
       properties.put("otel.exporter.otlp.endpoint", endpoint);
+    } else {
+      System.out.println("[OTEL_DEBUG][JAVA] otelCollectorAddress was null/empty. Relying on default localhost:4317 / env var.");
     }
+    System.out.println("[OTEL_DEBUG][JAVA] Building AutoConfiguredOpenTelemetrySdk with properties: " + properties);
     sdkBuilder.addPropertiesSupplier(() -> properties);
     AutoConfiguredOpenTelemetrySdk autoSdk = sdkBuilder.build();
     OpenTelemetrySdk openTelemetrySdk = autoSdk.getOpenTelemetrySdk();
+    System.out.println("[OTEL_DEBUG][JAVA] Successfully built OpenTelemetrySdk: " + openTelemetrySdk);
     GrpcOpenTelemetry.Builder grpcOpentelemetryBuilder = GrpcOpenTelemetry.newBuilder()
         .sdk(openTelemetrySdk);
     InternalGrpcOpenTelemetry.enableTracing(grpcOpentelemetryBuilder, true);
     GrpcOpenTelemetry grpcOpenTelemetry = grpcOpentelemetryBuilder.build();
     grpcOpenTelemetry.registerGlobal();
+    System.out.println("[OTEL_DEBUG][JAVA] Successfully registered GrpcOpenTelemetry globally!");
     return openTelemetrySdk;
   }
 }

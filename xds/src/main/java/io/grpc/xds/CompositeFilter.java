@@ -55,6 +55,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import javax.annotation.Nullable;
 
@@ -231,16 +232,10 @@ final class CompositeFilter implements Filter {
     }
 
     private boolean validateActionTypeUrl(String typeUrl) {
-      if ("type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter"
-          .equals(typeUrl)) {
-        return true;
-      }
-      if ("type.googleapis.com/envoy.extensions.filters.http.composite.v3.ExecuteFilterAction"
-          .equals(typeUrl)) {
-        return true;
-      }
-      Filter.Provider provider = registryLookup.apply(typeUrl);
-      return provider != null;
+      return "type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter"
+          .equals(typeUrl)
+          || "type.googleapis.com/envoy.extensions.filters.http.composite.v3.ExecuteFilterAction"
+          .equals(typeUrl);
     }
 
     private void collectDelegates(Matcher matcher, Map<String, FilterDelegate> map,
@@ -296,7 +291,8 @@ final class CompositeFilter implements Filter {
           return new FilterDelegate(Collections.emptyList(), null);
         }
         if (!actionAny.is(ExecuteFilterAction.class)) {
-          return null;
+          throw new IllegalArgumentException(
+              "Expected ExecuteFilterAction or SkipFilter but got: " + actionAny.getTypeUrl());
         }
         ExecuteFilterAction executeAction = actionAny.unpack(ExecuteFilterAction.class);
         FractionalPercent samplePercent = executeAction.hasSamplePercent()
@@ -310,7 +306,8 @@ final class CompositeFilter implements Filter {
           childConfigs.add(executeAction.getTypedConfig());
         }
         if (childConfigs.isEmpty()) {
-          return null;
+          throw new IllegalArgumentException(
+              "ExecuteFilterAction must specify either typed_config or a non-empty filter_chain");
         }
         List<DelegateEntry> delegates = new ArrayList<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
@@ -483,6 +480,7 @@ final class CompositeFilter implements Filter {
             .setMetadata(headers)
             .setAttributes(call.getAttributes())
             .setMethod(call.getMethodDescriptor().getFullMethodName())
+            .setPath("/" + call.getMethodDescriptor().getFullMethodName())
             .setHost(call.getAuthority())
             .build();
 
@@ -515,8 +513,10 @@ final class CompositeFilter implements Filter {
                       new Metadata());
                   return new ServerCall.Listener<ReqT>() {};
                 }
+                MetricRecorder recorder =
+                    metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
                 Filter filter = entry.provider.newInstance(
-                    FilterContext.create(entry.name, metricsRecorder));
+                    FilterContext.create(entry.name, recorder));
                 filters.add(filter);
                 ServerInterceptor interceptor = filter.buildServerInterceptor(entry.config, null);
                 if (interceptor != null) {
@@ -542,14 +542,26 @@ final class CompositeFilter implements Filter {
                 }
               };
             }
-            ServerCall.Listener<ReqT> listener = wrapped.startCall(call, headers);
+            final AtomicBoolean closed = new AtomicBoolean();
+            final Runnable doClose = () -> {
+              if (closed.compareAndSet(false, true)) {
+                closeAll(filters);
+              }
+            };
+            ServerCall.Listener<ReqT> listener;
+            try {
+              listener = wrapped.startCall(call, headers);
+            } catch (Throwable t) {
+              doClose.run();
+              throw t;
+            }
             return new SimpleForwardingServerCallListener<ReqT>(listener) {
               @Override
               public void onCancel() {
                 try {
                   super.onCancel();
                 } finally {
-                  closeAll(filters);
+                  doClose.run();
                 }
               }
 
@@ -558,7 +570,7 @@ final class CompositeFilter implements Filter {
                 try {
                   super.onComplete();
                 } finally {
-                  closeAll(filters);
+                  doClose.run();
                 }
               }
             };
@@ -599,8 +611,22 @@ final class CompositeFilter implements Filter {
   }
 
   private static void closeAll(Iterable<Filter> filters) {
+    Throwable firstException = null;
     for (Filter f : filters) {
-      f.close();
+      try {
+        f.close();
+      } catch (Throwable t) {
+        if (firstException == null) {
+          firstException = t;
+        } else {
+          firstException.addSuppressed(t);
+        }
+      }
+    }
+    if (firstException instanceof RuntimeException) {
+      throw (RuntimeException) firstException;
+    } else if (firstException instanceof Error) {
+      throw (Error) firstException;
     }
   }
 
@@ -614,6 +640,7 @@ final class CompositeFilter implements Filter {
     private final ScheduledExecutorService scheduler;
     @Nullable
     private final MetricRecorder metricsRecorder;
+    private final Object lock = new Object();
     private ClientCall<ReqT, RespT> delegate;
     private boolean started;
     private Status cancelStatus;
@@ -630,51 +657,94 @@ final class CompositeFilter implements Filter {
       this.metricsRecorder = metricsRecorder;
     }
 
+    private static final ClientCall<Object, Object> NOOP_CALL =
+        new ClientCall<Object, Object>() {
+          @Override
+          public void start(Listener<Object> responseListener, Metadata headers) {}
+
+          @Override
+          public void request(int numMessages) {}
+
+          @Override
+          public void cancel(@Nullable String message, @Nullable Throwable cause) {}
+
+          @Override
+          public void halfClose() {}
+
+          @Override
+          public void sendMessage(Object message) {}
+        };
+
+    @SuppressWarnings("unchecked")
+    private static <ReqT, RespT> ClientCall<ReqT, RespT> noopCall() {
+      return (ClientCall<ReqT, RespT>) NOOP_CALL;
+    }
+
     @Override
     protected ClientCall<ReqT, RespT> delegate() {
-      Preconditions.checkState(delegate != null, "Not started");
-      return delegate;
+      synchronized (lock) {
+        Preconditions.checkState(started, "Not started");
+        return delegate != null ? delegate : noopCall();
+      }
     }
 
     @Override
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
-      if (delegate != null) {
-        delegate.cancel(message, cause);
-      } else {
-        cancelStatus = Status.CANCELLED.withDescription(message).withCause(cause);
+      ClientCall<ReqT, RespT> callToCancel = null;
+      synchronized (lock) {
+        if (cancelStatus == null) {
+          cancelStatus = Status.CANCELLED.withDescription(message).withCause(cause);
+        }
+        if (delegate != null) {
+          callToCancel = delegate;
+        }
+      }
+      if (callToCancel != null) {
+        callToCancel.cancel(message, cause);
       }
     }
 
     @Override
     public void start(Listener<RespT> responseListener, Metadata headers) {
-      Preconditions.checkState(!started, "Already started");
-      started = true;
+      synchronized (lock) {
+        Preconditions.checkState(!started, "Already started");
+        started = true;
 
-      if (cancelStatus != null) {
-        responseListener.onClose(cancelStatus, new Metadata());
-        return;
+        if (cancelStatus != null) {
+          delegate = noopCall();
+          responseListener.onClose(cancelStatus, new Metadata());
+          return;
+        }
       }
 
+      String host = callOptions.getAuthority() != null
+          ? callOptions.getAuthority() : next.authority();
       MatchContext context = MatchContext.newBuilder()
           .setMetadata(headers)
           .setAttributes(Attributes.EMPTY)
           .setCallOptions(callOptions)
           .setMethod(method.getFullMethodName())
+          .setPath("/" + method.getFullMethodName())
+          .setHost(host)
           .build();
 
       MatchResult matchResult = matcher.match(context);
       if (matchResult == null || !matchResult.matched) {
+        synchronized (lock) {
+          delegate = noopCall();
+        }
         responseListener.onClose(
             Status.UNAVAILABLE.withDescription("Composite filter: no match found in matcher tree"),
             new Metadata());
         return;
       }
 
-      List<FilterDelegate> filterDelegates = resolveDelegates(matchResult, delegatesMap);
-      if (!filterDelegates.isEmpty()) {
-        List<ClientInterceptor> interceptors = new ArrayList<>();
-        List<Filter> filters = new ArrayList<>();
-        try {
+      final List<Filter> filters = new ArrayList<>();
+      ClientCall<ReqT, RespT> realCall = null;
+      try {
+        List<FilterDelegate> filterDelegates = resolveDelegates(matchResult, delegatesMap);
+        if (!filterDelegates.isEmpty()) {
+          List<ClientInterceptor> interceptors = new ArrayList<>();
           for (FilterDelegate filterDelegate : filterDelegates) {
             if (!filterDelegate.shouldExecute()) {
               continue;
@@ -682,14 +752,19 @@ final class CompositeFilter implements Filter {
             for (DelegateEntry entry : filterDelegate.delegates) {
               if (!entry.provider.isClientFilter()) {
                 closeAll(filters);
+                synchronized (lock) {
+                  delegate = noopCall();
+                }
                 responseListener.onClose(
                     Status.UNAVAILABLE.withDescription(
                         "Filter " + entry.name + " is not supported on client side"),
                     new Metadata());
                 return;
               }
+              MetricRecorder recorder =
+                  metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
               Filter filter = entry.provider.newInstance(
-                  FilterContext.create(entry.name, metricsRecorder));
+                  FilterContext.create(entry.name, recorder));
               filters.add(filter);
               ClientInterceptor interceptor =
                   filter.buildClientInterceptor(entry.config, null, scheduler);
@@ -698,32 +773,43 @@ final class CompositeFilter implements Filter {
               }
             }
           }
-        } catch (Throwable t) {
-          closeAll(filters);
-          throw t;
-        }
 
-        if (!interceptors.isEmpty()) {
-          delegate = ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);
-          responseListener = new SimpleForwardingClientCallListener<RespT>(responseListener) {
-            @Override
-            public void onClose(Status status, Metadata trailers) {
-              try {
-                super.onClose(status, trailers);
-              } finally {
-                closeAll(filters);
+          if (!interceptors.isEmpty()) {
+            realCall =
+                ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);
+            responseListener = new SimpleForwardingClientCallListener<RespT>(responseListener) {
+              @Override
+              public void onClose(Status status, Metadata trailers) {
+                try {
+                  super.onClose(status, trailers);
+                } finally {
+                  closeAll(filters);
+                }
               }
-            }
-          };
-        } else {
-          closeAll(filters);
+            };
+          } else {
+            closeAll(filters);
+          }
         }
-      }
 
-      if (delegate == null) {
-        delegate = next.newCall(method, callOptions);
+        if (realCall == null) {
+          realCall = next.newCall(method, callOptions);
+        }
+
+        synchronized (lock) {
+          if (cancelStatus != null) {
+            closeAll(filters);
+            delegate = noopCall();
+            responseListener.onClose(cancelStatus, new Metadata());
+            return;
+          }
+          delegate = realCall;
+        }
+        realCall.start(responseListener, headers);
+      } catch (Throwable t) {
+        closeAll(filters);
+        throw t;
       }
-      delegate.start(responseListener, headers);
     }
   }
 }

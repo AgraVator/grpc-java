@@ -165,9 +165,10 @@ interface Filter extends Closeable {
   abstract static class FilterContext {
     abstract String filterName();
 
+    @Nullable
     abstract MetricRecorder metricsRecorder();
 
-    static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
+    static FilterContext create(String filterName, @Nullable MetricRecorder metricsRecorder) {
       return new AutoValue_Filter_FilterContext(filterName, metricsRecorder);
     }
   }

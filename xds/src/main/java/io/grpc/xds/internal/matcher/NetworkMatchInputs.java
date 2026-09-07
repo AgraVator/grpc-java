@@ -38,7 +38,10 @@ final class NetworkMatchInputs {
     public String apply(MatchContext context) {
       SocketAddress addr = context.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
       if (addr instanceof InetSocketAddress) {
-        return ((InetSocketAddress) addr).getAddress().getHostAddress();
+        InetSocketAddress inetAddr = (InetSocketAddress) addr;
+        if (inetAddr.getAddress() != null) {
+          return inetAddr.getAddress().getHostAddress();
+        }
       }
       return null;
     }
@@ -103,7 +106,10 @@ final class NetworkMatchInputs {
     public String apply(MatchContext context) {
       SocketAddress addr = context.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
       if (addr instanceof InetSocketAddress) {
-        return ((InetSocketAddress) addr).getAddress().getHostAddress();
+        InetSocketAddress inetAddr = (InetSocketAddress) addr;
+        if (inetAddr.getAddress() != null) {
+          return inetAddr.getAddress().getHostAddress();
+        }
       }
       return null;
     }
@@ -140,9 +146,11 @@ final class NetworkMatchInputs {
       if (session instanceof javax.net.ssl.ExtendedSSLSession) {
         javax.net.ssl.ExtendedSSLSession extSession = (javax.net.ssl.ExtendedSSLSession) session;
         List<SNIServerName> names = extSession.getRequestedServerNames();
-        for (SNIServerName name : names) {
-          if (name.getType() == StandardConstants.SNI_HOST_NAME && name instanceof SNIHostName) {
-            return ((SNIHostName) name).getAsciiName();
+        if (names != null) {
+          for (SNIServerName name : names) {
+            if (name.getType() == StandardConstants.SNI_HOST_NAME && name instanceof SNIHostName) {
+              return ((SNIHostName) name).getAsciiName();
+            }
           }
         }
       }

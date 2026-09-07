@@ -1174,7 +1174,16 @@ public class CompositeFilterTest {
     listener.onComplete();
     verify(fakeFilter).close();
 
+    // Idempotent: onCancel after onComplete does not double-close
     listener.onCancel();
+    verify(fakeFilter, times(1)).close();
+
+    // Separate call: onCancel closes filters
+    ServerCall call2 = mock(ServerCall.class);
+    when(call2.getAttributes()).thenReturn(io.grpc.Attributes.EMPTY);
+    when(call2.getMethodDescriptor()).thenReturn(createMockMethod());
+    ServerCall.Listener listener2 = interceptor.interceptCall(call2, headers, next);
+    listener2.onCancel();
     verify(fakeFilter, times(2)).close();
   }
 
@@ -1230,5 +1239,390 @@ public class CompositeFilterTest {
 
     when(mockRandom.nextDouble()).thenReturn(0.6);
     assertThat(delegate.shouldExecute()).isFalse();
+  }
+
+  @Test
+  public void filterRegistry_compositeFilterRegistered() {
+    FilterRegistry registry = FilterRegistry.getDefaultRegistry();
+    Filter.Provider provider1 = registry.get(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER);
+    assertThat(provider1).isInstanceOf(CompositeFilter.Provider.class);
+    Filter.Provider provider2 =
+        registry.get(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE);
+    assertThat(provider2).isInstanceOf(CompositeFilter.Provider.class);
+  }
+
+  @Test
+  public void clientInterceptor_streamingCall_delegatesAllMethods() {
+    Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
+            .build())
+        .build();
+
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    ClientCall childCall = mock(ClientCall.class);
+    when(fakeClientInterceptor.interceptCall(any(), any(), any())).thenReturn(childCall);
+
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+
+    ClientCall.Listener responseListener = mock(ClientCall.Listener.class);
+    call.start(responseListener, headers);
+
+    ArgumentCaptor<ClientCall.Listener> listenerCaptor =
+        ArgumentCaptor.forClass(ClientCall.Listener.class);
+    verify(childCall).start(listenerCaptor.capture(), eq(headers));
+
+    // Test streaming call methods delegation
+    call.request(5);
+    verify(childCall).request(5);
+
+    call.sendMessage(null);
+    verify(childCall).sendMessage(null);
+
+    call.setMessageCompression(true);
+    verify(childCall).setMessageCompression(true);
+
+    call.halfClose();
+    verify(childCall).halfClose();
+
+    // Test response listener delegation
+    ClientCall.Listener capturedListener = listenerCaptor.getValue();
+    Metadata respHeaders = new Metadata();
+    capturedListener.onHeaders(respHeaders);
+    verify(responseListener).onHeaders(respHeaders);
+
+    capturedListener.onMessage(null);
+    verify(responseListener).onMessage(null);
+
+    Metadata trailers = new Metadata();
+    capturedListener.onClose(Status.OK, trailers);
+    verify(responseListener).onClose(Status.OK, trailers);
+
+    // Verify filter resources cleaned up
+    verify(fakeFilter).close();
+  }
+
+  @Test
+  public void clientInterceptor_unaryCall_methodsSafeAfterNoMatch() {
+    Matcher matcher = Matcher.newBuilder().build();
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+    Metadata headers = new Metadata();
+    call.start(listener, headers);
+
+    ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+    verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+    assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+
+    // Stub call sequence after start() must not throw IllegalStateException("Not started")
+    call.request(1);
+    call.sendMessage(null);
+    call.halfClose();
+    call.cancel("cancel", null);
+  }
+
+  @Test
+  public void clientInterceptor_unaryCall_methodsSafeAfterUnsupportedSideChildFilter() {
+    Matcher.OnMatch matchAction = createExecuteAction("unsupported", FAKE_UNSUPPORTED_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
+            .build())
+        .build();
+
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+    call.start(listener, headers);
+
+    ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+    verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+    assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+
+    // Subsequent calls from stubs must be safe no-ops
+    call.request(1);
+    call.sendMessage(null);
+    call.halfClose();
+    call.cancel("cancel", null);
+  }
+
+  @Test
+  public void clientInterceptor_unaryCall_methodsSafeAfterCancelledBeforeStart() {
+    CompositeFilter filter = newFilter("composite");
+    UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+    ClientInterceptor interceptor = filter.buildClientInterceptor(
+        new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    call.cancel("cancelled before start", null);
+
+    ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+    call.start(listener, new Metadata());
+
+    ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+    verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+    assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
+
+    // Subsequent calls from stubs must be safe no-ops
+    call.request(1);
+    call.sendMessage(null);
+    call.halfClose();
+  }
+
+  @Test
+  public void filterContext_passesFilterNameAndMetricsRecorderToChild() {
+    Matcher.OnMatch matchAction = createExecuteAction("my_child_filter", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
+            .build())
+        .build();
+
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    MetricRecorder expectedRecorder = mock(MetricRecorder.class);
+    CompositeFilter filter = new CompositeFilter(expectedRecorder);
+    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    when(fakeClientInterceptor.interceptCall(any(), any(), any()))
+        .thenReturn(mock(ClientCall.class));
+
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+    call.start(mock(ClientCall.Listener.class), headers);
+
+    ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
+    verify(fakeProvider).newInstance(contextCaptor.capture());
+    assertThat(contextCaptor.getValue().filterName()).isEqualTo("my_child_filter");
+    assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(expectedRecorder);
+  }
+
+  @Test
+  public void filterContext_nullMetricsRecorderFallback() {
+    Matcher.OnMatch matchAction = createExecuteAction("child_with_null_metrics", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
+            .build())
+        .build();
+
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    // CompositeFilter initialized with null metrics recorder
+    CompositeFilter filter = new CompositeFilter(null);
+    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
+        mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    when(fakeClientInterceptor.interceptCall(any(), any(), any()))
+        .thenReturn(mock(ClientCall.class));
+
+    MethodDescriptor<Void, Void> method = createMockMethod();
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+    call.start(mock(ClientCall.Listener.class), headers);
+
+    ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
+    verify(fakeProvider).newInstance(contextCaptor.capture());
+    assertThat(contextCaptor.getValue().filterName()).isEqualTo("child_with_null_metrics");
+    // Fallback metric recorder must be non-null to prevent NPE in child filters
+    assertThat(contextCaptor.getValue().metricsRecorder()).isNotNull();
+  }
+
+  @Test
+  public void serverInterceptor_streamingCall_delegatesAllMethodsAndClosesFilters() {
+    Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
+            .build())
+        .build();
+
+    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    ServerInterceptor interceptor = filter.buildServerInterceptor(result.config, null);
+
+    ServerCall call = mock(ServerCall.class);
+    when(call.getAttributes()).thenReturn(io.grpc.Attributes.EMPTY);
+    when(call.getMethodDescriptor()).thenReturn(createMockMethod());
+
+    ServerCall.Listener childListener = mock(ServerCall.Listener.class);
+    when(fakeServerInterceptor.interceptCall(any(), any(), any())).thenReturn(childListener);
+
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+
+    ServerCallHandler next = mock(ServerCallHandler.class);
+    ServerCall.Listener listener = interceptor.interceptCall(call, headers, next);
+
+    // Verify streaming message delegation
+    listener.onMessage(null);
+    verify(childListener).onMessage(null);
+
+    listener.onHalfClose();
+    verify(childListener).onHalfClose();
+
+    listener.onReady();
+    verify(childListener).onReady();
+
+    // Verify completion closes filter
+    listener.onComplete();
+    verify(childListener).onComplete();
+    verify(fakeFilter).close();
+  }
+
+  @Test
+  public void matchContext_pathAndAuthorityCapturedOnClientAndServer() {
+    UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+    when(mockMatcher.match(any())).thenReturn(
+        io.grpc.xds.internal.matcher.MatchResult.noMatch(Collections.emptyList()));
+
+    CompositeFilter.CompositeFilterConfig config =
+        new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap());
+
+    CompositeFilter filter = newFilter("composite");
+
+    // Client side verification
+    ClientInterceptor clientInterceptor = filter.buildClientInterceptor(
+        config, null, mock(ScheduledExecutorService.class));
+    Channel next = mock(Channel.class);
+    when(next.authority()).thenReturn("my-channel-authority:443");
+
+    MethodDescriptor<Void, Void> method = createMockMethod(); // fullMethodName is "service/method"
+    ClientCall<Void, Void> clientCall =
+        clientInterceptor.interceptCall(method, CallOptions.DEFAULT, next);
+
+    Metadata clientHeaders = new Metadata();
+    clientCall.start(mock(ClientCall.Listener.class), clientHeaders);
+
+    ArgumentCaptor<io.grpc.xds.internal.matcher.MatchContext> clientContextCaptor =
+        ArgumentCaptor.forClass(io.grpc.xds.internal.matcher.MatchContext.class);
+    verify(mockMatcher).match(clientContextCaptor.capture());
+
+    io.grpc.xds.internal.matcher.MatchContext clientContext = clientContextCaptor.getValue();
+    assertThat(clientContext.getPath()).isEqualTo("/service/method");
+    assertThat(clientContext.getHost()).isEqualTo("my-channel-authority:443");
+    assertThat(clientContext.getMethod()).isEqualTo("service/method");
+
+    // Server side verification
+    ServerInterceptor serverInterceptor = filter.buildServerInterceptor(config, null);
+    ServerCall serverCall = mock(ServerCall.class);
+    when(serverCall.getAttributes()).thenReturn(io.grpc.Attributes.EMPTY);
+    when(serverCall.getMethodDescriptor()).thenReturn(createMockMethod());
+    when(serverCall.getAuthority()).thenReturn("my-server-authority:50051");
+
+    Metadata serverHeaders = new Metadata();
+    serverInterceptor.interceptCall(serverCall, serverHeaders, mock(ServerCallHandler.class));
+
+    ArgumentCaptor<io.grpc.xds.internal.matcher.MatchContext> serverContextCaptor =
+        ArgumentCaptor.forClass(io.grpc.xds.internal.matcher.MatchContext.class);
+    verify(mockMatcher, times(2)).match(serverContextCaptor.capture());
+
+    io.grpc.xds.internal.matcher.MatchContext serverContext = serverContextCaptor.getValue();
+    assertThat(serverContext.getPath()).isEqualTo("/service/method");
+    assertThat(serverContext.getHost()).isEqualTo("my-server-authority:50051");
+    assertThat(serverContext.getMethod()).isEqualTo("service/method");
+  }
+
+  @Test
+  public void endToEnd_routeOverride_withExtensionWithMatcherPerRoute() {
+    // Base composite filter matches "header_env=prod" -> executes child filter
+    Matcher.OnMatch baseAction = createExecuteAction("prod_child", FAKE_TYPE_URL);
+    Matcher baseMatcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("header_env", "prod", baseAction))
+            .build())
+        .build();
+    ExtensionWithMatcher baseProto = createExtensionWithMatcher(baseMatcher);
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> baseResult =
+        provider.parseFilterConfig(Any.pack(baseProto), getFilterContext());
+
+    // Override composite filter matches "header_env=staging" -> executes child filter
+    Matcher.OnMatch overrideAction = createExecuteAction("staging_child", FAKE_TYPE_URL);
+    Matcher overrideMatcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("header_env", "staging", overrideAction))
+            .build())
+        .build();
+    ExtensionWithMatcherPerRoute overrideProto = ExtensionWithMatcherPerRoute.newBuilder()
+        .setXdsMatcher(overrideMatcher)
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> overrideResult =
+        provider.parseFilterConfigOverride(Any.pack(overrideProto), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    // Build interceptor with base config overridden by route config
+    ClientInterceptor interceptor = filter.buildClientInterceptor(
+        baseResult.config, overrideResult.config, mock(ScheduledExecutorService.class));
+
+    Channel next = mock(Channel.class);
+    ClientCall childCall = mock(ClientCall.class);
+    when(fakeClientInterceptor.interceptCall(any(), any(), any())).thenReturn(childCall);
+
+    MethodDescriptor<Void, Void> method = createMockMethod();
+
+    // Call with header_env=staging should match the override matcher
+    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("header_env", Metadata.ASCII_STRING_MARSHALLER), "staging");
+    call.start(mock(ClientCall.Listener.class), headers);
+
+    verify(fakeClientInterceptor).interceptCall(any(), any(), any());
+    verify(childCall).start(any(), eq(headers));
   }
 }

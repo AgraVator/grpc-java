@@ -39,7 +39,8 @@ final class FilterRegistry {
               new RouterFilter.Provider(),
               new RbacFilter.Provider(),
               new GcpAuthenticationFilter.Provider(),
-              new ExternalProcessorFilter.Provider());
+              new ExternalProcessorFilter.Provider(),
+              new CompositeFilter.Provider());
     }
     return instance;
   }

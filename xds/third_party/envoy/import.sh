@@ -75,9 +75,7 @@ envoy/config/trace/v3/service.proto
 envoy/config/trace/v3/zipkin.proto
 envoy/data/accesslog/v3/accesslog.proto
 envoy/extensions/clusters/aggregate/v3/cluster.proto
-envoy/extensions/common/matching/v3/extension_matcher.proto
 envoy/extensions/filters/common/fault/v3/fault.proto
-envoy/extensions/filters/http/composite/v3/composite.proto
 envoy/extensions/filters/http/ext_authz/v3/ext_authz.proto
 envoy/extensions/filters/http/ext_proc/v3/ext_proc.proto
 envoy/extensions/filters/http/ext_proc/v3/processing_mode.proto
@@ -119,7 +117,6 @@ envoy/type/http/v3/path_transformation.proto
 envoy/type/matcher/v3/address.proto
 envoy/type/matcher/v3/filter_state.proto
 envoy/type/matcher/v3/http_inputs.proto
-envoy/config/common/matcher/v3/matcher.proto
 envoy/type/matcher/v3/metadata.proto
 envoy/type/matcher/v3/node.proto
 envoy/config/common/matcher/v3/matcher.proto

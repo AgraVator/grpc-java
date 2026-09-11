@@ -726,7 +726,6 @@ final class XdsNameResolver extends NameResolver {
       }
 
       VirtualHost virtualHost = update.getVirtualHost();
-      // filters and there configurations
       ImmutableList<NamedFilterConfig> filterConfigs = httpConnectionManager.httpFilterConfigs();
       long streamDurationNano = httpConnectionManager.httpMaxStreamDurationNano();
 

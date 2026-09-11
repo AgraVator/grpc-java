@@ -23,14 +23,12 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.primitives.UnsignedInteger;
 import com.google.protobuf.Any;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
-import com.google.protobuf.Struct;
 import com.google.protobuf.util.Durations;
 import com.google.re2j.Pattern;
 import com.google.re2j.PatternSyntaxException;
@@ -295,11 +293,6 @@ class XdsRouteConfigureResource extends XdsResourceType<RdsUpdate> {
     }
     Map<String, FilterConfig> overrideConfigs = overrideConfigsOrError.getStruct();
 
-    Map<String, Struct> filterMetadata = ImmutableMap.of();
-    if (proto.hasMetadata()) {
-      filterMetadata = proto.getMetadata().getFilterMetadataMap();
-    }
-
     switch (proto.getActionCase()) {
       case ROUTE:
         StructOrError<RouteAction> routeAction =
@@ -314,11 +307,10 @@ class XdsRouteConfigureResource extends XdsResourceType<RdsUpdate> {
                   + routeAction.getErrorDetail());
         }
         return StructOrError.fromStruct(
-            Route.forAction(routeMatch.getStruct(), routeAction.getStruct(), overrideConfigs,
-                filterMetadata));
+            Route.forAction(routeMatch.getStruct(), routeAction.getStruct(), overrideConfigs));
       case NON_FORWARDING_ACTION:
         return StructOrError.fromStruct(
-            Route.forNonForwardingAction(routeMatch.getStruct(), overrideConfigs, filterMetadata));
+            Route.forNonForwardingAction(routeMatch.getStruct(), overrideConfigs));
       case REDIRECT:
       case DIRECT_RESPONSE:
       case FILTER_ACTION:

@@ -1017,12 +1017,14 @@ public class CompositeFilterAdversarialTest {
   }
 
   @Test
-  public void envelopeOverride_missingXdsMatcher_succeedsAsNoOp() {
+  public void envelopeOverride_missingXdsMatcher_rejected() {
+    // An override with no matcher configures nothing, so it is rejected rather than silently
+    // ignored. gRPC C++ NACKs this case as well.
     ExtensionWithMatcherPerRoute proto = ExtensionWithMatcherPerRoute.newBuilder().build();
     ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
         provider.parseFilterConfigOverride(Any.pack(proto), getFilterContext());
-    assertThat(result.errorDetail).isNull();
-    assertThat(result.config).isNotNull();
-    assertThat(result.config.matcher).isNull();
+    assertThat(result.config).isNull();
+    assertThat(result.errorDetail)
+        .contains("ExtensionWithMatcherPerRoute.xds_matcher: field not set");
   }
 }

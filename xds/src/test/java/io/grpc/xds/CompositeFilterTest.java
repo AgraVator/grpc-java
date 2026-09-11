@@ -520,6 +520,44 @@ public class CompositeFilterTest {
   }
 
   @Test
+  public void parseFilterConfigOverride_missingXdsMatcherIsRejected() {
+    // A per-route override consists of nothing but the matcher, so an absent one is an error.
+    // gRPC C++ NACKs here too: ".xds_matcher error:field not set".
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(
+            Any.pack(ExtensionWithMatcherPerRoute.getDefaultInstance()), getFilterContext());
+
+    assertThat(result.config).isNull();
+    assertThat(result.errorDetail)
+        .contains("ExtensionWithMatcherPerRoute.xds_matcher: field not set");
+  }
+
+  @Test
+  public void parseFilterConfig_missingXdsMatcherIsAllowedAndActsAsNoOp() {
+    // Unlike the override, a top-level config without a matcher is valid; the filter becomes a
+    // passthrough and a per-route override may still supply a matcher. This mirrors gRPC C++
+    // (ParseTopLevelConfig leaves config->matcher null, no validation error).
+    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("composite")
+            .setTypedConfig(Any.pack(Composite.getDefaultInstance()))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config).isNotNull();
+    assertThat(result.config.matcher).isNull();
+
+    CompositeFilter filter = newFilter("composite");
+    assertThat(filter.buildClientInterceptor(
+        result.config, null, mock(ScheduledExecutorService.class))).isNull();
+    assertThat(filter.buildServerInterceptor(result.config, null)).isNull();
+  }
+
+  @Test
   public void parseFilterConfigOverride_failsWhenDisabled() {
     System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     try {
@@ -640,6 +678,17 @@ public class CompositeFilterTest {
     ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
         provider.parseFilterConfig(Any.pack(proto), getFilterContext());
 
+    // Nested interceptors are built when the composite interceptor is built, so stub before that.
+    fakeClientInterceptor = mock(ClientInterceptor.class);
+    when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(fakeClientInterceptor);
+
+    org.mockito.Mockito.doAnswer(invocation -> {
+      Channel nextArg = (Channel) invocation.getArguments()[2];
+      return nextArg.newCall(
+          (MethodDescriptor<?, ?>) invocation.getArguments()[0],
+          (CallOptions) invocation.getArguments()[1]);
+    }).when(fakeClientInterceptor).interceptCall(any(), any(), any());
+
     CompositeFilter filter = newFilter("composite");
     ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
         mock(ScheduledExecutorService.class));
@@ -650,16 +699,6 @@ public class CompositeFilterTest {
 
     MethodDescriptor<Void, Void> method = createMockMethod();
     ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
-
-    fakeClientInterceptor = mock(ClientInterceptor.class);
-    when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(fakeClientInterceptor);
-
-    org.mockito.Mockito.doAnswer(invocation -> {
-      Channel nextArg = (Channel) invocation.getArguments()[2];
-      return nextArg.newCall(
-          (MethodDescriptor<?, ?>) invocation.getArguments()[0],
-          (CallOptions) invocation.getArguments()[1]);
-    }).when(fakeClientInterceptor).interceptCall(any(), any(), any());
 
     Metadata headers = new Metadata();
     headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
@@ -819,7 +858,7 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void clientInterceptor_closesFiltersOnClose() {
+  public void clientInterceptor_nestedFilterOutlivesRpcAndClosesWithComposite() {
     Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
     Matcher matcher = Matcher.newBuilder()
         .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -855,6 +894,11 @@ public class CompositeFilterTest {
     ClientCall.Listener capturedListener = listenerCaptor.getValue();
     capturedListener.onClose(Status.OK, new Metadata());
 
+    // Closing the RPC must NOT close the nested filter; it is shared across RPCs.
+    verify(fakeFilter, never()).close();
+
+    // It is released only when the composite filter itself is closed.
+    filter.close();
     verify(fakeFilter).close();
   }
 
@@ -1137,7 +1181,7 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void serverInterceptor_closesFiltersOnCancelAndComplete() {
+  public void serverInterceptor_nestedFilterOutlivesRpcsAndClosesWithComposite() {
     Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
     Matcher matcher = Matcher.newBuilder()
         .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -1172,19 +1216,118 @@ public class CompositeFilterTest {
     ServerCall.Listener listener = interceptor.interceptCall(call, headers, next);
 
     listener.onComplete();
-    verify(fakeFilter).close();
+    verify(fakeFilter, never()).close();
 
-    // Idempotent: onCancel after onComplete does not double-close
     listener.onCancel();
-    verify(fakeFilter, times(1)).close();
+    verify(fakeFilter, never()).close();
 
-    // Separate call: onCancel closes filters
+    // A second RPC reuses the same nested filter instance rather than creating a new one.
     ServerCall call2 = mock(ServerCall.class);
     when(call2.getAttributes()).thenReturn(io.grpc.Attributes.EMPTY);
     when(call2.getMethodDescriptor()).thenReturn(createMockMethod());
     ServerCall.Listener listener2 = interceptor.interceptCall(call2, headers, next);
     listener2.onCancel();
+    verify(fakeFilter, never()).close();
+    verify(fakeProvider, times(1)).newInstance(any());
+
+    // Closing the composite filter releases the nested filter exactly once.
+    filter.close();
+    verify(fakeFilter, times(1)).close();
+
+    // close() is idempotent.
+    filter.close();
+    verify(fakeFilter, times(1)).close();
+  }
+
+  /** Parses a top-level composite config whose single action runs the named nested filter. */
+  private CompositeFilter.CompositeFilterConfig configWithChild(String childName) {
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar",
+                createExecuteAction(childName, FAKE_TYPE_URL)))
+            .build())
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+    assertThat(result.errorDetail).isNull();
+    return result.config;
+  }
+
+  @Test
+  public void nestedFilter_oneInstancePerConfigGenerationAcrossRoutes() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+    // The resolver hands the same config object to every route of a single LDS update.
+    CompositeFilter.CompositeFilterConfig config = configWithChild("child");
+
+    filter.buildClientInterceptor(config, null, scheduler);
+    filter.buildClientInterceptor(config, null, scheduler);
+    filter.buildClientInterceptor(config, null, scheduler);
+
+    verify(fakeProvider, times(1)).newInstance(any());
+    verify(fakeFilter, never()).close();
+  }
+
+  @Test
+  public void nestedFilter_carriedForwardAcrossConfigGenerations() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+    // Two separate LDS updates that both still configure "child".
+    filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
+    filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
+
+    // The instance is reused, so the state it owns (connection pools, credential caches)
+    // survives the update instead of being rebuilt.
+    verify(fakeProvider, times(1)).newInstance(any());
+    verify(fakeFilter, never()).close();
+  }
+
+  @Test
+  public void nestedFilter_droppedFromConfigIsReleasedOnFollowingGeneration() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+    filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
+    filter.buildClientInterceptor(configWithChild("other"), null, scheduler);
+
+    // Generation 2 may still have routes left to process, any of which could reclaim "child",
+    // so it is only retired here, not closed.
+    verify(fakeFilter, never()).close();
+
+    // Once generation 3 starts, generation 1's leftovers are provably unused.
+    filter.buildClientInterceptor(configWithChild("third"), null, scheduler);
+    verify(fakeFilter, times(1)).close();
+  }
+
+  @Test
+  public void nestedFilter_closeReleasesActiveAndRetiredGenerations() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+    filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
+    filter.buildClientInterceptor(configWithChild("other"), null, scheduler);
+    verify(fakeProvider, times(2)).newInstance(any());
+    verify(fakeFilter, never()).close();
+
+    // "other" is active and "child" is retired; both must be released.
+    filter.close();
     verify(fakeFilter, times(2)).close();
+  }
+
+  @Test
+  public void nestedFilter_buildAfterCloseIsRejected() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+    filter.close();
+
+    try {
+      filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
+      fail("Expected IllegalStateException");
+    } catch (IllegalStateException expected) {
+      assertThat(expected).hasMessageThat().contains("CompositeFilter is closed");
+    }
   }
 
   @Test
@@ -1311,7 +1454,11 @@ public class CompositeFilterTest {
     capturedListener.onClose(Status.OK, trailers);
     verify(responseListener).onClose(Status.OK, trailers);
 
-    // Verify filter resources cleaned up
+    // The nested filter must survive the RPC; it is shared across RPCs.
+    verify(fakeFilter, never()).close();
+
+    // It is released only when the composite filter itself is closed.
+    filter.close();
     verify(fakeFilter).close();
   }
 
@@ -1482,7 +1629,7 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void serverInterceptor_streamingCall_delegatesAllMethodsAndClosesFilters() {
+  public void serverInterceptor_streamingCall_delegatesAllMethods() {
     Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
     Matcher matcher = Matcher.newBuilder()
         .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -1520,9 +1667,14 @@ public class CompositeFilterTest {
     listener.onReady();
     verify(childListener).onReady();
 
-    // Verify completion closes filter
+    // Completing the RPC must NOT tear down the nested filter: nested filters are long-lived
+    // and shared across RPCs, just like top-level filters.
     listener.onComplete();
     verify(childListener).onComplete();
+    verify(fakeFilter, never()).close();
+
+    // They are released only when the composite filter itself is closed.
+    filter.close();
     verify(fakeFilter).close();
   }
 

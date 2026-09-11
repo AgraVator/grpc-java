@@ -36,8 +36,7 @@ import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
 import io.grpc.ClientInterceptors;
 import io.grpc.ForwardingClientCall;
-import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.ForwardingServerCallListener.SimpleForwardingServerCallListener;
+import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MetricRecorder;
@@ -55,9 +54,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 final class CompositeFilter implements Filter {
 
@@ -68,6 +67,35 @@ final class CompositeFilter implements Filter {
 
   @Nullable
   private final MetricRecorder metricsRecorder;
+
+  private final Object filtersLock = new Object();
+
+  /**
+   * Nested filter instances claimed by the current configuration generation, keyed by nested
+   * filter name and type URL, mirroring {@link Filter.NamedFilterConfig#filterStateKey}.
+   */
+  @GuardedBy("filtersLock")
+  private final Map<String, Filter> activeNestedFilters = new HashMap<>();
+
+  /**
+   * Nested filters held over from the previous configuration generation. A filter that is still
+   * configured is promoted back into {@link #activeNestedFilters} on first use, preserving the
+   * state it owns; whatever remains unclaimed is closed when the next generation begins.
+   */
+  @GuardedBy("filtersLock")
+  private final Map<String, Filter> retiredNestedFilters = new HashMap<>();
+
+  /**
+   * The top-level {@link FilterConfig} that defines the current generation, compared by identity.
+   * A given LDS update produces exactly one config object, which the resolver then passes to
+   * every route, so a change of identity marks a new generation.
+   */
+  @GuardedBy("filtersLock")
+  @Nullable
+  private FilterConfig currentGeneration;
+
+  @GuardedBy("filtersLock")
+  private boolean closed;
 
   CompositeFilter(@Nullable MetricRecorder metricsRecorder) {
     this.metricsRecorder = metricsRecorder;
@@ -137,6 +165,11 @@ final class CompositeFilter implements Filter {
           return ConfigOrError.fromError(
               "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
         }
+        // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
+        // per-route override may still supply one. This matches gRPC C++, whose
+        // ParseTopLevelConfig() leaves config->matcher null without adding a validation error,
+        // and whose data plane then starts the child call directly. The deprecated `matcher`
+        // field is ignored, per A103.
         return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
@@ -165,7 +198,14 @@ final class CompositeFilter implements Filter {
               "Expected ExtensionWithMatcherPerRoute but got: " + any.getTypeUrl());
         }
         ExtensionWithMatcherPerRoute proto = any.unpack(ExtensionWithMatcherPerRoute.class);
-        return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
+        // Unlike the top-level config, a per-route override carries nothing but the matcher, so
+        // an absent one is a configuration error rather than a no-op. gRPC C++ likewise NACKs
+        // here, with "...ExtensionWithMatcherPerRoute].xds_matcher error:field not set".
+        if (!proto.hasXdsMatcher()) {
+          return ConfigOrError.fromError(
+              "ExtensionWithMatcherPerRoute.xds_matcher: field not set");
+        }
+        return parseMatcherConfig(proto.getXdsMatcher(), context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
       }
@@ -442,14 +482,51 @@ final class CompositeFilter implements Filter {
     }
   }
 
+  /**
+   * A {@link FilterDelegate} whose nested filter interceptors have already been built, at
+   * configuration time.
+   *
+   * <p>Per RPC we only need to evaluate {@link FilterDelegate#shouldExecute} and reuse
+   * {@link #interceptors}. If a nested filter is not supported on the side being built,
+   * {@link #error} holds the status to fail matching RPCs with; the error is deliberately
+   * deferred to RPC time so that a delegate which is never sampled in never fails anything.
+   */
+  static final class ResolvedDelegate<I> {
+    final FilterDelegate delegate;
+    final List<I> interceptors;
+    @Nullable
+    final Status error;
+
+    private ResolvedDelegate(FilterDelegate delegate, List<I> interceptors,
+        @Nullable Status error) {
+      this.delegate = delegate;
+      this.interceptors = Collections.unmodifiableList(interceptors);
+      this.error = error;
+    }
+
+    static <I> ResolvedDelegate<I> of(FilterDelegate delegate, List<I> interceptors) {
+      return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
+    }
+
+    static <I> ResolvedDelegate<I> error(FilterDelegate delegate, Status error) {
+      return new ResolvedDelegate<>(delegate, Collections.<I>emptyList(), error);
+    }
+  }
+
   @Override
   public ClientInterceptor buildClientInterceptor(FilterConfig config,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
     Preconditions.checkNotNull(config, "config");
+    // Done before the early return below, so that a configuration which no longer has a matcher
+    // still releases the nested filters of the generation it replaced.
+    closeAll(rotateGenerationIfNeeded(config));
     CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
     if (effective == null || effective.matcher == null) {
       return null;
     }
+
+    final Map<String, ResolvedDelegate<ClientInterceptor>> resolvedDelegates =
+        resolveAll(effective, delegate -> resolveClientDelegate(delegate, scheduler));
 
     return new ClientInterceptor() {
       @Override
@@ -457,8 +534,7 @@ final class CompositeFilter implements Filter {
           MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
           Channel next) {
         return new CompositeClientCall<>(
-            method, callOptions, next, effective.matcher, effective.delegates, scheduler,
-            metricsRecorder);
+            method, callOptions, next, effective.matcher, resolvedDelegates);
       }
     };
   }
@@ -466,10 +542,15 @@ final class CompositeFilter implements Filter {
   @Override
   public ServerInterceptor buildServerInterceptor(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    Preconditions.checkNotNull(config, "config");
+    closeAll(rotateGenerationIfNeeded(config));
     CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
     if (effective == null || effective.matcher == null) {
       return null;
     }
+
+    final Map<String, ResolvedDelegate<ServerInterceptor>> resolvedDelegates =
+        resolveAll(effective, this::resolveServerDelegate);
 
     return new ServerInterceptor() {
       @Override
@@ -493,94 +574,164 @@ final class CompositeFilter implements Filter {
           return new ServerCall.Listener<ReqT>() {};
         }
 
-        List<FilterDelegate> matchedDelegates =
-            resolveDelegates(matchResult, effective.delegates);
-
-        if (!matchedDelegates.isEmpty()) {
-          List<ServerInterceptor> interceptors = new ArrayList<>();
-          final List<Filter> filters = new ArrayList<>();
-          try {
-            for (FilterDelegate delegate : matchedDelegates) {
-              if (!delegate.shouldExecute()) {
-                continue;
-              }
-              for (DelegateEntry entry : delegate.delegates) {
-                if (!entry.provider.isServerFilter()) {
-                  closeAll(filters);
-                  call.close(
-                      Status.UNAVAILABLE.withDescription(
-                          "Filter " + entry.name + " is not supported on server side"),
-                      new Metadata());
-                  return new ServerCall.Listener<ReqT>() {};
-                }
-                MetricRecorder recorder =
-                    metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
-                Filter filter = entry.provider.newInstance(
-                    FilterContext.create(entry.name, recorder));
-                filters.add(filter);
-                ServerInterceptor interceptor = filter.buildServerInterceptor(entry.config, null);
-                if (interceptor != null) {
-                  interceptors.add(interceptor);
-                }
-              }
-            }
-          } catch (Throwable t) {
-            closeAll(filters);
-            throw t;
+        // Only matcher evaluation and sampling happen per RPC. The nested filters and their
+        // interceptors were already built once above, at configuration time.
+        List<ServerInterceptor> interceptors = new ArrayList<>();
+        for (ResolvedDelegate<ServerInterceptor> resolved
+            : resolveDelegates(matchResult, resolvedDelegates)) {
+          if (!resolved.delegate.shouldExecute()) {
+            continue;
           }
-
-          if (!interceptors.isEmpty()) {
-            ServerCallHandler<ReqT, RespT> wrapped = next;
-            for (int i = interceptors.size() - 1; i >= 0; i--) {
-              final ServerInterceptor interceptor = interceptors.get(i);
-              final ServerCallHandler<ReqT, RespT> current = wrapped;
-              wrapped = new ServerCallHandler<ReqT, RespT>() {
-                @Override
-                public ServerCall.Listener<ReqT> startCall(
-                    ServerCall<ReqT, RespT> call, Metadata headers) {
-                  return interceptor.interceptCall(call, headers, current);
-                }
-              };
-            }
-            final AtomicBoolean closed = new AtomicBoolean();
-            final Runnable doClose = () -> {
-              if (closed.compareAndSet(false, true)) {
-                closeAll(filters);
-              }
-            };
-            ServerCall.Listener<ReqT> listener;
-            try {
-              listener = wrapped.startCall(call, headers);
-            } catch (Throwable t) {
-              doClose.run();
-              throw t;
-            }
-            return new SimpleForwardingServerCallListener<ReqT>(listener) {
-              @Override
-              public void onCancel() {
-                try {
-                  super.onCancel();
-                } finally {
-                  doClose.run();
-                }
-              }
-
-              @Override
-              public void onComplete() {
-                try {
-                  super.onComplete();
-                } finally {
-                  doClose.run();
-                }
-              }
-            };
-          } else {
-            closeAll(filters);
+          if (resolved.error != null) {
+            call.close(resolved.error, new Metadata());
+            return new ServerCall.Listener<ReqT>() {};
           }
+          interceptors.addAll(resolved.interceptors);
         }
-        return next.startCall(call, headers);
+
+        ServerCallHandler<ReqT, RespT> wrapped = next;
+        for (int i = interceptors.size() - 1; i >= 0; i--) {
+          wrapped = InternalServerInterceptors.interceptCallHandlerCreate(
+              interceptors.get(i), wrapped);
+        }
+        return wrapped.startCall(call, headers);
       }
     };
+  }
+
+  /**
+   * Builds the nested filters and their interceptors for every action in the matcher tree. This
+   * runs once per configuration update, not per RPC.
+   *
+   * <p>This mirrors the reference implementations. In Envoy, {@code ExecuteFilterAction} stores an
+   * {@code Http::FilterFactoryCb} created by {@code ExecuteFilterActionFactory::createAction()} at
+   * config load and merely invokes it per stream. In gRPC C++, {@code CompositeFilter} caches
+   * per-action filter chains in {@code filter_chain_map_}. Creating nested filters per RPC would
+   * defeat the caches and shared connections that {@link Filter} implementations are documented to
+   * own, and would violate {@link Filter.Provider#newInstance}'s lifecycle contract.
+   */
+  private <I> Map<String, ResolvedDelegate<I>> resolveAll(
+      CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {
+    Map<String, ResolvedDelegate<I>> resolved = new HashMap<>();
+    for (Map.Entry<String, FilterDelegate> entry : effective.delegates.entrySet()) {
+      resolved.put(entry.getKey(), resolver.apply(entry.getValue()));
+    }
+    return Collections.unmodifiableMap(resolved);
+  }
+
+  private ResolvedDelegate<ServerInterceptor> resolveServerDelegate(FilterDelegate delegate) {
+    List<ServerInterceptor> interceptors = new ArrayList<>();
+    for (DelegateEntry entry : delegate.delegates) {
+      if (!entry.provider.isServerFilter()) {
+        return ResolvedDelegate.error(delegate,
+            Status.UNAVAILABLE.withDescription(
+                "Filter " + entry.name + " is not supported on server side"));
+      }
+      ServerInterceptor interceptor = getOrCreateNestedFilter(entry)
+          .buildServerInterceptor(entry.config, /* overrideConfig= */ null);
+      if (interceptor != null) {
+        interceptors.add(interceptor);
+      }
+    }
+    return ResolvedDelegate.of(delegate, interceptors);
+  }
+
+  private ResolvedDelegate<ClientInterceptor> resolveClientDelegate(
+      FilterDelegate delegate, ScheduledExecutorService scheduler) {
+    List<ClientInterceptor> interceptors = new ArrayList<>();
+    for (DelegateEntry entry : delegate.delegates) {
+      if (!entry.provider.isClientFilter()) {
+        return ResolvedDelegate.error(delegate,
+            Status.UNAVAILABLE.withDescription(
+                "Filter " + entry.name + " is not supported on client side"));
+      }
+      ClientInterceptor interceptor = getOrCreateNestedFilter(entry)
+          .buildClientInterceptor(entry.config, /* overrideConfig= */ null, scheduler);
+      if (interceptor != null) {
+        interceptors.add(interceptor);
+      }
+    }
+    return ResolvedDelegate.of(delegate, interceptors);
+  }
+
+  /**
+   * Rotates the nested filter generations if {@code topLevelConfig} is not the one that defined
+   * the current generation, and returns the filters that are now provably unused.
+   *
+   * <p>Nested filters must outlive a configuration update, because the state they own - a
+   * connection pool, a credential cache - is exactly what would be lost by rebuilding them. So a
+   * new generation retires the previous one wholesale, {@link #getOrCreateNestedFilter} promotes
+   * back anything still configured, and only the leftovers are closed.
+   *
+   * <p>gRPC C++ solves the same problem with its {@code Blackboard}. It has used two designs. The
+   * original one is what this method implements: an explicit carry-forward step
+   * ({@code UpdateBlackboard(old_blackboard, new_blackboard)}) followed by dropping the old
+   * container, so unclaimed state died deterministically at the swap. C++ has since replaced it
+   * with a single long-lived blackboard holding weak references, letting refcounting destroy an
+   * entry once the last config referencing it goes away. That second design does not port to
+   * Java: {@link Filter#close} has to be called explicitly, and garbage collection will not do it,
+   * so the resources would leak even after the object became unreachable. Hence the explicit
+   * approach.
+   *
+   * <p>One difference from C++: a configuration generation here has no explicit end, since the
+   * resolver calls {@code buildXInterceptor} once per route and never signals the last one. A
+   * generation's leftovers can therefore only be released once the following generation begins,
+   * which bounds live instances at two generations instead of letting them grow without limit.
+   */
+  private List<Filter> rotateGenerationIfNeeded(FilterConfig topLevelConfig) {
+    synchronized (filtersLock) {
+      // Identity, not equality: one LDS update yields one config object, shared by every route.
+      if (currentGeneration == topLevelConfig) {
+        return new ArrayList<>();
+      }
+      currentGeneration = topLevelConfig;
+      List<Filter> unclaimed = new ArrayList<>(retiredNestedFilters.values());
+      retiredNestedFilters.clear();
+      retiredNestedFilters.putAll(activeNestedFilters);
+      activeNestedFilters.clear();
+      return unclaimed;
+    }
+  }
+
+  /**
+   * Returns the nested {@link Filter} for {@code entry}, promoting it from the previous
+   * generation when possible and only creating a new instance as a last resort.
+   */
+  private Filter getOrCreateNestedFilter(DelegateEntry entry) {
+    String key = entry.name + "_" + entry.config.typeUrl();
+    synchronized (filtersLock) {
+      Preconditions.checkState(!closed, "CompositeFilter is closed");
+      Filter filter = activeNestedFilters.get(key);
+      if (filter == null) {
+        // Still configured, so carry the instance - and the state it owns - across the update.
+        filter = retiredNestedFilters.remove(key);
+      }
+      if (filter == null) {
+        MetricRecorder recorder =
+            metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
+        filter = entry.provider.newInstance(FilterContext.create(entry.name, recorder));
+      }
+      activeNestedFilters.put(key, filter);
+      return filter;
+    }
+  }
+
+  @Override
+  public void close() {
+    List<Filter> toClose;
+    synchronized (filtersLock) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      toClose = new ArrayList<>(activeNestedFilters.size() + retiredNestedFilters.size());
+      toClose.addAll(activeNestedFilters.values());
+      toClose.addAll(retiredNestedFilters.values());
+      activeNestedFilters.clear();
+      retiredNestedFilters.clear();
+      currentGeneration = null;
+    }
+    closeAll(toClose);
   }
 
   private static CompositeFilterConfig getEffectiveConfig(
@@ -595,14 +746,14 @@ final class CompositeFilter implements Filter {
     return effective;
   }
 
-  static List<FilterDelegate> resolveDelegates(@Nullable MatchResult matchResult,
-      Map<String, FilterDelegate> delegatesMap) {
+  static <I> List<ResolvedDelegate<I>> resolveDelegates(@Nullable MatchResult matchResult,
+      Map<String, ResolvedDelegate<I>> delegatesMap) {
     if (matchResult == null || !matchResult.matched || matchResult.actions.isEmpty()) {
       return Collections.emptyList();
     }
-    List<FilterDelegate> list = new ArrayList<>();
+    List<ResolvedDelegate<I>> list = new ArrayList<>();
     for (TypedExtensionConfig action : matchResult.actions) {
-      FilterDelegate d = delegatesMap.get(action.getName());
+      ResolvedDelegate<I> d = delegatesMap.get(action.getName());
       if (d != null) {
         list.add(d);
       }
@@ -636,25 +787,20 @@ final class CompositeFilter implements Filter {
     private final CallOptions callOptions;
     private final Channel next;
     private final UnifiedMatcher matcher;
-    private final Map<String, FilterDelegate> delegatesMap;
-    private final ScheduledExecutorService scheduler;
-    @Nullable
-    private final MetricRecorder metricsRecorder;
+    private final Map<String, ResolvedDelegate<ClientInterceptor>> delegatesMap;
     private final Object lock = new Object();
     private ClientCall<ReqT, RespT> delegate;
     private boolean started;
     private Status cancelStatus;
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
-        Channel next, UnifiedMatcher matcher, Map<String, FilterDelegate> delegatesMap,
-        ScheduledExecutorService scheduler, @Nullable MetricRecorder metricsRecorder) {
+        Channel next, UnifiedMatcher matcher,
+        Map<String, ResolvedDelegate<ClientInterceptor>> delegatesMap) {
       this.method = method;
       this.callOptions = callOptions;
       this.next = next;
       this.matcher = matcher;
       this.delegatesMap = delegatesMap;
-      this.scheduler = scheduler;
-      this.metricsRecorder = metricsRecorder;
     }
 
     private static final ClientCall<Object, Object> NOOP_CALL =
@@ -730,86 +876,47 @@ final class CompositeFilter implements Filter {
 
       MatchResult matchResult = matcher.match(context);
       if (matchResult == null || !matchResult.matched) {
-        synchronized (lock) {
-          delegate = noopCall();
-        }
-        responseListener.onClose(
-            Status.UNAVAILABLE.withDescription("Composite filter: no match found in matcher tree"),
-            new Metadata());
+        failCall(responseListener,
+            Status.UNAVAILABLE.withDescription("Composite filter: no match found in matcher tree"));
         return;
       }
 
-      final List<Filter> filters = new ArrayList<>();
-      ClientCall<ReqT, RespT> realCall = null;
-      try {
-        List<FilterDelegate> filterDelegates = resolveDelegates(matchResult, delegatesMap);
-        if (!filterDelegates.isEmpty()) {
-          List<ClientInterceptor> interceptors = new ArrayList<>();
-          for (FilterDelegate filterDelegate : filterDelegates) {
-            if (!filterDelegate.shouldExecute()) {
-              continue;
-            }
-            for (DelegateEntry entry : filterDelegate.delegates) {
-              if (!entry.provider.isClientFilter()) {
-                closeAll(filters);
-                synchronized (lock) {
-                  delegate = noopCall();
-                }
-                responseListener.onClose(
-                    Status.UNAVAILABLE.withDescription(
-                        "Filter " + entry.name + " is not supported on client side"),
-                    new Metadata());
-                return;
-              }
-              MetricRecorder recorder =
-                  metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
-              Filter filter = entry.provider.newInstance(
-                  FilterContext.create(entry.name, recorder));
-              filters.add(filter);
-              ClientInterceptor interceptor =
-                  filter.buildClientInterceptor(entry.config, null, scheduler);
-              if (interceptor != null) {
-                interceptors.add(interceptor);
-              }
-            }
-          }
-
-          if (!interceptors.isEmpty()) {
-            realCall =
-                ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);
-            responseListener = new SimpleForwardingClientCallListener<RespT>(responseListener) {
-              @Override
-              public void onClose(Status status, Metadata trailers) {
-                try {
-                  super.onClose(status, trailers);
-                } finally {
-                  closeAll(filters);
-                }
-              }
-            };
-          } else {
-            closeAll(filters);
-          }
+      // Only matcher evaluation and sampling happen per RPC. The nested filters and their
+      // interceptors were already built once at configuration time; see
+      // CompositeFilter#buildClientInterceptor.
+      List<ClientInterceptor> interceptors = new ArrayList<>();
+      for (ResolvedDelegate<ClientInterceptor> resolved
+          : resolveDelegates(matchResult, delegatesMap)) {
+        if (!resolved.delegate.shouldExecute()) {
+          continue;
         }
-
-        if (realCall == null) {
-          realCall = next.newCall(method, callOptions);
+        if (resolved.error != null) {
+          failCall(responseListener, resolved.error);
+          return;
         }
-
-        synchronized (lock) {
-          if (cancelStatus != null) {
-            closeAll(filters);
-            delegate = noopCall();
-            responseListener.onClose(cancelStatus, new Metadata());
-            return;
-          }
-          delegate = realCall;
-        }
-        realCall.start(responseListener, headers);
-      } catch (Throwable t) {
-        closeAll(filters);
-        throw t;
+        interceptors.addAll(resolved.interceptors);
       }
+
+      ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
+          ? next.newCall(method, callOptions)
+          : ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);
+
+      synchronized (lock) {
+        if (cancelStatus != null) {
+          delegate = noopCall();
+          responseListener.onClose(cancelStatus, new Metadata());
+          return;
+        }
+        delegate = realCall;
+      }
+      realCall.start(responseListener, headers);
+    }
+
+    private void failCall(Listener<RespT> responseListener, Status status) {
+      synchronized (lock) {
+        delegate = noopCall();
+      }
+      responseListener.onClose(status, new Metadata());
     }
   }
 }

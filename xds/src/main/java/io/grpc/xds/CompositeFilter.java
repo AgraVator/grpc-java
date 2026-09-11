@@ -65,6 +65,14 @@ final class CompositeFilter implements Filter {
   static final String TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE =
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
 
+  /**
+   * How deeply composite filters may be nested inside one another. A composite filter's actions
+   * can themselves be composite filters, so a hostile or buggy control plane could otherwise
+   * describe an arbitrarily deep tree and exhaust the stack while parsing it.
+   */
+  @VisibleForTesting
+  static final int MAX_RECURSION_DEPTH = 8;
+
   @Nullable
   private final MetricRecorder metricsRecorder;
 
@@ -122,14 +130,20 @@ final class CompositeFilter implements Filter {
       };
     }
 
+    // The experimental flag is reported through the side predicates rather than checked in
+    // parseFilterConfig, so that a disabled composite filter looks like any other filter this
+    // build does not support. That distinction matters: XdsListenerResource honours the
+    // http_filter's is_optional flag when a filter is unsupported, but treats a parse error as
+    // fatal, so checking the flag while parsing would NACK the whole listener over an optional
+    // filter. Mirrors ExternalProcessorFilter.Provider.isClientFilter().
     @Override
     public boolean isClientFilter() {
-      return true;
+      return isSupported();
     }
 
     @Override
     public boolean isServerFilter() {
-      return true;
+      return isSupported();
     }
 
     @Override
@@ -140,17 +154,13 @@ final class CompositeFilter implements Filter {
     @Override
     public ConfigOrError<CompositeFilterConfig> parseFilterConfig(
         Message rawProtoMessage, FilterConfigParseContext context) {
-      if (!isSupported()) {
-        return ConfigOrError.fromError(
-            "Composite Filter is experimental and disabled by default.");
-      }
       if (!(rawProtoMessage instanceof Any)) {
         return ConfigOrError.fromError(
             "Invalid message type: " + rawProtoMessage.getClass().getName());
       }
-      int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
-      if (depth >= 8) {
-        return ConfigOrError.fromError("Maximum recursion depth of 8 exceeded");
+      if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
+        return ConfigOrError.fromError(
+            "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
       }
       try {
         Any any = (Any) rawProtoMessage;
@@ -179,17 +189,13 @@ final class CompositeFilter implements Filter {
     @Override
     public ConfigOrError<CompositeFilterConfig> parseFilterConfigOverride(
         Message rawProtoMessage, FilterConfigParseContext context) {
-      if (!isSupported()) {
-        return ConfigOrError.fromError(
-            "Composite Filter is experimental and disabled by default.");
-      }
       if (!(rawProtoMessage instanceof Any)) {
         return ConfigOrError.fromError(
             "Invalid message type: " + rawProtoMessage.getClass().getName());
       }
-      int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
-      if (depth >= 8) {
-        return ConfigOrError.fromError("Maximum recursion depth of 8 exceeded");
+      if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
+        return ConfigOrError.fromError(
+            "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
       }
       try {
         Any any = (Any) rawProtoMessage;
@@ -222,7 +228,7 @@ final class CompositeFilter implements Filter {
             "keep_matching is not permitted anywhere in the composite filter matcher tree");
       }
       try {
-        Map<String, FilterDelegate> delegates = new HashMap<>();
+        Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
         collectDelegates(matcherProto, delegates, context);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
@@ -278,7 +284,7 @@ final class CompositeFilter implements Filter {
           .equals(typeUrl);
     }
 
-    private void collectDelegates(Matcher matcher, Map<String, FilterDelegate> map,
+    private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
         FilterConfigParseContext context) {
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
@@ -303,16 +309,21 @@ final class CompositeFilter implements Filter {
       }
     }
 
-    private void collectOnMatch(Matcher.OnMatch onMatch, Map<String, FilterDelegate> map,
-        FilterConfigParseContext context) {
+    private void collectOnMatch(Matcher.OnMatch onMatch,
+        Map<TypedExtensionConfig, FilterDelegate> map, FilterConfigParseContext context) {
       if (onMatch.hasMatcher()) {
         collectDelegates(onMatch.getMatcher(), map, context);
       } else if (onMatch.hasAction()) {
         TypedExtensionConfig action = onMatch.getAction();
-        if (!map.containsKey(action.getName())) {
+        // Keyed by the action message rather than by action.name: `name` is documentation only
+        // ("is not used to select the extension") and the proto imposes no uniqueness rule, so
+        // two distinct actions may share a name, and gRPC-Java does not require the name to be
+        // set at all. gRPC C++ keys its equivalent map by the Action* pointer for the same
+        // reason. Identical actions still collapse to one entry, which is intended.
+        if (!map.containsKey(action)) {
           FilterDelegate delegate = createFilterDelegate(action, context);
           if (delegate != null) {
-            map.put(action.getName(), delegate);
+            map.put(action, delegate);
           }
         }
       }
@@ -378,12 +389,13 @@ final class CompositeFilter implements Filter {
           if (provider == null) {
             throw new IllegalArgumentException("Action filter not found: " + typeUrl);
           }
-          int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
-          if (depth >= 8) {
-            throw new IllegalArgumentException("Maximum recursion depth of 8 exceeded");
+
+          if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
+            throw new IllegalArgumentException(
+                "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
           }
           Filter.FilterConfigParseContext childContext =
-              context.toBuilder().recursionDepth(depth + 1).build();
+              context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
           ConfigOrError<? extends FilterConfig> parsed =
               provider.parseFilterConfig(rawConfig, childContext);
           if (parsed.errorDetail != null) {
@@ -406,10 +418,10 @@ final class CompositeFilter implements Filter {
   static final class CompositeFilterConfig implements FilterConfig {
     @Nullable
     final UnifiedMatcher matcher;
-    final Map<String, FilterDelegate> delegates;
+    final Map<TypedExtensionConfig, FilterDelegate> delegates;
 
     CompositeFilterConfig(@Nullable UnifiedMatcher matcher,
-        Map<String, FilterDelegate> delegates) {
+        Map<TypedExtensionConfig, FilterDelegate> delegates) {
       this.matcher = matcher;
       this.delegates = delegates != null
           ? Collections.unmodifiableMap(delegates) : Collections.emptyMap();
@@ -453,8 +465,12 @@ final class CompositeFilter implements Filter {
         case MILLION:
           denominator = 1000000.0;
           break;
+        case UNRECOGNIZED:
         default:
-          denominator = 100.0;
+          // Guessing here would silently widen the sample: a numerator meant as a fraction of a
+          // denominator we do not know would be read as a percentage. Reject the config instead.
+          throw new IllegalArgumentException(
+              "Unknown denominator type: " + samplePercent.getDenominator());
       }
       return numerator / denominator;
     }
@@ -525,7 +541,7 @@ final class CompositeFilter implements Filter {
       return null;
     }
 
-    final Map<String, ResolvedDelegate<ClientInterceptor>> resolvedDelegates =
+    final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> resolvedDelegates =
         resolveAll(effective, delegate -> resolveClientDelegate(delegate, scheduler));
 
     return new ClientInterceptor() {
@@ -549,7 +565,7 @@ final class CompositeFilter implements Filter {
       return null;
     }
 
-    final Map<String, ResolvedDelegate<ServerInterceptor>> resolvedDelegates =
+    final Map<TypedExtensionConfig, ResolvedDelegate<ServerInterceptor>> resolvedDelegates =
         resolveAll(effective, this::resolveServerDelegate);
 
     return new ServerInterceptor() {
@@ -610,10 +626,10 @@ final class CompositeFilter implements Filter {
    * defeat the caches and shared connections that {@link Filter} implementations are documented to
    * own, and would violate {@link Filter.Provider#newInstance}'s lifecycle contract.
    */
-  private <I> Map<String, ResolvedDelegate<I>> resolveAll(
+  private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> resolveAll(
       CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {
-    Map<String, ResolvedDelegate<I>> resolved = new HashMap<>();
-    for (Map.Entry<String, FilterDelegate> entry : effective.delegates.entrySet()) {
+    Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new HashMap<>();
+    for (Map.Entry<TypedExtensionConfig, FilterDelegate> entry : effective.delegates.entrySet()) {
       resolved.put(entry.getKey(), resolver.apply(entry.getValue()));
     }
     return Collections.unmodifiableMap(resolved);
@@ -747,13 +763,13 @@ final class CompositeFilter implements Filter {
   }
 
   static <I> List<ResolvedDelegate<I>> resolveDelegates(@Nullable MatchResult matchResult,
-      Map<String, ResolvedDelegate<I>> delegatesMap) {
+      Map<TypedExtensionConfig, ResolvedDelegate<I>> delegatesMap) {
     if (matchResult == null || !matchResult.matched || matchResult.actions.isEmpty()) {
       return Collections.emptyList();
     }
     List<ResolvedDelegate<I>> list = new ArrayList<>();
     for (TypedExtensionConfig action : matchResult.actions) {
-      ResolvedDelegate<I> d = delegatesMap.get(action.getName());
+      ResolvedDelegate<I> d = delegatesMap.get(action);
       if (d != null) {
         list.add(d);
       }
@@ -787,7 +803,7 @@ final class CompositeFilter implements Filter {
     private final CallOptions callOptions;
     private final Channel next;
     private final UnifiedMatcher matcher;
-    private final Map<String, ResolvedDelegate<ClientInterceptor>> delegatesMap;
+    private final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> delegatesMap;
     private final Object lock = new Object();
     private ClientCall<ReqT, RespT> delegate;
     private boolean started;
@@ -795,7 +811,7 @@ final class CompositeFilter implements Filter {
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
         Channel next, UnifiedMatcher matcher,
-        Map<String, ResolvedDelegate<ClientInterceptor>> delegatesMap) {
+        Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> delegatesMap) {
       this.method = method;
       this.callOptions = callOptions;
       this.next = next;

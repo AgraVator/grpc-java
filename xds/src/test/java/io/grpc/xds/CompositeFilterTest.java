@@ -17,6 +17,7 @@
 package io.grpc.xds;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -29,6 +30,7 @@ import static org.mockito.Mockito.when;
 import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.github.xds.type.matcher.v3.Matcher;
 import com.github.xds.type.matcher.v3.StringMatcher;
+import com.google.common.collect.Iterables;
 import com.google.protobuf.Any;
 import io.envoyproxy.envoy.config.core.v3.RuntimeFractionalPercent;
 import io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig;
@@ -187,6 +189,32 @@ public class CompositeFilterTest {
         .build();
   }
 
+  /**
+   * Builds an ExecuteFilterAction whose action name is chosen independently of the child filter
+   * name, so that tests can construct two distinct actions that share a name.
+   */
+  private static Matcher.OnMatch createExecuteActionNamed(
+      String actionName, String childName, String typeUrl) {
+    return Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName(actionName)
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/envoy.extensions.filters.http.composite.v3"
+                    + ".ExecuteFilterAction")
+                .setValue(ExecuteFilterAction.newBuilder()
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName(childName)
+                        .setTypedConfig(Any.newBuilder()
+                            .setTypeUrl(typeUrl)
+                            .setValue(Composite.getDefaultInstance().toByteString())
+                            .build())
+                        .build())
+                    .build().toByteString())
+                .build())
+            .build())
+        .build();
+  }
+
   private static Matcher.MatcherList.FieldMatcher createHeaderFieldMatcher(
       String headerName, String headerValue, Matcher.OnMatch onMatch) {
     return Matcher.MatcherList.FieldMatcher.newBuilder()
@@ -231,7 +259,78 @@ public class CompositeFilterTest {
     assertThat(result.errorDetail).isNull();
     assertThat(result.config).isNotNull();
     assertThat(result.config.matcher).isNotNull();
-    assertThat(result.config.delegates).containsKey("action_child");
+    assertThat(result.config.delegates).hasSize(1);
+    assertThat(Iterables.getOnlyElement(result.config.delegates.keySet()).getName())
+        .isEqualTo("action_child");
+  }
+
+  @Test
+  public void parseFilterConfig_actionsSharingANameAreBothRetained() {
+    // An action's `name` is documentation only -- the proto says it "is not used to select the
+    // extension" -- and nothing requires it to be unique or even set. Keying delegates by name
+    // silently dropped the second action, so a matcher branch could resolve to the wrong child
+    // filter, or to none at all. gRPC C++ keys the equivalent map by the Action* pointer.
+    Matcher.OnMatch first = createExecuteActionNamed("dup", "childA", FAKE_TYPE_URL);
+    Matcher.OnMatch second = createExecuteActionNamed("dup", "childB", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "a", first))
+            .addMatchers(createHeaderFieldMatcher("foo", "b", second))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config.delegates).hasSize(2);
+    assertThat(result.config.delegates).containsKey(first.getAction());
+    assertThat(result.config.delegates).containsKey(second.getAction());
+    for (com.github.xds.core.v3.TypedExtensionConfig key : result.config.delegates.keySet()) {
+      assertThat(key.getName()).isEqualTo("dup");
+    }
+  }
+
+  @Test
+  public void parseFilterConfig_identicalActionsCollapseToOneDelegate() {
+    // Two byte-identical actions describe the same work, so sharing a delegate is intended and
+    // keeps the map from growing with every duplicated matcher branch.
+    Matcher.OnMatch action = createExecuteActionNamed("same", "child", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "a", action))
+            .addMatchers(createHeaderFieldMatcher("foo", "b", action))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config.delegates).hasSize(1);
+  }
+
+  @Test
+  public void parseFilterConfig_actionsWithNoNameAreBothRetained() {
+    // gRPC-Java does not enforce min_len:1 on the action name, so an unset name is legal and
+    // would previously have collapsed every anonymous action onto the empty-string key.
+    Matcher.OnMatch first = createExecuteActionNamed("", "childA", FAKE_TYPE_URL);
+    Matcher.OnMatch second = createExecuteActionNamed("", "childB", FAKE_TYPE_URL);
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "a", first))
+            .addMatchers(createHeaderFieldMatcher("foo", "b", second))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config.delegates).hasSize(2);
   }
 
   @Test
@@ -283,13 +382,15 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void parseFilterConfig_failsWhenDisabled() {
+  public void whenDisabled_reportedAsUnsupportedRatherThanFailingToParse() {
     System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     try {
-      ExtensionWithMatcher proto = createExtensionWithMatcher(Matcher.getDefaultInstance());
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-          provider.parseFilterConfig(Any.pack(proto), getFilterContext());
-      assertThat(result.errorDetail).contains("Composite Filter is experimental");
+      // The resource layer honours the http_filter's is_optional flag when a filter is
+      // unsupported, but treats a config parse error as a fatal NACK. Reporting "disabled" as
+      // unsupported therefore lets an optional composite filter be skipped instead of rejecting
+      // the entire listener.
+      assertThat(provider.isClientFilter()).isFalse();
+      assertThat(provider.isServerFilter()).isFalse();
     } finally {
       System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     }
@@ -333,7 +434,7 @@ public class CompositeFilterTest {
     when(fakeProvider.parseFilterConfig(any(), any()))
         .thenAnswer(invocation -> {
           FilterConfigParseContext context = invocation.getArgument(1);
-          int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
+          int depth = context.recursionDepth();
           FilterConfigParseContext childContext = context.toBuilder()
               .recursionDepth(depth + 1)
               .build();
@@ -558,16 +659,9 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void parseFilterConfigOverride_failsWhenDisabled() {
-    System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
-    try {
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-          provider.parseFilterConfigOverride(
-              Any.pack(ExtensionWithMatcherPerRoute.getDefaultInstance()), getFilterContext());
-      assertThat(result.errorDetail).contains("Composite Filter is experimental");
-    } finally {
-      System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
-    }
+  public void whenEnabled_reportedAsSupportedOnBothSides() {
+    assertThat(provider.isClientFilter()).isTrue();
+    assertThat(provider.isServerFilter()).isTrue();
   }
 
   @Test
@@ -1382,6 +1476,67 @@ public class CompositeFilterTest {
 
     when(mockRandom.nextDouble()).thenReturn(0.6);
     assertThat(delegate.shouldExecute()).isFalse();
+  }
+
+  @Test
+  public void samplePercentUnknownDenominator_rejected() {
+    FractionalPercent percent = FractionalPercent.newBuilder()
+        .setNumerator(50)
+        .setDenominatorValue(9999) // a denominator this build does not know
+        .build();
+
+    // Falling back to HUNDRED would read a numerator meant as a fraction of some much larger
+    // denominator as a percentage, running the action far more often than configured.
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+        () -> new CompositeFilter.FilterDelegate(
+            Collections.emptyList(), percent, mock(ThreadSafeRandom.class)));
+    assertThat(e).hasMessageThat().contains("Unknown denominator type");
+  }
+
+  @Test
+  public void parseFilterConfig_unknownSamplePercentDenominator_nacks() {
+    Matcher.OnMatch action = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_sampled")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/envoy.extensions.filters.http.composite.v3"
+                    + ".ExecuteFilterAction")
+                .setValue(ExecuteFilterAction.newBuilder()
+                    .setSamplePercent(RuntimeFractionalPercent.newBuilder()
+                        .setDefaultValue(FractionalPercent.newBuilder()
+                            .setNumerator(50)
+                            .setDenominatorValue(9999)
+                            .build())
+                        .build())
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName("child")
+                        .setTypedConfig(Any.newBuilder()
+                            .setTypeUrl(FAKE_TYPE_URL)
+                            .setValue(Composite.getDefaultInstance().toByteString())
+                            .build())
+                        .build())
+                    .build().toByteString())
+                .build())
+            .build())
+        .build();
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", action))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Unknown denominator type");
+  }
+
+  @Test
+  public void filterConfigParseContext_recursionDepthDefaultsToZero() {
+    // Callers outside the composite filter never set a depth, so the default has to be the
+    // top-level value rather than an absent one every reader has to translate.
+    assertThat(getFilterContext().recursionDepth()).isEqualTo(0);
   }
 
   @Test

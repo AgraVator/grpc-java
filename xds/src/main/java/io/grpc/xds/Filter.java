@@ -139,13 +139,17 @@ interface Filter extends Closeable {
 
     abstract ServerInfo serverInfo();
 
-    @Nullable
-    abstract Integer recursionDepth();
+    /**
+     * How many enclosing filter configs this config is nested inside. Zero for a filter config
+     * parsed directly from a listener or a route; incremented by filters that parse other filters'
+     * configs, so that they can bound recursion.
+     */
+    abstract int recursionDepth();
 
     abstract Builder toBuilder();
 
     static Builder builder() {
-      return new AutoValue_Filter_FilterConfigParseContext.Builder();
+      return new AutoValue_Filter_FilterConfigParseContext.Builder().recursionDepth(0);
     }
 
     @AutoValue.Builder
@@ -154,7 +158,7 @@ interface Filter extends Closeable {
 
       abstract Builder serverInfo(ServerInfo info);
 
-      abstract Builder recursionDepth(Integer depth);
+      abstract Builder recursionDepth(int depth);
 
       abstract FilterConfigParseContext build();
     }

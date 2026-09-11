@@ -267,7 +267,7 @@ public class CompositeFilterAdversarialTest {
     when(fakeProvider.parseFilterConfig(any(), any()))
         .thenAnswer(invocation -> {
           FilterConfigParseContext context = invocation.getArgument(1);
-          int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
+          int depth = context.recursionDepth();
           if (depth < 7) {
             return provider.parseFilterConfig(leafConfig, context);
           }
@@ -293,7 +293,7 @@ public class CompositeFilterAdversarialTest {
     when(fakeProvider.parseFilterConfig(any(), any()))
         .thenAnswer(invocation -> {
           FilterConfigParseContext context = invocation.getArgument(1);
-          int depth = context.recursionDepth() != null ? context.recursionDepth() : 0;
+          int depth = context.recursionDepth();
           if (depth <= 8) {
             return provider.parseFilterConfig(leafConfig, context);
           }
@@ -527,14 +527,16 @@ public class CompositeFilterAdversarialTest {
 
   @Test
   public void actionTypeUrl_bareFilterDirectlyAsOnMatchAction_failsOpenOrRejected() {
-    Matcher.OnMatch bareFilterAction = Matcher.OnMatch.newBuilder()
-        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+    com.github.xds.core.v3.TypedExtensionConfig bareAction =
+        com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
             .setName("action_bare")
             .setTypedConfig(Any.newBuilder()
                 .setTypeUrl(FAKE_TYPE_URL) // Registered filter directly as action
                 .setValue(ByteString.EMPTY)
                 .build())
-            .build())
+            .build();
+    Matcher.OnMatch bareFilterAction = Matcher.OnMatch.newBuilder()
+        .setAction(bareAction)
         .build();
 
     Matcher matcher = Matcher.newBuilder().setOnNoMatch(bareFilterAction).build();
@@ -547,7 +549,7 @@ public class CompositeFilterAdversarialTest {
     // ExecuteFilterAction"
     if (result.errorDetail == null) {
       // Check if it was added to delegates map or if it was dropped (failing open!)
-      boolean addedToDelegates = result.config.delegates.containsKey("action_bare");
+      boolean addedToDelegates = result.config.delegates.containsKey(bareAction);
       if (!addedToDelegates) {
         fail("FAIL-OPEN VULNERABILITY: Bare filter provider was accepted as action, but omitted "
             + "from delegates (fails open at runtime)!");

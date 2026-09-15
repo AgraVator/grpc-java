@@ -1435,10 +1435,10 @@ public class CompositeFilterTest {
     CompositeFilter.FilterDelegate delegate = new CompositeFilter.FilterDelegate(
         Collections.emptyList(), percent, mockRandom);
 
-    when(mockRandom.nextDouble()).thenReturn(0.4);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(400_000);
     assertThat(delegate.shouldExecute()).isTrue();
 
-    when(mockRandom.nextDouble()).thenReturn(0.6);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(600_000);
     assertThat(delegate.shouldExecute()).isFalse();
   }
 
@@ -1453,10 +1453,10 @@ public class CompositeFilterTest {
     CompositeFilter.FilterDelegate delegate = new CompositeFilter.FilterDelegate(
         Collections.emptyList(), percent, mockRandom);
 
-    when(mockRandom.nextDouble()).thenReturn(0.4);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(400_000);
     assertThat(delegate.shouldExecute()).isTrue();
 
-    when(mockRandom.nextDouble()).thenReturn(0.6);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(600_000);
     assertThat(delegate.shouldExecute()).isFalse();
   }
 
@@ -1471,10 +1471,10 @@ public class CompositeFilterTest {
     CompositeFilter.FilterDelegate delegate = new CompositeFilter.FilterDelegate(
         Collections.emptyList(), percent, mockRandom);
 
-    when(mockRandom.nextDouble()).thenReturn(0.4);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(400_000);
     assertThat(delegate.shouldExecute()).isTrue();
 
-    when(mockRandom.nextDouble()).thenReturn(0.6);
+    when(mockRandom.nextInt(1_000_000)).thenReturn(600_000);
     assertThat(delegate.shouldExecute()).isFalse();
   }
 

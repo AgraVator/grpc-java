@@ -435,7 +435,7 @@ final class CompositeFilter implements Filter {
 
   static final class FilterDelegate {
     final List<DelegateEntry> delegates;
-    private final double threshold;
+    private final int ratePerMillion;
     private final ThreadSafeRandom random;
 
     FilterDelegate(List<DelegateEntry> delegates, @Nullable FractionalPercent samplePercent) {
@@ -445,25 +445,25 @@ final class CompositeFilter implements Filter {
     FilterDelegate(List<DelegateEntry> delegates, @Nullable FractionalPercent samplePercent,
         ThreadSafeRandom random) {
       this.delegates = Collections.unmodifiableList(delegates);
-      this.threshold = calculateThreshold(samplePercent);
+      this.ratePerMillion = calculateRatePerMillion(samplePercent);
       this.random = random;
     }
 
-    private static double calculateThreshold(@Nullable FractionalPercent samplePercent) {
+    private static int calculateRatePerMillion(@Nullable FractionalPercent samplePercent) {
       if (samplePercent == null) {
-        return 1.0;
+        return 1_000_000;
       }
-      double numerator = samplePercent.getNumerator();
-      double denominator;
+      long numerator = Integer.toUnsignedLong(samplePercent.getNumerator());
+      long rate;
       switch (samplePercent.getDenominator()) {
         case HUNDRED:
-          denominator = 100.0;
+          rate = numerator * 10_000L;
           break;
         case TEN_THOUSAND:
-          denominator = 10000.0;
+          rate = numerator * 100L;
           break;
         case MILLION:
-          denominator = 1000000.0;
+          rate = numerator;
           break;
         case UNRECOGNIZED:
         default:
@@ -472,17 +472,17 @@ final class CompositeFilter implements Filter {
           throw new IllegalArgumentException(
               "Unknown denominator type: " + samplePercent.getDenominator());
       }
-      return numerator / denominator;
+      return (int) Math.min(rate, 1_000_000L);
     }
 
     boolean shouldExecute() {
-      if (threshold >= 1.0) {
+      if (ratePerMillion >= 1_000_000) {
         return true;
       }
-      if (threshold <= 0.0) {
+      if (ratePerMillion <= 0) {
         return false;
       }
-      return random.nextDouble() < threshold;
+      return random.nextInt(1_000_000) < ratePerMillion;
     }
   }
 

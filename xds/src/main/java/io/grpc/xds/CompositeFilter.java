@@ -970,9 +970,12 @@ final class CompositeFilter implements Filter {
         logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
             new Object[] {interceptors.size(), method.getFullMethodName()});
       }
+      // interceptForward, not intercept: A103 specifies filter_chain as "a chain of filters to
+      // call, in order", so the first entry has to run first. ClientInterceptors.intercept makes
+      // the *last* interceptor outermost, which would run the chain backwards.
       ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
           ? next.newCall(method, callOptions)
-          : ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);
+          : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
 
       synchronized (lock) {
         if (cancelStatus != null) {

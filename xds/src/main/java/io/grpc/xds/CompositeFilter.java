@@ -166,10 +166,8 @@ final class CompositeFilter implements Filter {
               "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
         }
         // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
-        // per-route override may still supply one. This matches gRPC C++, whose
-        // ParseTopLevelConfig() leaves config->matcher null without adding a validation error,
-        // and whose data plane then starts the child call directly. The deprecated `matcher`
-        // field is ignored, per A103.
+        // per-route override may still supply one. The deprecated `matcher` field is ignored,
+        // per A103.
         return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
@@ -195,8 +193,7 @@ final class CompositeFilter implements Filter {
         }
         ExtensionWithMatcherPerRoute proto = any.unpack(ExtensionWithMatcherPerRoute.class);
         // Unlike the top-level config, a per-route override carries nothing but the matcher, so
-        // an absent one is a configuration error rather than a no-op. gRPC C++ likewise NACKs
-        // here, with "...ExtensionWithMatcherPerRoute].xds_matcher error:field not set".
+        // an absent one is a configuration error rather than a no-op.
         if (!proto.hasXdsMatcher()) {
           return ConfigOrError.fromError(
               "ExtensionWithMatcherPerRoute.xds_matcher: field not set");
@@ -308,8 +305,7 @@ final class CompositeFilter implements Filter {
         // Keyed by the action message rather than by action.name: `name` is documentation only
         // ("is not used to select the extension") and the proto imposes no uniqueness rule, so
         // two distinct actions may share a name, and gRPC-Java does not require the name to be
-        // set at all. gRPC C++ keys its equivalent map by the Action* pointer for the same
-        // reason. Identical actions still collapse to one entry, which is intended.
+        // set at all. Identical actions still collapse to one entry, which is intended.
         if (!map.containsKey(action)) {
           FilterDelegate delegate = createFilterDelegate(action, context);
           if (delegate != null) {
@@ -338,8 +334,8 @@ final class CompositeFilter implements Filter {
         ExecuteFilterAction executeAction = actionAny.unpack(ExecuteFilterAction.class);
         // A103 requires default_value to be present whenever sample_percent is; without this
         // check the unset message would read as 0%, silently disabling the action instead of
-        // rejecting the config. gRPC C++ reports the same error. runtime_key is ignored, per
-        // A103, because gRPC has no runtime system.
+        // rejecting the config. runtime_key is ignored, per A103, because gRPC has no runtime
+        // system.
         FractionalPercent samplePercent = null;
         if (executeAction.hasSamplePercent()) {
           if (!executeAction.getSamplePercent().hasDefaultValue()) {
@@ -612,12 +608,9 @@ final class CompositeFilter implements Filter {
    * Builds the nested filters and their interceptors for every action in the matcher tree. This
    * runs once per configuration update, not per RPC.
    *
-   * <p>This mirrors the reference implementations. In Envoy, {@code ExecuteFilterAction} stores an
-   * {@code Http::FilterFactoryCb} created by {@code ExecuteFilterActionFactory::createAction()} at
-   * config load and merely invokes it per stream. In gRPC C++, {@code CompositeFilter} caches
-   * per-action filter chains in {@code filter_chain_map_}. Creating nested filters per RPC would
-   * defeat the caches and shared connections that {@link Filter} implementations are documented to
-   * own, and would violate {@link Filter.Provider#newInstance}'s lifecycle contract.
+   * <p>Creating nested filters per RPC would defeat the caches and shared connections that
+   * {@link Filter} implementations are documented to own, and would violate
+   * {@link Filter.Provider#newInstance}'s lifecycle contract.
    */
   private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> resolveAll(
       CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {
@@ -672,20 +665,14 @@ final class CompositeFilter implements Filter {
    * new generation retires the previous one wholesale, {@link #getOrCreateNestedFilter} promotes
    * back anything still configured, and only the leftovers are closed.
    *
-   * <p>gRPC C++ solves the same problem with its {@code Blackboard}. It has used two designs. The
-   * original one is what this method implements: an explicit carry-forward step
-   * ({@code UpdateBlackboard(old_blackboard, new_blackboard)}) followed by dropping the old
-   * container, so unclaimed state died deterministically at the swap. C++ has since replaced it
-   * with a single long-lived blackboard holding weak references, letting refcounting destroy an
-   * entry once the last config referencing it goes away. That second design does not port to
-   * Java: {@link Filter#close} has to be called explicitly, and garbage collection will not do it,
-   * so the resources would leak even after the object became unreachable. Hence the explicit
-   * approach.
+   * <p>Cleanup has to be driven explicitly rather than by reachability: {@link Filter#close} has
+   * to be called by hand and garbage collection will not do it, so a filter that merely became
+   * unreachable would leak the resources it owns. Hence the explicit rotate-and-reclaim.
    *
-   * <p>One difference from C++: a configuration generation here has no explicit end, since the
-   * resolver calls {@code buildXInterceptor} once per route and never signals the last one. A
-   * generation's leftovers can therefore only be released once the following generation begins,
-   * which bounds live instances at two generations instead of letting them grow without limit.
+   * <p>A configuration generation has no explicit end, since the resolver calls
+   * {@code buildXInterceptor} once per route and never signals the last one. A generation's
+   * leftovers can therefore only be released once the following generation begins, which bounds
+   * live instances at two generations instead of letting them grow without limit.
    */
   private List<Filter> rotateGenerationIfNeeded(FilterConfig topLevelConfig) {
     synchronized (filtersLock) {

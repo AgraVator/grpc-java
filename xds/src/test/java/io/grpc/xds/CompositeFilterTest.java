@@ -268,7 +268,7 @@ public class CompositeFilterTest {
     // An action's `name` is documentation only -- the proto says it "is not used to select the
     // extension" -- and nothing requires it to be unique or even set. Keying delegates by name
     // silently dropped the second action, so a matcher branch could resolve to the wrong child
-    // filter, or to none at all. gRPC C++ keys the equivalent map by the Action* pointer.
+    // filter, or to none at all.
     Matcher.OnMatch first = createExecuteActionNamed("dup", "childA", FAKE_TYPE_URL);
     Matcher.OnMatch second = createExecuteActionNamed("dup", "childB", FAKE_TYPE_URL);
     Matcher matcher = Matcher.newBuilder()
@@ -622,7 +622,6 @@ public class CompositeFilterTest {
   @Test
   public void parseFilterConfigOverride_missingXdsMatcherIsRejected() {
     // A per-route override consists of nothing but the matcher, so an absent one is an error.
-    // gRPC C++ NACKs here too: ".xds_matcher error:field not set".
     ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
         provider.parseFilterConfigOverride(
             Any.pack(ExtensionWithMatcherPerRoute.getDefaultInstance()), getFilterContext());
@@ -635,8 +634,7 @@ public class CompositeFilterTest {
   @Test
   public void parseFilterConfig_missingXdsMatcherIsAllowedAndActsAsNoOp() {
     // Unlike the override, a top-level config without a matcher is valid; the filter becomes a
-    // passthrough and a per-route override may still supply a matcher. This mirrors gRPC C++
-    // (ParseTopLevelConfig leaves config->matcher null, no validation error).
+    // passthrough and a per-route override may still supply a matcher.
     ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
         .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
             .setName("composite")

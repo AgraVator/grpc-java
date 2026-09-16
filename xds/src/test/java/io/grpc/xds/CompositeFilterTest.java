@@ -32,6 +32,7 @@ import com.github.xds.type.matcher.v3.Matcher;
 import com.github.xds.type.matcher.v3.StringMatcher;
 import com.google.common.collect.Iterables;
 import com.google.protobuf.Any;
+import com.google.protobuf.ByteString;
 import io.envoyproxy.envoy.config.core.v3.RuntimeFractionalPercent;
 import io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
@@ -75,6 +76,9 @@ public class CompositeFilterTest {
 
   private static final String FAKE_TYPE_URL = "type.googleapis.com/fake";
   private static final String FAKE_UNSUPPORTED_TYPE_URL = "type.googleapis.com/fake.unsupported";
+  private static final String FAKE_FAILING_PARSE_TYPE_URL = "type.googleapis.com/fake.failing";
+  private static final String EXECUTE_ACTION_TYPE_URL =
+      "type.googleapis.com/envoy.extensions.filters.http.composite.v3.ExecuteFilterAction";
 
   private CompositeFilter.Provider provider;
 
@@ -82,6 +86,8 @@ public class CompositeFilterTest {
   private Filter.Provider fakeProvider;
   @Mock
   private Filter.Provider fakeUnsupportedProvider;
+  @Mock
+  private Filter.Provider fakeFailingProvider;
   @Mock
   private Filter fakeFilter;
   @Mock
@@ -114,12 +120,21 @@ public class CompositeFilterTest {
         any(com.google.protobuf.Message.class), any()))
         .thenReturn((ConfigOrError) configRes);
 
+    when(fakeFailingProvider.typeUrls()).thenReturn(new String[]{FAKE_FAILING_PARSE_TYPE_URL});
+    when(fakeFailingProvider.isClientFilter()).thenReturn(true);
+    when(fakeFailingProvider.isServerFilter()).thenReturn(true);
+    when(fakeFailingProvider.parseFilterConfig(any(com.google.protobuf.Message.class), any()))
+        .thenReturn(ConfigOrError.fromError("Child filter config parsing failed intentionally"));
+
     provider = new CompositeFilter.Provider(typeUrl -> {
       if (FAKE_TYPE_URL.equals(typeUrl)) {
         return fakeProvider;
       }
       if (FAKE_UNSUPPORTED_TYPE_URL.equals(typeUrl)) {
         return fakeUnsupportedProvider;
+      }
+      if (FAKE_FAILING_PARSE_TYPE_URL.equals(typeUrl)) {
+        return fakeFailingProvider;
       }
       return FilterRegistry.getDefaultRegistry().get(typeUrl);
     });
@@ -394,19 +409,6 @@ public class CompositeFilterTest {
   }
 
   @Test
-  public void parseFilterConfig_missingCompositeInExtensionConfigFails() {
-    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
-        .setExtensionConfig(TypedExtensionConfig.newBuilder().setName("composite").build())
-        .build();
-
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
-
-    assertThat(result.errorDetail).contains(
-        "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
-  }
-
-  @Test
   public void parseFilterConfig_emptyConfigWithExtensionWithMatcherSucceeds() {
     ExtensionWithMatcher protoNoMatcher = ExtensionWithMatcher.newBuilder()
         .setExtensionConfig(TypedExtensionConfig.newBuilder()
@@ -446,28 +448,6 @@ public class CompositeFilterTest {
     } finally {
       System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     }
-  }
-
-  @Test
-  public void parseFilterConfig_invalidMessageType() {
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfig(com.google.protobuf.Empty.getDefaultInstance(),
-            getFilterContext());
-
-    assertThat(result.errorDetail).contains("Invalid message type");
-  }
-
-  @Test
-  public void parseFilterConfig_invalidProtoBytes() {
-    Any invalidAny = Any.newBuilder()
-        .setTypeUrl(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER)
-        .setValue(com.google.protobuf.ByteString.copyFrom(new byte[]{(byte) 0x80}))
-        .build();
-
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfig(invalidAny, getFilterContext());
-
-    assertThat(result.errorDetail).contains("Invalid proto:");
   }
 
   @Test
@@ -648,40 +628,6 @@ public class CompositeFilterTest {
         provider.parseFilterConfigOverride(Any.pack(configProto), getFilterContext());
 
     assertThat(result.errorDetail).contains("Expected ExtensionWithMatcherPerRoute but got");
-  }
-
-  @Test
-  public void parseFilterConfigOverride_invalidMessageType() {
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfigOverride(
-            com.google.protobuf.Empty.getDefaultInstance(), getFilterContext());
-
-    assertThat(result.errorDetail).contains("Invalid message type");
-  }
-
-  @Test
-  public void parseFilterConfigOverride_invalidProtoBytes() {
-    Any invalidAny = Any.newBuilder()
-        .setTypeUrl(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE)
-        .setValue(com.google.protobuf.ByteString.copyFrom(new byte[]{(byte) 0x80}))
-        .build();
-
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfigOverride(invalidAny, getFilterContext());
-
-    assertThat(result.errorDetail).contains("Invalid proto:");
-  }
-
-  @Test
-  public void parseFilterConfigOverride_missingXdsMatcherIsRejected() {
-    // A per-route override consists of nothing but the matcher, so an absent one is an error.
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfigOverride(
-            Any.pack(ExtensionWithMatcherPerRoute.getDefaultInstance()), getFilterContext());
-
-    assertThat(result.config).isNull();
-    assertThat(result.errorDetail)
-        .contains("ExtensionWithMatcherPerRoute.xds_matcher: field not set");
   }
 
   @Test
@@ -1962,5 +1908,1138 @@ public class CompositeFilterTest {
 
     verify(fakeClientInterceptor).interceptCall(any(), any(), any());
     verify(childCall).start(any(), eq(headers));
+  }
+
+  // =========================================================================
+  // 1. RECURSION DEPTH BOUNDARY: Depth 7 (allowed) vs Depth 8 (rejected)
+  // =========================================================================
+
+  @Test
+  public void recursionDepth_contextDepth7_allowed() {
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("c", FAKE_TYPE_URL)))
+            .build())
+        .build();
+    Any configAny = Any.pack(createExtensionWithMatcher(matcher));
+
+    FilterConfigParseContext ctxDepth7 = getFilterContext().toBuilder()
+        .recursionDepth(7)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(configAny, ctxDepth7);
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config).isNotNull();
+  }
+
+  @Test
+  public void recursionDepth_contextDepth8_rejected() {
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("c", FAKE_TYPE_URL)))
+            .build())
+        .build();
+    Any configAny = Any.pack(createExtensionWithMatcher(matcher));
+
+    FilterConfigParseContext ctxDepth8 = getFilterContext().toBuilder()
+        .recursionDepth(8)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(configAny, ctxDepth8);
+
+    assertThat(result.errorDetail).contains("Maximum recursion depth of 8 exceeded");
+    assertThat(result.config).isNull();
+  }
+
+  @Test
+  public void recursionDepthOverride_contextDepth7_allowed() {
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("c", FAKE_TYPE_URL)))
+            .build())
+        .build();
+    Any configAny = Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+        .setXdsMatcher(matcher)
+        .build());
+
+    FilterConfigParseContext ctxDepth7 = getFilterContext().toBuilder()
+        .recursionDepth(7)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(configAny, ctxDepth7);
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config).isNotNull();
+  }
+
+  @Test
+  public void recursionDepthOverride_contextDepth8_rejected() {
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("c", FAKE_TYPE_URL)))
+            .build())
+        .build();
+    Any configAny = Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+        .setXdsMatcher(matcher)
+        .build());
+
+    FilterConfigParseContext ctxDepth8 = getFilterContext().toBuilder()
+        .recursionDepth(8)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(configAny, ctxDepth8);
+
+    assertThat(result.errorDetail).contains("Maximum recursion depth of 8 exceeded");
+    assertThat(result.config).isNull();
+  }
+
+  @Test
+  public void recursionDepth_nestedCompositeFilters_depth7Allowed() {
+    final Any leafConfig = Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("leaf", FAKE_TYPE_URL)))
+            .build())
+        .build()));
+
+    when(fakeProvider.parseFilterConfig(any(), any()))
+        .thenAnswer(invocation -> {
+          FilterConfigParseContext context = invocation.getArgument(1);
+          int depth = context.recursionDepth();
+          if (depth < 7) {
+            return provider.parseFilterConfig(leafConfig, context);
+          }
+          return ConfigOrError.fromConfig(fakeConfig);
+        });
+
+    ConfigOrError<? extends FilterConfig> result =
+        provider.parseFilterConfig(leafConfig, getFilterContext());
+
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config).isNotNull();
+  }
+
+  @Test
+  public void recursionDepth_nestedCompositeFilters_depth8Rejected() {
+    final Any leafConfig = Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "v", createExecuteAction("child", FAKE_TYPE_URL)))
+            .build())
+        .build()));
+
+    when(fakeProvider.parseFilterConfig(any(), any()))
+        .thenAnswer(invocation -> {
+          FilterConfigParseContext context = invocation.getArgument(1);
+          int depth = context.recursionDepth();
+          if (depth <= 8) {
+            return provider.parseFilterConfig(leafConfig, context);
+          }
+          return ConfigOrError.fromConfig(fakeConfig);
+        });
+
+    ConfigOrError<? extends FilterConfig> result =
+        provider.parseFilterConfig(leafConfig, getFilterContext());
+
+    assertThat(result.errorDetail).contains("Maximum recursion depth of 8 exceeded");
+  }
+
+  // =========================================================================
+  // 2. ADVERSARIAL KEEP_MATCHING=TRUE: Nested inside exactMatchMap, prefixMatchMap, onNoMatch
+  // =========================================================================
+
+  @Test
+  public void keepMatching_directInExactMatchMap_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setExactMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("key", badAction)))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_directInPrefixMatchMap_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setPrefixMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("prefix/", badAction)))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_directInOnNoMatch_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher matcher = Matcher.newBuilder()
+        .setOnNoMatch(badAction)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_deeplyNestedInsideExactMatchMap_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher innerMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setExactMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("innerKey", badAction)))
+        .build();
+
+    Matcher outerMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setExactMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("outerKey", Matcher.OnMatch.newBuilder().setMatcher(innerMatcher).build())))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(outerMatcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_deeplyNestedInsidePrefixMatchMap_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher innerMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setPrefixMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("innerPrefix/", badAction)))
+        .build();
+
+    Matcher outerMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setPrefixMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("outerPrefix/",
+                    Matcher.OnMatch.newBuilder().setMatcher(innerMatcher).build())))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(outerMatcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_deeplyNestedInsideOnNoMatch_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher innerMatcher = Matcher.newBuilder()
+        .setOnNoMatch(badAction)
+        .build();
+
+    Matcher outerMatcher = Matcher.newBuilder()
+        .setOnNoMatch(Matcher.OnMatch.newBuilder().setMatcher(innerMatcher).build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(outerMatcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  @Test
+  public void keepMatching_mixedNesting_allLevelsDetectedAndRejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setKeepMatching(true)
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("act")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
+        .build();
+
+    Matcher level3 = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setPrefixMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("l3/", badAction)))
+        .build();
+
+    Matcher level2 = Matcher.newBuilder()
+        .setOnNoMatch(Matcher.OnMatch.newBuilder().setMatcher(level3).build())
+        .build();
+
+    Matcher level1 = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setExactMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("l1", Matcher.OnMatch.newBuilder().setMatcher(level2).build())))
+        .build();
+
+    Matcher root = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
+                .setOnMatch(Matcher.OnMatch.newBuilder().setMatcher(level1).build())))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(createExtensionWithMatcher(root)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "keep_matching is not permitted anywhere in the composite filter matcher tree");
+  }
+
+  // =========================================================================
+  // 3. ADVERSARIAL ACTION TYPE URLS: Unrecognized, Malformed, or Fail-Open
+  // =========================================================================
+
+  @Test
+  public void actionTypeUrl_completelyUnrecognized_rejected() {
+    Matcher.OnMatch badAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_unknown")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/unknown.BogusAction")
+                .setValue(ByteString.EMPTY)
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(badAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).isNotNull();
+    assertThat(result.errorDetail).contains("Expected ExecuteFilterAction or SkipFilter but got");
+  }
+
+  @Test
+  public void actionTypeUrl_bareFilterDirectlyAsOnMatchAction_rejected() {
+    com.github.xds.core.v3.TypedExtensionConfig bareAction =
+        com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_bare")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl(FAKE_TYPE_URL) // Registered filter directly as action
+                .setValue(ByteString.EMPTY)
+                .build())
+            .build();
+    Matcher.OnMatch bareFilterAction = Matcher.OnMatch.newBuilder()
+        .setAction(bareAction)
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(bareFilterAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    // Per gRFC A103: "The actions in this tree must be one of two types: SkipFilter or
+    // ExecuteFilterAction". A filter config used directly as an action is neither, so it must be
+    // rejected outright rather than silently dropped from the delegate map (which would fail open
+    // at runtime, letting the RPC through unfiltered).
+    assertThat(result.config).isNull();
+    assertThat(result.errorDetail)
+        .contains("Expected ExecuteFilterAction or SkipFilter but got: " + FAKE_TYPE_URL);
+  }
+
+  @Test
+  public void actionTypeUrl_executeFilterAction_emptyConfig_rejected() {
+    ExecuteFilterAction emptyAction = ExecuteFilterAction.newBuilder().build();
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("empty_execute_action")
+            .setTypedConfig(Any.pack(emptyAction))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    // Per gRFC A103: "It is an error if neither typed_config nor filter_chain are set."
+    assertThat(result.config).isNull();
+    assertThat(result.errorDetail)
+        .contains("ExecuteFilterAction must specify either typed_config or filter_chain");
+  }
+
+  @Test
+  public void actionTypeUrl_executeFilterAction_emptyFilterChain_acceptedAsNoOp() {
+    ExecuteFilterAction emptyChainAction = ExecuteFilterAction.newBuilder()
+        .setFilterChain(FilterChainConfiguration.newBuilder().build())
+        .build();
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("empty_chain_action")
+            .setTypedConfig(Any.pack(emptyChainAction))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    // A103 makes it an error only if neither typed_config nor filter_chain is set. An empty
+    // filter_chain is set, so the action is valid and simply runs no nested filters.
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config.delegates).hasSize(1);
+    assertThat(result.config.delegates.values().iterator().next().delegates).isEmpty();
+  }
+
+  @Test
+  public void actionTypeUrl_skipFilter_corruptedProtoBytes_rejected() {
+    // SkipFilter has no fields, but the payload must still be well-formed protobuf; accepting
+    // garbage here would silently turn a corrupt action into "skip the nested filters".
+    Matcher.OnMatch corruptSkip = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("skip_corrupt")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/"
+                    + "envoy.extensions.filters.common.matcher.action.v3.SkipFilter")
+                .setValue(ByteString.copyFrom(new byte[]{(byte) 0xff, (byte) 0xff}))
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(corruptSkip).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Could not parse SkipFilter action");
+  }
+
+  @Test
+  public void actionTypeUrl_executeFilterAction_corruptedProtoBytes_rejected() {
+    Matcher.OnMatch corruptedAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_corrupt")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl(EXECUTE_ACTION_TYPE_URL)
+                .setValue(ByteString.copyFrom(new byte[]{(byte) 0xff, (byte) 0xff}))
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(corruptedAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).isNotNull();
+  }
+
+  @Test
+  public void actionTypeUrl_executeFilterAction_unregisteredChildFilter_rejected() {
+    Matcher.OnMatch action = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_unregistered")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl(EXECUTE_ACTION_TYPE_URL)
+                .setValue(ExecuteFilterAction.newBuilder()
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName("child")
+                        .setTypedConfig(Any.newBuilder()
+                            .setTypeUrl("type.googleapis.com/unregistered.Filter")
+                            .build())
+                        .build())
+                    .build().toByteString())
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(action).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail)
+        .contains("Action filter not found: type.googleapis.com/unregistered.Filter");
+  }
+
+  @Test
+  public void actionTypeUrl_executeFilterAction_childFilterFailsParsing_rejected() {
+    Matcher.OnMatch action = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_failing")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl(EXECUTE_ACTION_TYPE_URL)
+                .setValue(ExecuteFilterAction.newBuilder()
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName("child")
+                        .setTypedConfig(Any.newBuilder()
+                            .setTypeUrl(FAKE_FAILING_PARSE_TYPE_URL)
+                            .build())
+                        .build())
+                    .build().toByteString())
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(action).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Child filter config parsing failed intentionally");
+  }
+
+  // =========================================================================
+  // 4. TERMINAL FILTER (RouterFilter) DISGUISED INSIDE TypedStruct
+  // =========================================================================
+
+  @Test
+  public void terminalFilter_disguisedInsideUdpaTypedStruct_rejected() {
+    com.google.protobuf.Struct struct = com.google.protobuf.Struct.newBuilder().build();
+    TypedStruct udpaTypedStruct = TypedStruct.newBuilder()
+        .setTypeUrl(RouterFilter.TYPE_URL)
+        .setValue(struct)
+        .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setTypedConfig(TypedExtensionConfig.newBuilder()
+            .setName("disguised_router")
+            .setTypedConfig(Any.pack(udpaTypedStruct))
+            .build())
+        .build();
+
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action")
+            .setTypedConfig(Any.pack(action))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "Nested filter cannot be a terminal filter");
+  }
+
+  @Test
+  public void terminalFilter_disguisedInsideXdsTypedStruct_rejected() {
+    com.google.protobuf.Struct struct = com.google.protobuf.Struct.newBuilder().build();
+    com.github.xds.type.v3.TypedStruct xdsTypedStruct =
+        com.github.xds.type.v3.TypedStruct.newBuilder()
+            .setTypeUrl(RouterFilter.TYPE_URL)
+            .setValue(struct)
+            .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setTypedConfig(TypedExtensionConfig.newBuilder()
+            .setName("disguised_router")
+            .setTypedConfig(Any.pack(xdsTypedStruct))
+            .build())
+        .build();
+
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action")
+            .setTypedConfig(Any.pack(action))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "Nested filter cannot be a terminal filter");
+  }
+
+  @Test
+  public void terminalFilter_disguisedInsideUdpaTypedStruct_inFilterChain_rejected() {
+    com.google.protobuf.Struct struct = com.google.protobuf.Struct.newBuilder().build();
+    TypedStruct udpaTypedStruct = TypedStruct.newBuilder()
+        .setTypeUrl(RouterFilter.TYPE_URL)
+        .setValue(struct)
+        .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setFilterChain(FilterChainConfiguration.newBuilder()
+            .addTypedConfig(TypedExtensionConfig.newBuilder()
+                .setName("valid_child")
+                .setTypedConfig(Any.newBuilder()
+                    .setTypeUrl(FAKE_TYPE_URL)
+                    .setValue(Composite.getDefaultInstance().toByteString())
+                    .build())
+                .build())
+            .addTypedConfig(TypedExtensionConfig.newBuilder()
+                .setName("hidden_router")
+                .setTypedConfig(Any.pack(udpaTypedStruct))
+                .build())
+            .build())
+        .build();
+
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action")
+            .setTypedConfig(Any.pack(action))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "Nested filter cannot be a terminal filter");
+  }
+
+  @Test
+  public void terminalFilter_disguisedInsideXdsTypedStruct_inFilterChain_rejected() {
+    com.google.protobuf.Struct struct = com.google.protobuf.Struct.newBuilder().build();
+    com.github.xds.type.v3.TypedStruct xdsTypedStruct =
+        com.github.xds.type.v3.TypedStruct.newBuilder()
+            .setTypeUrl(RouterFilter.TYPE_URL)
+            .setValue(struct)
+            .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setFilterChain(FilterChainConfiguration.newBuilder()
+            .addTypedConfig(TypedExtensionConfig.newBuilder()
+                .setName("hidden_router")
+                .setTypedConfig(Any.pack(xdsTypedStruct))
+                .build())
+            .build())
+        .build();
+
+    Matcher.OnMatch matchAction = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action")
+            .setTypedConfig(Any.pack(action))
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "Nested filter cannot be a terminal filter");
+  }
+
+  @Test
+  public void terminalFilter_childProviderReturnsRouterConfig_rejected() {
+    when(fakeProvider.parseFilterConfig(any(com.google.protobuf.Message.class), any()))
+        .thenReturn((ConfigOrError) ConfigOrError.fromConfig(RouterFilter.ROUTER_CONFIG));
+
+    Matcher matcher = Matcher.newBuilder()
+        .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains(
+        "Nested filter cannot be a terminal filter");
+  }
+
+  @Test
+  public void terminalFilter_corruptedUdpaTypedStructBytes_rejected() {
+    Any badUdpaAny = Any.newBuilder()
+        .setTypeUrl("type.googleapis.com/udpa.type.v1.TypedStruct")
+        .setValue(ByteString.copyFrom(new byte[]{(byte) 0x80}))
+        .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setTypedConfig(TypedExtensionConfig.newBuilder()
+            .setName("bad_udpa")
+            .setTypedConfig(badUdpaAny)
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder()
+        .setOnNoMatch(Matcher.OnMatch.newBuilder()
+            .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                .setName("action")
+                .setTypedConfig(Any.pack(action))))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Failed to unpack TypedStruct");
+  }
+
+  @Test
+  public void terminalFilter_corruptedXdsTypedStructBytes_rejected() {
+    Any badXdsAny = Any.newBuilder()
+        .setTypeUrl("type.googleapis.com/xds.type.v3.TypedStruct")
+        .setValue(ByteString.copyFrom(new byte[]{(byte) 0x80}))
+        .build();
+
+    ExecuteFilterAction action = ExecuteFilterAction.newBuilder()
+        .setTypedConfig(TypedExtensionConfig.newBuilder()
+            .setName("bad_xds")
+            .setTypedConfig(badXdsAny)
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder()
+        .setOnNoMatch(Matcher.OnMatch.newBuilder()
+            .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                .setName("action")
+                .setTypedConfig(Any.pack(action))))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Failed to unpack TypedStruct");
+  }
+
+  // =========================================================================
+  // 5. ENVELOPE VALIDATION: ExtensionWithMatcher & ExtensionWithMatcherPerRoute
+  // =========================================================================
+
+  @Test
+  public void envelope_nonAnyRawMessage_rejected() {
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Composite.getDefaultInstance(), getFilterContext());
+    assertThat(result.errorDetail).contains(
+        "Invalid message type: io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite");
+  }
+
+  @Test
+  public void envelope_wrongTypeUrl_rejected() {
+    Any wrongAny = Any.newBuilder()
+        .setTypeUrl(RouterFilter.TYPE_URL)
+        .setValue(ByteString.EMPTY)
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(wrongAny, getFilterContext());
+    assertThat(result.errorDetail)
+        .contains("Expected ExtensionWithMatcher but got: " + RouterFilter.TYPE_URL);
+  }
+
+  @Test
+  public void envelope_corruptedAnyBytes_rejected() {
+    Any corruptAny = Any.newBuilder()
+        .setTypeUrl(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER)
+        .setValue(ByteString.copyFrom(new byte[]{(byte) 0x80}))
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(corruptAny, getFilterContext());
+    assertThat(result.errorDetail).contains("Invalid proto:");
+  }
+
+  @Test
+  public void envelope_missingExtensionConfig_rejected() {
+    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+        .setXdsMatcher(Matcher.getDefaultInstance())
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+    assertThat(result.errorDetail).contains(
+        "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
+  }
+
+  @Test
+  public void envelope_extensionConfigMissingTypedConfig_rejected() {
+    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(TypedExtensionConfig.newBuilder().setName("composite").build())
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+    assertThat(result.errorDetail).contains(
+        "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
+  }
+
+  @Test
+  public void envelope_extensionConfigNotComposite_rejected() {
+    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(TypedExtensionConfig.newBuilder()
+            .setName("composite")
+            .setTypedConfig(Any.newBuilder().setTypeUrl(RouterFilter.TYPE_URL).build())
+            .build())
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
+    assertThat(result.errorDetail).contains(
+        "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
+  }
+
+  @Test
+  public void envelopeOverride_nonAnyRawMessage_rejected() {
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(Composite.getDefaultInstance(), getFilterContext());
+    assertThat(result.errorDetail).contains(
+        "Invalid message type: io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite");
+  }
+
+  @Test
+  public void envelopeOverride_wrongTypeUrl_rejected() {
+    Any wrongAny = Any.newBuilder()
+        .setTypeUrl(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER)
+        .setValue(ByteString.EMPTY)
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(wrongAny, getFilterContext());
+    assertThat(result.errorDetail).contains("Expected ExtensionWithMatcherPerRoute but got");
+  }
+
+  @Test
+  public void envelopeOverride_corruptedBytes_rejected() {
+    Any corruptAny = Any.newBuilder()
+        .setTypeUrl(CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE)
+        .setValue(ByteString.copyFrom(new byte[]{(byte) 0x80}))
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(corruptAny, getFilterContext());
+    assertThat(result.errorDetail).contains("Invalid proto:");
+  }
+
+  @Test
+  public void envelopeOverride_missingXdsMatcher_rejected() {
+    // An override with no matcher configures nothing, so it is rejected rather than silently
+    // ignored.
+    ExtensionWithMatcherPerRoute proto = ExtensionWithMatcherPerRoute.newBuilder().build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfigOverride(Any.pack(proto), getFilterContext());
+    assertThat(result.config).isNull();
+    assertThat(result.errorDetail)
+        .contains("ExtensionWithMatcherPerRoute.xds_matcher: field not set");
+  }
+
+  // =========================================================================
+  // 6. COVERAGE GAP TESTS: MatcherTree collection, closeAll errors, equals/toString,
+  //    resolveDelegates edge cases, NOOP_CALL methods, post-build cancel race, FINE logs
+  // =========================================================================
+
+  @Test
+  public void collectDelegates_matcherTreeExactAndPrefixMapsAndNestedMatcher() {
+    Matcher.OnMatch exactAction = createExecuteAction("exact_child", FAKE_TYPE_URL);
+    Matcher.OnMatch nestedLeafAction = createExecuteAction("nested_child", FAKE_TYPE_URL);
+    Matcher nestedMatcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("h2", "v2", nestedLeafAction)))
+        .build();
+    Matcher.OnMatch nestedOnMatch = Matcher.OnMatch.newBuilder()
+        .setMatcher(nestedMatcher)
+        .build();
+    Matcher.OnMatch fallbackAction = createExecuteAction("fallback_child", FAKE_TYPE_URL);
+
+    com.github.xds.core.v3.TypedExtensionConfig headerInput =
+        com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("request_headers")
+            .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
+                .setHeaderName("h1")
+                .build()))
+            .build();
+
+    Matcher exactTreeMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setInput(headerInput)
+            .setExactMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("exact_val", exactAction)
+                .putMap("nested_val", nestedOnMatch)))
+        .setOnNoMatch(fallbackAction)
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> exactRes =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(exactTreeMatcher)), getFilterContext());
+    assertThat(exactRes.errorDetail).isNull();
+    assertThat(exactRes.config.delegates).hasSize(3);
+
+    Matcher.OnMatch prefixAction = createExecuteAction("prefix_child", FAKE_TYPE_URL);
+    Matcher prefixTreeMatcher = Matcher.newBuilder()
+        .setMatcherTree(Matcher.MatcherTree.newBuilder()
+            .setInput(headerInput)
+            .setPrefixMatchMap(Matcher.MatcherTree.MatchMap.newBuilder()
+                .putMap("pre_", prefixAction)))
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> prefixRes =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(prefixTreeMatcher)), getFilterContext());
+    assertThat(prefixRes.errorDetail).isNull();
+    assertThat(prefixRes.config.delegates).hasSize(1);
+  }
+
+  @Test
+  public void close_nestedFilterThrowsRuntimeException_propagatesAndSuppressesSubsequent() {
+    Filter failing1 = new Filter() {
+      @Override
+      public void close() {
+        throw new IllegalStateException("boom1");
+      }
+    };
+    Filter failing2 = new Filter() {
+      @Override
+      public void close() {
+        throw new IllegalArgumentException("boom2");
+      }
+    };
+    java.util.concurrent.atomic.AtomicInteger count =
+        new java.util.concurrent.atomic.AtomicInteger();
+    when(fakeProvider.newInstance(any(FilterContext.class))).thenAnswer(inv ->
+        count.getAndIncrement() == 0 ? failing1 : failing2);
+
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "1", createExecuteAction("c1", FAKE_TYPE_URL)))
+            .addMatchers(createHeaderFieldMatcher(
+                "h", "2", createExecuteAction("c2", FAKE_TYPE_URL))))
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
+
+    RuntimeException thrown = assertThrows(RuntimeException.class, filter::close);
+    assertThat(thrown.getSuppressed()).hasLength(1);
+    assertThat(java.util.Arrays.asList(thrown.getMessage(), thrown.getSuppressed()[0].getMessage()))
+        .containsExactly("boom1", "boom2");
+  }
+
+  @Test
+  public void close_nestedFilterThrowsError_propagatesError() {
+    Filter errorFilter = new Filter() {
+      @Override
+      public void close() {
+        throw new AssertionError("fatal error");
+      }
+    };
+    when(fakeProvider.newInstance(any(FilterContext.class))).thenReturn(errorFilter);
+
+    Matcher matcher = Matcher.newBuilder()
+        .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    CompositeFilter filter = newFilter("composite");
+    filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
+
+    AssertionError err = assertThrows(AssertionError.class, filter::close);
+    assertThat(err).hasMessageThat().isEqualTo("fatal error");
+  }
+
+  @Test
+  public void compositeFilterConfig_equalsHashCodeToString() {
+    Matcher matcherProto = Matcher.newBuilder()
+        .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
+        .build();
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcherProto)), getFilterContext());
+
+    CompositeFilter.CompositeFilterConfig cfg = parsed.config;
+    assertThat(cfg.equals(cfg)).isTrue();
+    Object nonConfig = new Object();
+    assertThat(cfg.equals(nonConfig)).isFalse();
+    assertThat(cfg.equals(null)).isFalse();
+    assertThat(cfg.toString()).contains("matcher=set");
+    assertThat(cfg.toString()).contains("delegates=1");
+
+    UnifiedMatcher um = mock(UnifiedMatcher.class);
+    CompositeFilter.CompositeFilterConfig handBuilt1 =
+        new CompositeFilter.CompositeFilterConfig(um, null);
+    CompositeFilter.CompositeFilterConfig handBuilt2 =
+        new CompositeFilter.CompositeFilterConfig(um, Collections.emptyMap());
+    CompositeFilter.CompositeFilterConfig handBuiltDifferent =
+        new CompositeFilter.CompositeFilterConfig(mock(UnifiedMatcher.class), null);
+
+    assertThat(handBuilt1.equals(handBuilt2)).isTrue();
+    assertThat(handBuilt1.hashCode()).isEqualTo(handBuilt2.hashCode());
+    assertThat(handBuilt1.equals(handBuiltDifferent)).isFalse();
+    assertThat(handBuilt1.equals(cfg)).isFalse();
+    assertThat(cfg.equals(handBuilt1)).isFalse();
+    assertThat(handBuilt1.toString()).contains("matcher=none");
+  }
+
+  @Test
+  public void resolveDelegates_nullOrUnmatchedOrEmptyActions_returnsEmptyList() {
+    assertThat(CompositeFilter.resolveDelegates(null, Collections.emptyMap())).isEmpty();
+    assertThat(CompositeFilter.resolveDelegates(
+        io.grpc.xds.internal.matcher.MatchResult.noMatch(), Collections.emptyMap())).isEmpty();
+    assertThat(CompositeFilter.resolveDelegates(
+        io.grpc.xds.internal.matcher.MatchResult.create(Collections.emptyList()),
+        Collections.emptyMap())).isEmpty();
+  }
+
+  @Test
+  public void noopCallMethods_andPostBuildCancelRace_andNullChildInterceptor_andFineLogging()
+      throws Exception {
+    java.util.logging.Logger julLogger =
+        java.util.logging.Logger.getLogger(CompositeFilter.class.getName());
+    java.util.logging.Level oldLevel = julLogger.getLevel();
+    julLogger.setLevel(java.util.logging.Level.FINE);
+    try {
+      // Child filter returning null interceptor (passthrough) on both client and server
+      when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(null);
+      when(fakeFilter.buildServerInterceptor(any(), any())).thenReturn(null);
+
+      Matcher matcher = Matcher.newBuilder()
+          .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+      CompositeFilter filter = newFilter("composite");
+      ClientInterceptor clientInterceptor = filter.buildClientInterceptor(
+          res.config, null, mock(ScheduledExecutorService.class));
+      ServerInterceptor serverInterceptor = filter.buildServerInterceptor(res.config, null);
+
+      // Server call with FINE logging and null child interceptor
+      ServerCall<Void, Void> serverCall = mock(ServerCall.class);
+      when(serverCall.getMethodDescriptor()).thenReturn(createMockMethod());
+      ServerCallHandler<Void, Void> nextHandler = mock(ServerCallHandler.class);
+      serverInterceptor.interceptCall(serverCall, new Metadata(), nextHandler);
+      verify(nextHandler).startCall(eq(serverCall), any(Metadata.class));
+
+      // Client call where cancel arrives mid-start (during next.newCall construction)
+      java.util.concurrent.atomic.AtomicReference<ClientCall<Void, Void>> outerCallRef =
+          new java.util.concurrent.atomic.AtomicReference<>();
+      Channel nextChannel = new Channel() {
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
+            MethodDescriptor<ReqT, RespT> m, CallOptions co) {
+          outerCallRef.get().cancel("mid-start cancel", null);
+          return mock(ClientCall.class);
+        }
+
+        @Override
+        public String authority() {
+          return "test-auth";
+        }
+      };
+
+      ClientCall<Void, Void> call = clientInterceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT, nextChannel);
+      outerCallRef.set(call);
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      call.start(listener, new Metadata());
+
+      ArgumentCaptor<Status> statusCap = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCap.capture(), any(Metadata.class));
+      assertThat(statusCap.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
+
+      // Exercise NOOP_CALL methods on the cancelled call
+      call.request(2);
+      call.sendMessage(null);
+      call.halfClose();
+      call.cancel("again", null);
+
+      // Starting an already-started call throws IllegalStateException
+      assertThrows(IllegalStateException.class, () -> call.start(listener, new Metadata()));
+
+      // Exercise CallOptions authority override branch (callOptions.getAuthority() != null)
+      Channel passthroughNext = new Channel() {
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
+            MethodDescriptor<ReqT, RespT> m, CallOptions co) {
+          return mock(ClientCall.class);
+        }
+
+        @Override
+        public String authority() {
+          return "default-auth";
+        }
+      };
+      ClientCall<Void, Void> authCall = clientInterceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT.withAuthority("override-auth"), passthroughNext);
+      authCall.start(mock(ClientCall.Listener.class), new Metadata());
+
+      // Exercise NOOP_CALL.start directly so 100% of methods/lines in CompositeFilter are covered
+      java.lang.reflect.Field noopField = null;
+      for (Class<?> inner : CompositeFilter.class.getDeclaredClasses()) {
+        if (inner.getSimpleName().equals("CompositeClientCall")) {
+          noopField = inner.getDeclaredField("NOOP_CALL");
+          noopField.setAccessible(true);
+          ClientCall<?, ?> noop = (ClientCall<?, ?>) noopField.get(null);
+          noop.start(null, null);
+          break;
+        }
+      }
+    } finally {
+      julLogger.setLevel(oldLevel);
+    }
   }
 }

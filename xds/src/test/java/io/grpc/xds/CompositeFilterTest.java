@@ -292,6 +292,59 @@ public class CompositeFilterTest {
   }
 
   @Test
+  public void parseFilterConfig_equalProtosProduceEqualConfigs() {
+    // The xDS client decides whether to wake watchers by comparing parsed resources, so a
+    // control plane re-sending an unchanged listener must not look like a change.
+    ExtensionWithMatcher proto = createExtensionWithMatcher(Matcher.newBuilder()
+        .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
+        .build());
+
+    CompositeFilter.CompositeFilterConfig first =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext()).config;
+    CompositeFilter.CompositeFilterConfig second =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext()).config;
+
+    assertThat(first).isNotSameInstanceAs(second);
+    assertThat(first).isEqualTo(second);
+    assertThat(first.hashCode()).isEqualTo(second.hashCode());
+  }
+
+  @Test
+  public void parseFilterConfig_differentProtosProduceUnequalConfigs() {
+    CompositeFilter.CompositeFilterConfig first = provider.parseFilterConfig(
+        Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
+            .setOnNoMatch(createExecuteAction("child_a", FAKE_TYPE_URL))
+            .build())),
+        getFilterContext()).config;
+    CompositeFilter.CompositeFilterConfig second = provider.parseFilterConfig(
+        Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
+            .setOnNoMatch(createExecuteAction("child_b", FAKE_TYPE_URL))
+            .build())),
+        getFilterContext()).config;
+
+    assertThat(first).isNotEqualTo(second);
+  }
+
+  @Test
+  public void parseFilterConfig_matcherlessConfigsAreEqual() {
+    // Two passthrough configs carry no matcher and no delegates, so they are interchangeable.
+    ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("composite")
+            .setTypedConfig(Any.pack(Composite.getDefaultInstance()))
+            .build())
+        .build();
+
+    CompositeFilter.CompositeFilterConfig first =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext()).config;
+    CompositeFilter.CompositeFilterConfig second =
+        provider.parseFilterConfig(Any.pack(proto), getFilterContext()).config;
+
+    assertThat(first.matcher).isNull();
+    assertThat(first).isEqualTo(second);
+  }
+
+  @Test
   public void parseFilterConfig_identicalActionsCollapseToOneDelegate() {
     // Two byte-identical actions describe the same work, so sharing a delegate is intended and
     // keeps the map from growing with every duplicated matcher branch.

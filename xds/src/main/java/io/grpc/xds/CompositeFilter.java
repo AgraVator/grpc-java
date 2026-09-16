@@ -22,11 +22,11 @@ import com.github.xds.type.matcher.v3.Matcher;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.protobuf.Any;
-import com.google.protobuf.Empty;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute;
+import io.envoyproxy.envoy.extensions.filters.common.matcher.action.v3.SkipFilter;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.type.v3.FractionalPercent;
@@ -53,6 +53,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
 import java.util.logging.Level;
@@ -66,9 +67,6 @@ final class CompositeFilter implements Filter {
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcher";
   static final String TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE =
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
-  private static final String TYPE_URL_SKIP_FILTER =
-      "type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter";
-
   private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
 
   private final MetricRecorder metricsRecorder;
@@ -215,7 +213,7 @@ final class CompositeFilter implements Filter {
         @Nullable Matcher matcherProto, FilterConfigParseContext context) {
       if (matcherProto == null) {
         return ConfigOrError.fromConfig(
-            new CompositeFilterConfig(null, Collections.emptyMap()));
+            new CompositeFilterConfig(null, Collections.emptyMap(), /* matcherProto= */ null));
       }
       if (hasKeepMatching(matcherProto)) {
         return ConfigOrError.fromError(
@@ -226,7 +224,8 @@ final class CompositeFilter implements Filter {
         collectDelegates(matcherProto, delegates, context);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
-        return ConfigOrError.fromConfig(new CompositeFilterConfig(matcher, delegates));
+        return ConfigOrError.fromConfig(
+            new CompositeFilterConfig(matcher, delegates, matcherProto));
       } catch (Exception e) {
         return ConfigOrError.fromError("Failed to create matcher: " + e.getMessage());
       }
@@ -330,14 +329,12 @@ final class CompositeFilter implements Filter {
         TypedExtensionConfig config, FilterConfigParseContext context) {
       try {
         Any actionAny = config.getTypedConfig();
-        if (TYPE_URL_SKIP_FILTER.equals(actionAny.getTypeUrl())) {
+        if (actionAny.is(SkipFilter.class)) {
           // SkipFilter declares no fields, so there is nothing to read - but the payload is still
-          // parsed to reject malformed wire bytes rather than silently treating them as a skip.
-          // Empty is wire-compatible with any field-less message: unknown fields are skipped,
-          // while corrupt bytes throw. This avoids vendoring the SkipFilter proto to learn
-          // nothing from it.
+          // unpacked, so that malformed wire bytes are rejected rather than silently treated as
+          // a skip.
           try {
-            Empty unused = Empty.parseFrom(actionAny.getValue());
+            SkipFilter unused = actionAny.unpack(SkipFilter.class);
           } catch (InvalidProtocolBufferException e) {
             throw new IllegalArgumentException("Could not parse SkipFilter action", e);
           }
@@ -394,13 +391,16 @@ final class CompositeFilter implements Filter {
           } catch (InvalidProtocolBufferException e) {
             throw new IllegalArgumentException("Failed to unpack TypedStruct", e);
           }
+          // A103 bans terminal filters under a composite filter. The router filter is the only
+          // terminal filter, matching XdsListenerResource#isTerminalFilter; both will need
+          // updating together if that ever stops being true.
+          if (RouterFilter.TYPE_URL.equals(typeUrl)) {
+            throw new IllegalArgumentException(
+                "Nested filter cannot be a terminal filter: " + typeUrl);
+          }
           Filter.Provider provider = registryLookup.apply(typeUrl);
           if (provider == null) {
             throw new IllegalArgumentException("Action filter not found: " + typeUrl);
-          }
-          if (provider.isTerminalFilter()) {
-            throw new IllegalArgumentException(
-                "Nested filter cannot be a terminal filter: " + typeUrl);
           }
 
           Filter.FilterConfigParseContext childContext =
@@ -411,8 +411,8 @@ final class CompositeFilter implements Filter {
             throw new IllegalArgumentException(
                 "Failed to parse child filter: " + parsed.errorDetail);
           }
-          // Defence in depth: a provider that does not declare itself terminal must still not
-          // hand back the router config, which the listener parser treats as chain-terminating.
+          // Defence in depth: the type URL check above can be evaded by a provider registered
+          // under another type URL that nonetheless returns the router config.
           if (parsed.config == RouterFilter.ROUTER_CONFIG) {
             throw new IllegalArgumentException(
                 "Nested filter cannot be a terminal filter: " + typeUrl);
@@ -430,17 +430,65 @@ final class CompositeFilter implements Filter {
     @Nullable
     final UnifiedMatcher matcher;
     final Map<TypedExtensionConfig, FilterDelegate> delegates;
+    /**
+     * The proto the other two fields were parsed from, retained solely to give this config value
+     * equality. Neither {@link UnifiedMatcher} nor {@link FilterDelegate} implements
+     * {@code equals}, but parsing is deterministic, so two configs built from equal protos are
+     * interchangeable.
+     */
+    @Nullable
+    private final Matcher matcherProto;
 
+    @VisibleForTesting
     CompositeFilterConfig(@Nullable UnifiedMatcher matcher,
         Map<TypedExtensionConfig, FilterDelegate> delegates) {
+      this(matcher, delegates, /* matcherProto= */ null);
+    }
+
+    CompositeFilterConfig(@Nullable UnifiedMatcher matcher,
+        Map<TypedExtensionConfig, FilterDelegate> delegates, @Nullable Matcher matcherProto) {
       this.matcher = matcher;
       this.delegates = delegates != null
           ? Collections.unmodifiableMap(delegates) : Collections.emptyMap();
+      this.matcherProto = matcherProto;
     }
 
     @Override
     public String typeUrl() {
       return TYPE_URL_EXTENSION_WITH_MATCHER;
+    }
+
+    /**
+     * Value equality, so that a control plane re-sending an unchanged resource does not look like
+     * a configuration change. The xDS client compares parsed resources to decide whether to notify
+     * watchers, and identity semantics here would wake every watcher on every LDS refresh.
+     */
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof CompositeFilterConfig)) {
+        return false;
+      }
+      CompositeFilterConfig that = (CompositeFilterConfig) o;
+      if (matcherProto != null || that.matcherProto != null) {
+        return Objects.equals(matcherProto, that.matcherProto);
+      }
+      // Neither was parsed from a proto: either both are the no-matcher passthrough, whose
+      // matcher is null, or both were hand-built. Fall back to matcher identity.
+      return matcher == that.matcher;
+    }
+
+    @Override
+    public int hashCode() {
+      return matcherProto != null ? matcherProto.hashCode() : System.identityHashCode(matcher);
+    }
+
+    @Override
+    public String toString() {
+      return "CompositeFilterConfig{matcher=" + (matcherProto == null ? "none" : "set")
+          + ", delegates=" + delegates.size() + "}";
     }
   }
 

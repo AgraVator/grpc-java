@@ -74,16 +74,6 @@ interface Filter extends Closeable {
     }
 
     /**
-     * Whether this filter terminates the filter chain.
-     *
-     * <p>A terminal filter must be the last filter in the chain, and may not appear as a nested
-     * filter of another filter. Only the router filter is terminal today.
-     */
-    default boolean isTerminalFilter() {
-      return false;
-    }
-
-    /**
      * Creates a new instance of the filter.
      *
      * <p>Returns a filter instance registered with the same typeUrls as the provider,

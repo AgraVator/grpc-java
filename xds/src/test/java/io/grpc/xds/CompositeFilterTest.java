@@ -501,7 +501,7 @@ public class CompositeFilterTest {
         provider.parseFilterConfig(Any.pack(proto), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test

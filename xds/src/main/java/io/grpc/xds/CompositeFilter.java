@@ -22,6 +22,7 @@ import com.github.xds.type.matcher.v3.Matcher;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.protobuf.Any;
+import com.google.protobuf.Empty;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
@@ -54,6 +55,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
@@ -63,6 +66,10 @@ final class CompositeFilter implements Filter {
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcher";
   static final String TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE =
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
+  private static final String TYPE_URL_SKIP_FILTER =
+      "type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter";
+
+  private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
 
   private final MetricRecorder metricsRecorder;
 
@@ -323,8 +330,17 @@ final class CompositeFilter implements Filter {
         TypedExtensionConfig config, FilterConfigParseContext context) {
       try {
         Any actionAny = config.getTypedConfig();
-        if ("type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter"
-            .equals(actionAny.getTypeUrl())) {
+        if (TYPE_URL_SKIP_FILTER.equals(actionAny.getTypeUrl())) {
+          // SkipFilter declares no fields, so there is nothing to read - but the payload is still
+          // parsed to reject malformed wire bytes rather than silently treating them as a skip.
+          // Empty is wire-compatible with any field-less message: unknown fields are skipped,
+          // while corrupt bytes throw. This avoids vendoring the SkipFilter proto to learn
+          // nothing from it.
+          try {
+            Empty unused = Empty.parseFrom(actionAny.getValue());
+          } catch (InvalidProtocolBufferException e) {
+            throw new IllegalArgumentException("Could not parse SkipFilter action", e);
+          }
           return new FilterDelegate(Collections.emptyList(), null);
         }
         if (!actionAny.is(ExecuteFilterAction.class)) {
@@ -346,14 +362,16 @@ final class CompositeFilter implements Filter {
         }
         List<io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> childConfigs =
             new ArrayList<>();
+        // A103 makes it an error only if *neither* field is set. A filter_chain that is set but
+        // empty is legal and produces an action that runs no filters, which is the same
+        // observable behaviour as SkipFilter.
         if (executeAction.hasFilterChain()) {
           childConfigs.addAll(executeAction.getFilterChain().getTypedConfigList());
         } else if (executeAction.hasTypedConfig()) {
           childConfigs.add(executeAction.getTypedConfig());
-        }
-        if (childConfigs.isEmpty()) {
+        } else {
           throw new IllegalArgumentException(
-              "ExecuteFilterAction must specify either typed_config or a non-empty filter_chain");
+              "ExecuteFilterAction must specify either typed_config or filter_chain");
         }
         List<DelegateEntry> delegates = new ArrayList<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
@@ -376,13 +394,13 @@ final class CompositeFilter implements Filter {
           } catch (InvalidProtocolBufferException e) {
             throw new IllegalArgumentException("Failed to unpack TypedStruct", e);
           }
-          if (RouterFilter.TYPE_URL.equals(typeUrl)) {
-            throw new IllegalArgumentException(
-                "Nested filter cannot be a terminal filter (RouterFilter)");
-          }
           Filter.Provider provider = registryLookup.apply(typeUrl);
           if (provider == null) {
             throw new IllegalArgumentException("Action filter not found: " + typeUrl);
+          }
+          if (provider.isTerminalFilter()) {
+            throw new IllegalArgumentException(
+                "Nested filter cannot be a terminal filter: " + typeUrl);
           }
 
           Filter.FilterConfigParseContext childContext =
@@ -393,9 +411,11 @@ final class CompositeFilter implements Filter {
             throw new IllegalArgumentException(
                 "Failed to parse child filter: " + parsed.errorDetail);
           }
+          // Defence in depth: a provider that does not declare itself terminal must still not
+          // hand back the router config, which the listener parser treats as chain-terminating.
           if (parsed.config == RouterFilter.ROUTER_CONFIG) {
             throw new IllegalArgumentException(
-                "Nested filter cannot be a terminal filter (RouterFilter)");
+                "Nested filter cannot be a terminal filter: " + typeUrl);
           }
           delegates.add(new DelegateEntry(provider, parsed.config, childFilterConfig.getName()));
         }
@@ -573,6 +593,8 @@ final class CompositeFilter implements Filter {
 
         MatchResult matchResult = effective.matcher.match(context);
         if (matchResult == null || !matchResult.matched) {
+          logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
+              call.getMethodDescriptor().getFullMethodName());
           call.close(
               Status.UNAVAILABLE.withDescription("no match found in composite filter"),
               new Metadata());
@@ -585,6 +607,8 @@ final class CompositeFilter implements Filter {
         for (ResolvedDelegate<ServerInterceptor> resolved
             : resolveDelegates(matchResult, resolvedDelegates)) {
           if (!resolved.delegate.shouldExecute()) {
+            logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
+                call.getMethodDescriptor().getFullMethodName());
             continue;
           }
           if (resolved.error != null) {
@@ -594,6 +618,11 @@ final class CompositeFilter implements Filter {
           interceptors.addAll(resolved.interceptors);
         }
 
+        if (logger.isLoggable(Level.FINE)) {
+          logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
+              new Object[] {interceptors.size(),
+                  call.getMethodDescriptor().getFullMethodName()});
+        }
         ServerCallHandler<ReqT, RespT> wrapped = next;
         for (int i = interceptors.size() - 1; i >= 0; i--) {
           wrapped = InternalServerInterceptors.interceptCallHandlerCreate(
@@ -730,14 +759,10 @@ final class CompositeFilter implements Filter {
 
   private static CompositeFilterConfig getEffectiveConfig(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    CompositeFilterConfig effective = (CompositeFilterConfig) config;
-    if (overrideConfig != null) {
-      CompositeFilterConfig override = (CompositeFilterConfig) overrideConfig;
-      if (override.matcher != null) {
-        return override;
-      }
-    }
-    return effective;
+    // A per-route override replaces the top-level config outright, per A103. No null-matcher
+    // guard is needed: parseFilterConfigOverride rejects an override without a matcher, so an
+    // override that reaches here always has one.
+    return (CompositeFilterConfig) (overrideConfig != null ? overrideConfig : config);
   }
 
   static <I> List<ResolvedDelegate<I>> resolveDelegates(@Nullable MatchResult matchResult,
@@ -868,6 +893,8 @@ final class CompositeFilter implements Filter {
 
       MatchResult matchResult = matcher.match(context);
       if (matchResult == null || !matchResult.matched) {
+        logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
+            method.getFullMethodName());
         failCall(responseListener,
             Status.UNAVAILABLE.withDescription("no match found in composite filter"));
         return;
@@ -880,6 +907,8 @@ final class CompositeFilter implements Filter {
       for (ResolvedDelegate<ClientInterceptor> resolved
           : resolveDelegates(matchResult, delegatesMap)) {
         if (!resolved.delegate.shouldExecute()) {
+          logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
+              method.getFullMethodName());
           continue;
         }
         if (resolved.error != null) {
@@ -889,6 +918,10 @@ final class CompositeFilter implements Filter {
         interceptors.addAll(resolved.interceptors);
       }
 
+      if (logger.isLoggable(Level.FINE)) {
+        logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
+            new Object[] {interceptors.size(), method.getFullMethodName()});
+      }
       ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
           ? next.newCall(method, callOptions)
           : ClientInterceptors.intercept(next, interceptors).newCall(method, callOptions);

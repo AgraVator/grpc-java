@@ -583,7 +583,7 @@ public class CompositeFilterAdversarialTest {
   }
 
   @Test
-  public void actionTypeUrl_executeFilterAction_emptyFilterChain_failsOpenOrRejected() {
+  public void actionTypeUrl_executeFilterAction_emptyFilterChain_acceptedAsNoOp() {
     ExecuteFilterAction emptyChainAction = ExecuteFilterAction.newBuilder()
         .setFilterChain(FilterChainConfiguration.newBuilder().build())
         .build();
@@ -600,10 +600,35 @@ public class CompositeFilterAdversarialTest {
         provider.parseFilterConfig(
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
-    if (result.errorDetail == null) {
-      fail("SPEC VIOLATION / FAIL-OPEN: ExecuteFilterAction with empty filter_chain was "
-          + "accepted without error!");
-    }
+    // A103 makes it an error only if neither typed_config nor filter_chain is set. An empty
+    // filter_chain is set, so the action is valid and simply runs no nested filters.
+    assertThat(result.errorDetail).isNull();
+    assertThat(result.config.delegates).hasSize(1);
+    assertThat(result.config.delegates.values().iterator().next().delegates).isEmpty();
+  }
+
+  @Test
+  public void actionTypeUrl_skipFilter_corruptedProtoBytes_rejected() {
+    // SkipFilter has no fields, but the payload must still be well-formed protobuf; accepting
+    // garbage here would silently turn a corrupt action into "skip the nested filters".
+    Matcher.OnMatch corruptSkip = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("skip_corrupt")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/"
+                    + "envoy.extensions.filters.common.matcher.action.v3.SkipFilter")
+                .setValue(ByteString.copyFrom(new byte[]{(byte) 0xff, (byte) 0xff}))
+                .build())
+            .build())
+        .build();
+
+    Matcher matcher = Matcher.newBuilder().setOnNoMatch(corruptSkip).build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail).contains("Could not parse SkipFilter action");
   }
 
   @Test
@@ -717,7 +742,7 @@ public class CompositeFilterAdversarialTest {
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test
@@ -750,7 +775,7 @@ public class CompositeFilterAdversarialTest {
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test
@@ -791,7 +816,7 @@ public class CompositeFilterAdversarialTest {
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test
@@ -826,7 +851,7 @@ public class CompositeFilterAdversarialTest {
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test
@@ -843,7 +868,7 @@ public class CompositeFilterAdversarialTest {
             Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
     assertThat(result.errorDetail).contains(
-        "Nested filter cannot be a terminal filter (RouterFilter)");
+        "Nested filter cannot be a terminal filter");
   }
 
   @Test

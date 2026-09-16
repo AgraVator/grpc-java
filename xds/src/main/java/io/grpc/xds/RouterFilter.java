@@ -53,6 +53,11 @@ final class RouterFilter implements Filter {
     }
 
     @Override
+    public boolean isTerminalFilter() {
+      return true;
+    }
+
+    @Override
     public boolean isServerFilter() {
       return true;
     }

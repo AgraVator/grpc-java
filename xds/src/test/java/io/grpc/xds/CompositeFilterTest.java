@@ -1487,6 +1487,45 @@ public class CompositeFilterTest {
   }
 
   @Test
+  public void parseFilterConfig_samplePercentWithoutDefaultValue_nacks() {
+    // A103 requires default_value whenever sample_percent is set. An unset message would read
+    // as 0%, silently disabling the action, so it has to be rejected instead.
+    Matcher.OnMatch action = Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_sampled")
+            .setTypedConfig(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/envoy.extensions.filters.http.composite.v3"
+                    + ".ExecuteFilterAction")
+                .setValue(ExecuteFilterAction.newBuilder()
+                    .setSamplePercent(RuntimeFractionalPercent.newBuilder()
+                        .setRuntimeKey("ignored_by_grpc")
+                        .build())
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName("child")
+                        .setTypedConfig(Any.newBuilder()
+                            .setTypeUrl(FAKE_TYPE_URL)
+                            .setValue(Composite.getDefaultInstance().toByteString())
+                            .build())
+                        .build())
+                    .build().toByteString())
+                .build())
+            .build())
+        .build();
+    Matcher matcher = Matcher.newBuilder()
+        .setMatcherList(Matcher.MatcherList.newBuilder()
+            .addMatchers(createHeaderFieldMatcher("foo", "bar", action))
+            .build())
+        .build();
+
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        provider.parseFilterConfig(
+            Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+
+    assertThat(result.errorDetail)
+        .contains("ExecuteFilterAction.sample_percent.default_value: field not set");
+  }
+
+  @Test
   public void filterConfigParseContext_recursionDepthDefaultsToZero() {
     // Callers outside the composite filter never set a depth, so the default has to be the
     // top-level value rather than an absent one every reader has to translate.

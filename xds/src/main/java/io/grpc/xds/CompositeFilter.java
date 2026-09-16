@@ -344,9 +344,18 @@ final class CompositeFilter implements Filter {
               "Expected ExecuteFilterAction or SkipFilter but got: " + actionAny.getTypeUrl());
         }
         ExecuteFilterAction executeAction = actionAny.unpack(ExecuteFilterAction.class);
-        FractionalPercent samplePercent = executeAction.hasSamplePercent()
-            ? executeAction.getSamplePercent().getDefaultValue()
-            : null;
+        // A103 requires default_value to be present whenever sample_percent is; without this
+        // check the unset message would read as 0%, silently disabling the action instead of
+        // rejecting the config. gRPC C++ reports the same error. runtime_key is ignored, per
+        // A103, because gRPC has no runtime system.
+        FractionalPercent samplePercent = null;
+        if (executeAction.hasSamplePercent()) {
+          if (!executeAction.getSamplePercent().hasDefaultValue()) {
+            throw new IllegalArgumentException(
+                "ExecuteFilterAction.sample_percent.default_value: field not set");
+          }
+          samplePercent = executeAction.getSamplePercent().getDefaultValue();
+        }
         List<io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> childConfigs =
             new ArrayList<>();
         if (executeAction.hasFilterChain()) {

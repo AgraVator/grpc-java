@@ -64,14 +64,6 @@ final class CompositeFilter implements Filter {
   static final String TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE =
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
 
-  /**
-   * How deeply composite filters may be nested inside one another. A composite filter's actions
-   * can themselves be composite filters, so a hostile or buggy control plane could otherwise
-   * describe an arbitrarily deep tree and exhaust the stack while parsing it.
-   */
-  @VisibleForTesting
-  static final int MAX_RECURSION_DEPTH = 8;
-
   private final MetricRecorder metricsRecorder;
 
   private final Object filtersLock = new Object();
@@ -156,9 +148,9 @@ final class CompositeFilter implements Filter {
         return ConfigOrError.fromError(
             "Invalid message type: " + rawProtoMessage.getClass().getName());
       }
-      if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
-        return ConfigOrError.fromError(
-            "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
+      if (context.recursionDepth() >= FilterConfigParseContext.MAX_RECURSION_DEPTH) {
+        return ConfigOrError.fromError("Maximum recursion depth of "
+            + FilterConfigParseContext.MAX_RECURSION_DEPTH + " exceeded");
       }
       try {
         Any any = (Any) rawProtoMessage;
@@ -191,9 +183,9 @@ final class CompositeFilter implements Filter {
         return ConfigOrError.fromError(
             "Invalid message type: " + rawProtoMessage.getClass().getName());
       }
-      if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
-        return ConfigOrError.fromError(
-            "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
+      if (context.recursionDepth() >= FilterConfigParseContext.MAX_RECURSION_DEPTH) {
+        return ConfigOrError.fromError("Maximum recursion depth of "
+            + FilterConfigParseContext.MAX_RECURSION_DEPTH + " exceeded");
       }
       try {
         Any any = (Any) rawProtoMessage;
@@ -397,10 +389,6 @@ final class CompositeFilter implements Filter {
             throw new IllegalArgumentException("Action filter not found: " + typeUrl);
           }
 
-          if (context.recursionDepth() >= MAX_RECURSION_DEPTH) {
-            throw new IllegalArgumentException(
-                "Maximum recursion depth of " + MAX_RECURSION_DEPTH + " exceeded");
-          }
           Filter.FilterConfigParseContext childContext =
               context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
           ConfigOrError<? extends FilterConfig> parsed =

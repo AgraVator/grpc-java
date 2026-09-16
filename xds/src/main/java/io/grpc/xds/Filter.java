@@ -135,6 +135,17 @@ interface Filter extends Closeable {
   /** Context carrying dynamic metadata for a filter. */
   @AutoValue
   abstract static class FilterConfigParseContext {
+    /**
+     * The maximum value {@link #recursionDepth} may reach, imposed by gRFC A103 to avoid stack
+     * overflows while parsing HTTP filter configs.
+     *
+     * <p>The depth is a single budget shared by every filter that nests other filters' configs,
+     * so the bound on it lives here rather than in any one filter. A filter that parses another
+     * filter's config must reject a context that has already reached this depth, and must pass
+     * its child a context with the depth incremented.
+     */
+    static final int MAX_RECURSION_DEPTH = 8;
+
     abstract BootstrapInfo bootstrapInfo();
 
     abstract ServerInfo serverInfo();
@@ -142,7 +153,7 @@ interface Filter extends Closeable {
     /**
      * How many enclosing filter configs this config is nested inside. Zero for a filter config
      * parsed directly from a listener or a route; incremented by filters that parse other filters'
-     * configs, so that they can bound recursion.
+     * configs, so that they can bound recursion at {@link #MAX_RECURSION_DEPTH}.
      */
     abstract int recursionDepth();
 

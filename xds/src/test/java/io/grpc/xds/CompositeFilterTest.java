@@ -1318,6 +1318,29 @@ public class CompositeFilterTest {
   }
 
   @Test
+  public void nestedFilter_routesOfOneGenerationDoNotEvictEachOther() {
+    CompositeFilter filter = newFilter("composite");
+    ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+    // A single LDS update: the resolver hands the same top-level config object to every route,
+    // but individual routes may carry ExtensionWithMatcherPerRoute overrides that select
+    // different nested filters.
+    CompositeFilter.CompositeFilterConfig topLevel = configWithChild("child_a");
+    CompositeFilter.CompositeFilterConfig routeOverride = configWithChild("child_b");
+
+    filter.buildClientInterceptor(topLevel, null, scheduler);           // route 1 -> child_a
+    filter.buildClientInterceptor(topLevel, routeOverride, scheduler);  // route 2 -> child_b
+    filter.buildClientInterceptor(topLevel, null, scheduler);           // route 3 -> child_a
+
+    // Generations are keyed on the top-level config's identity, so all three routes belong to
+    // one generation and nothing rotates between them. Were a route to start a new generation,
+    // route 3 would close child_a while route 1's interceptor still holds an interceptor built
+    // from it, and would then hand route 3 a different instance.
+    verify(fakeProvider, times(2)).newInstance(any());
+    verify(fakeFilter, never()).close();
+  }
+
+  @Test
   public void nestedFilter_carriedForwardAcrossConfigGenerations() {
     CompositeFilter filter = newFilter("composite");
     ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);

@@ -22,35 +22,23 @@ import javax.annotation.Nullable;
 
 public final class MatchContext {
   private final Metadata metadata;
-  @Nullable 
-  private final String path;
-  @Nullable 
-  private final String host;
-  @Nullable 
-  private final String method;
-  @Nullable 
-  private final String id;
-  private final io.grpc.Attributes attributes;
   @Nullable
-  private final io.grpc.CallOptions callOptions;
+  private final String path;
+  @Nullable
+  private final String host;
+  @Nullable
+  private final String method;
+  @Nullable
+  private final String id;
 
-  public MatchContext(Metadata metadata, @Nullable String path,
+  MatchContext(Metadata metadata, @Nullable String path,
       @Nullable String host, @Nullable String method,
       @Nullable String id) {
-    this(metadata, path, host, method, id, io.grpc.Attributes.EMPTY, null);
-  }
-
-  public MatchContext(Metadata metadata, @Nullable String path,
-      @Nullable String host, @Nullable String method,
-      @Nullable String id, io.grpc.Attributes attributes,
-      @Nullable io.grpc.CallOptions callOptions) {
     this.metadata = Preconditions.checkNotNull(metadata, "metadata");
     this.path = path;
     this.host = host;
     this.method = method;
     this.id = id;
-    this.attributes = attributes != null ? attributes : io.grpc.Attributes.EMPTY;
-    this.callOptions = callOptions;
   }
 
   public Metadata getMetadata() {
@@ -77,15 +65,6 @@ public final class MatchContext {
     return id;
   }
 
-  public io.grpc.Attributes getAttributes() {
-    return attributes;
-  }
-
-  @Nullable
-  public io.grpc.CallOptions getCallOptions() {
-    return callOptions;
-  }
-
   public static Builder newBuilder() {
     return new Builder();
   }
@@ -96,8 +75,6 @@ public final class MatchContext {
     private String host;
     private String method;
     private String id;
-    private io.grpc.Attributes attributes = io.grpc.Attributes.EMPTY;
-    private io.grpc.CallOptions callOptions;
 
     public Builder setMetadata(Metadata metadata) {
       this.metadata = metadata;
@@ -124,20 +101,8 @@ public final class MatchContext {
       return this;
     }
 
-    public Builder setAttributes(io.grpc.Attributes attributes) {
-      if (attributes != null) {
-        this.attributes = attributes;
-      }
-      return this;
-    }
-
-    public Builder setCallOptions(io.grpc.CallOptions callOptions) {
-      this.callOptions = callOptions;
-      return this;
-    }
-
     public MatchContext build() {
-      return new MatchContext(metadata, path, host, method, id, attributes, callOptions);
+      return new MatchContext(metadata, path, host, method, id);
     }
   }
 }

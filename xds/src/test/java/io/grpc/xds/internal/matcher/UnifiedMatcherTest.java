@@ -18,8 +18,6 @@ package io.grpc.xds.internal.matcher;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.fail;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
@@ -29,12 +27,7 @@ import com.google.common.io.BaseEncoding;
 import com.google.protobuf.Any;
 import io.envoyproxy.envoy.type.matcher.v3.HttpRequestHeaderMatchInput;
 import io.grpc.Metadata;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.util.Collections;
 import java.util.List;
-import javax.net.ssl.ExtendedSSLSession;
-import javax.net.ssl.SNIHostName;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -671,134 +664,5 @@ public class UnifiedMatcherTest {
     Metadata metadata = new Metadata();
     metadata.put(Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER), value);
     return metadata;
-  }
-
-  @Test
-  public void matchingDataInputSourceIp() {
-    Metadata headers = new Metadata();
-    InetSocketAddress addr = new InetSocketAddress("192.168.1.1", 1234);
-    io.grpc.Attributes attributes = io.grpc.Attributes.newBuilder()
-        .set(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR, addr)
-        .build();
-
-    MatchContext context = MatchContext.newBuilder()
-        .setMetadata(headers)
-        .setAttributes(attributes)
-        .build();
-
-    TypedExtensionConfig inputConfig = TypedExtensionConfig.newBuilder()
-        .setTypedConfig(Any.newBuilder()
-            .setTypeUrl("type.googleapis.com/envoy.extensions.matching.common_inputs.network"
-                + ".v3.SourceIPInput")
-            .build())
-        .build();
-
-    MatchInput input = MatchInputRegistry.getDefaultRegistry()
-        .getProvider(inputConfig.getTypedConfig().getTypeUrl()).getInput(inputConfig);
-    assertThat(input.apply(context)).isEqualTo("192.168.1.1");
-  }
-
-  @Test
-  public void matchingDataInputSourcePort() {
-    Metadata headers = new Metadata();
-    InetSocketAddress addr = new InetSocketAddress("192.168.1.1", 1234);
-    io.grpc.Attributes attributes = io.grpc.Attributes.newBuilder()
-        .set(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR, addr)
-        .build();
-
-    MatchContext context = MatchContext.newBuilder()
-        .setMetadata(headers)
-        .setAttributes(attributes)
-        .build();
-
-    TypedExtensionConfig inputConfig = TypedExtensionConfig.newBuilder()
-        .setTypedConfig(Any.newBuilder()
-            .setTypeUrl("type.googleapis.com/envoy.extensions.matching.common_inputs.network"
-                + ".v3.SourcePortInput")
-            .build())
-        .build();
-
-    MatchInput input = MatchInputRegistry.getDefaultRegistry()
-        .getProvider(inputConfig.getTypedConfig().getTypeUrl()).getInput(inputConfig);
-    assertThat(input.apply(context)).isEqualTo("1234");
-  }
-
-  @Test
-  public void matchingDataInputDirectSourceIp() {
-    Metadata headers = new Metadata();
-    InetSocketAddress addr = new InetSocketAddress("192.168.1.1", 1234);
-    io.grpc.Attributes attributes = io.grpc.Attributes.newBuilder()
-        .set(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR, addr)
-        .build();
-
-    MatchContext context = MatchContext.newBuilder()
-        .setMetadata(headers)
-        .setAttributes(attributes)
-        .build();
-
-    TypedExtensionConfig inputConfig = TypedExtensionConfig.newBuilder()
-        .setTypedConfig(Any.newBuilder()
-            .setTypeUrl("type.googleapis.com/envoy.extensions.matching.common_inputs.network"
-                + ".v3.DirectSourceIPInput")
-            .build())
-        .build();
-
-    MatchInput input = MatchInputRegistry.getDefaultRegistry()
-        .getProvider(inputConfig.getTypedConfig().getTypeUrl()).getInput(inputConfig);
-    assertThat(input.apply(context)).isEqualTo("192.168.1.1");
-  }
-
-  @Test
-  public void matchingDataInputSourceIpNonInet() {
-    Metadata headers = new Metadata();
-    SocketAddress addr = new SocketAddress() {};
-    io.grpc.Attributes attributes = io.grpc.Attributes.newBuilder()
-        .set(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR, addr)
-        .build();
-
-    MatchContext context = MatchContext.newBuilder()
-        .setMetadata(headers)
-        .setAttributes(attributes)
-        .build();
-
-    TypedExtensionConfig inputConfig = TypedExtensionConfig.newBuilder()
-        .setTypedConfig(Any.newBuilder()
-            .setTypeUrl("type.googleapis.com/envoy.extensions.matching.common_inputs.network"
-                + ".v3.SourceIPInput")
-            .build())
-        .build();
-
-    MatchInput input = MatchInputRegistry.getDefaultRegistry()
-        .getProvider(inputConfig.getTypedConfig().getTypeUrl()).getInput(inputConfig);
-    assertThat(input.apply(context)).isNull();
-  }
-
-  @Test
-  public void matchingDataInputServerNameSni() {
-    Metadata headers = new Metadata();
-
-    ExtendedSSLSession mockSession = mock(ExtendedSSLSession.class);
-    SNIHostName sniHostName = new SNIHostName("bar.com");
-    when(mockSession.getRequestedServerNames()).thenReturn(Collections.singletonList(sniHostName));
-
-    io.grpc.Attributes attributes = io.grpc.Attributes.newBuilder()
-        .set(io.grpc.Grpc.TRANSPORT_ATTR_SSL_SESSION, mockSession)
-        .build();
-
-    MatchContext context = MatchContext.newBuilder()
-        .setMetadata(headers)
-        .setAttributes(attributes)
-        .build();
-
-    TypedExtensionConfig inputConfig = TypedExtensionConfig.newBuilder()
-        .setTypedConfig(Any.newBuilder()
-            .setTypeUrl("type.googleapis.com/envoy.extensions.matching.common_inputs.network"
-                + ".v3.ServerNameInput")
-            .build())
-        .build();
-
-    MatchInput input = MatchInputRegistry.getDefaultRegistry()
-        .getProvider(inputConfig.getTypedConfig().getTypeUrl()).getInput(inputConfig);
-    assertThat(input.apply(context)).isEqualTo("bar.com");
   }
 }

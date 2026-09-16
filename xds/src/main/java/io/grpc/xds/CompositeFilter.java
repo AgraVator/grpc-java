@@ -29,7 +29,6 @@ import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPer
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.type.v3.FractionalPercent;
-import io.grpc.Attributes;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -73,7 +72,6 @@ final class CompositeFilter implements Filter {
   @VisibleForTesting
   static final int MAX_RECURSION_DEPTH = 8;
 
-  @Nullable
   private final MetricRecorder metricsRecorder;
 
   private final Object filtersLock = new Object();
@@ -105,8 +103,8 @@ final class CompositeFilter implements Filter {
   @GuardedBy("filtersLock")
   private boolean closed;
 
-  CompositeFilter(@Nullable MetricRecorder metricsRecorder) {
-    this.metricsRecorder = metricsRecorder;
+  CompositeFilter(MetricRecorder metricsRecorder) {
+    this.metricsRecorder = Preconditions.checkNotNull(metricsRecorder, "metricsRecorder");
   }
 
   static final class Provider implements Filter.Provider {
@@ -148,7 +146,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context != null ? context.metricsRecorder() : null);
+      return new CompositeFilter(context.metricsRecorder());
     }
 
     @Override
@@ -575,7 +573,6 @@ final class CompositeFilter implements Filter {
 
         MatchContext context = MatchContext.newBuilder()
             .setMetadata(headers)
-            .setAttributes(call.getAttributes())
             .setMethod(call.getMethodDescriptor().getFullMethodName())
             .setPath("/" + call.getMethodDescriptor().getFullMethodName())
             .setHost(call.getAuthority())
@@ -584,8 +581,7 @@ final class CompositeFilter implements Filter {
         MatchResult matchResult = effective.matcher.match(context);
         if (matchResult == null || !matchResult.matched) {
           call.close(
-              Status.UNAVAILABLE.withDescription(
-                  "Composite filter: no match found in matcher tree"),
+              Status.UNAVAILABLE.withDescription("no match found in composite filter"),
               new Metadata());
           return new ServerCall.Listener<ReqT>() {};
         }
@@ -723,9 +719,7 @@ final class CompositeFilter implements Filter {
         filter = retiredNestedFilters.remove(key);
       }
       if (filter == null) {
-        MetricRecorder recorder =
-            metricsRecorder != null ? metricsRecorder : new MetricRecorder() {};
-        filter = entry.provider.newInstance(FilterContext.create(entry.name, recorder));
+        filter = entry.provider.newInstance(FilterContext.create(entry.name, metricsRecorder));
       }
       activeNestedFilters.put(key, filter);
       return filter;
@@ -883,8 +877,6 @@ final class CompositeFilter implements Filter {
           ? callOptions.getAuthority() : next.authority();
       MatchContext context = MatchContext.newBuilder()
           .setMetadata(headers)
-          .setAttributes(Attributes.EMPTY)
-          .setCallOptions(callOptions)
           .setMethod(method.getFullMethodName())
           .setPath("/" + method.getFullMethodName())
           .setHost(host)
@@ -893,7 +885,7 @@ final class CompositeFilter implements Filter {
       MatchResult matchResult = matcher.match(context);
       if (matchResult == null || !matchResult.matched) {
         failCall(responseListener,
-            Status.UNAVAILABLE.withDescription("Composite filter: no match found in matcher tree"));
+            Status.UNAVAILABLE.withDescription("no match found in composite filter"));
         return;
       }
 

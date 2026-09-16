@@ -39,7 +39,6 @@ import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPer
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.FilterChainConfiguration;
-import io.envoyproxy.envoy.extensions.matching.common_inputs.network.v3.ServerNameInput;
 import io.envoyproxy.envoy.type.matcher.v3.HttpRequestHeaderMatchInput;
 import io.envoyproxy.envoy.type.v3.FractionalPercent;
 import io.grpc.CallOptions;
@@ -724,7 +723,7 @@ public class CompositeFilterTest {
     verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
     assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
     assertThat(statusCaptor.getValue().getDescription())
-        .contains("no match found in matcher tree");
+        .contains("no match found in composite filter");
   }
 
   @Test
@@ -801,51 +800,6 @@ public class CompositeFilterTest {
 
     verify(fakeFilter, times(2)).buildClientInterceptor(any(), any(), any());
     verify(fakeClientInterceptor, times(2)).interceptCall(any(), any(), any());
-  }
-
-  @Test
-  public void clientInterceptor_serverNameInputMatch() {
-    Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
-
-    Matcher matcher = Matcher.newBuilder()
-        .setMatcherList(Matcher.MatcherList.newBuilder()
-            .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
-                .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
-                    .setSinglePredicate(Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
-                        .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
-                            .setName("server_name")
-                            .setTypedConfig(Any.pack(ServerNameInput.getDefaultInstance()))
-                            .build())
-                        .setValueMatch(StringMatcher.newBuilder().setExact("foo.com").build())
-                        .build())
-                    .build())
-                .setOnMatch(matchAction)
-                .build())
-            .build())
-        .build();
-
-    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
-
-    CompositeFilter filter = newFilter("composite");
-    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
-        mock(ScheduledExecutorService.class));
-
-    Channel next = mock(Channel.class);
-    MethodDescriptor<Void, Void> method = createMockMethod();
-    CallOptions callOptions = CallOptions.DEFAULT.withAuthority("foo.com");
-
-    ClientCall<Void, Void> call = interceptor.interceptCall(method, callOptions, next);
-
-    ClientCall childCall = mock(ClientCall.class);
-    when(fakeClientInterceptor.interceptCall(any(), any(), any())).thenReturn(childCall);
-
-    Metadata headers = new Metadata();
-    call.start(mock(ClientCall.Listener.class), headers);
-
-    verify(fakeClientInterceptor).interceptCall(any(), any(), any());
-    verify(childCall).start(any(), eq(headers));
   }
 
   @Test
@@ -1235,7 +1189,7 @@ public class CompositeFilterTest {
     verify(call).close(statusCaptor.capture(), any(Metadata.class));
     assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
     assertThat(statusCaptor.getValue().getDescription())
-        .contains("no match found in matcher tree");
+        .contains("no match found in composite filter");
   }
 
   @Test
@@ -1745,42 +1699,6 @@ public class CompositeFilterTest {
     verify(fakeProvider).newInstance(contextCaptor.capture());
     assertThat(contextCaptor.getValue().filterName()).isEqualTo("my_child_filter");
     assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(expectedRecorder);
-  }
-
-  @Test
-  public void filterContext_nullMetricsRecorderFallback() {
-    Matcher.OnMatch matchAction = createExecuteAction("child_with_null_metrics", FAKE_TYPE_URL);
-    Matcher matcher = Matcher.newBuilder()
-        .setMatcherList(Matcher.MatcherList.newBuilder()
-            .addMatchers(createHeaderFieldMatcher("foo", "bar", matchAction))
-            .build())
-        .build();
-
-    ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
-    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-        provider.parseFilterConfig(Any.pack(proto), getFilterContext());
-
-    // CompositeFilter initialized with null metrics recorder
-    CompositeFilter filter = new CompositeFilter(null);
-    ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
-        mock(ScheduledExecutorService.class));
-
-    Channel next = mock(Channel.class);
-    when(fakeClientInterceptor.interceptCall(any(), any(), any()))
-        .thenReturn(mock(ClientCall.class));
-
-    MethodDescriptor<Void, Void> method = createMockMethod();
-    ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
-
-    Metadata headers = new Metadata();
-    headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
-    call.start(mock(ClientCall.Listener.class), headers);
-
-    ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
-    verify(fakeProvider).newInstance(contextCaptor.capture());
-    assertThat(contextCaptor.getValue().filterName()).isEqualTo("child_with_null_metrics");
-    // Fallback metric recorder must be non-null to prevent NPE in child filters
-    assertThat(contextCaptor.getValue().metricsRecorder()).isNotNull();
   }
 
   @Test

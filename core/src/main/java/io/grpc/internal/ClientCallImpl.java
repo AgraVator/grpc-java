@@ -86,7 +86,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   private final boolean unaryRequest;
   private CallOptions callOptions;
   private ClientStream stream;
-  private boolean cancelCalled;
+  private volatile boolean cancelCalled;
   private boolean halfCloseCalled;
   private final ClientStreamProvider clientStreamProvider;
   private final ScheduledExecutorService deadlineCancellationExecutor;

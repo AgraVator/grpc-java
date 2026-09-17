@@ -84,11 +84,11 @@ public final class FakeClock {
         }
       };
 
-  private long currentTimeNanos;
+  private volatile long currentTimeNanos;
 
   public class ScheduledTask extends AbstractFuture<Void> implements ScheduledFuture<Void> {
     public final Runnable command;
-    public long dueTimeNanos;
+    public volatile long dueTimeNanos;
 
     ScheduledTask(Runnable command) {
       this.command = command;
@@ -364,7 +364,7 @@ public final class FakeClock {
    *
    * @return the number of tasks run by this call
    */
-  public int forwardTime(long value, TimeUnit unit) {
+  public synchronized int forwardTime(long value, TimeUnit unit) {
     currentTimeNanos += unit.toNanos(value);
     return runDueTasks();
   }

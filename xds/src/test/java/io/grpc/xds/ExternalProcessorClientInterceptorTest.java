@@ -258,7 +258,7 @@ public class ExternalProcessorClientInterceptorTest {
 
     grpcCleanup.register(InProcessServerBuilder.forName(dataPlaneServerName)
         .fallbackHandlerRegistry(dataPlaneServiceRegistry)
-        .directExecutor()
+        .executor(Runnable::run)
         .build().start());
   }
 

@@ -22,6 +22,8 @@ import io.grpc.Attributes;
 import io.grpc.ChannelLogger;
 import io.grpc.Internal;
 import io.grpc.InternalChannelz;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http2.Http2ConnectionDecoder;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
@@ -34,6 +36,21 @@ import javax.annotation.Nullable;
  */
 @Internal
 public abstract class GrpcHttp2ConnectionHandler extends Http2ConnectionHandler {
+  private static final Cumulator THREAD_SAFE_SLICE_CUMULATOR = new Cumulator() {
+    @Override
+    @SuppressWarnings("ReferenceEquality")
+    public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
+      if (cumulation != in && cumulation.refCnt() > 1
+          && in.readableBytes() > cumulation.writableBytes()) {
+        ByteBuf expanded = alloc.buffer(cumulation.readableBytes() + in.readableBytes());
+        expanded.writeBytes(cumulation);
+        cumulation.release();
+        cumulation = expanded;
+      }
+      return MERGE_CUMULATOR.cumulate(alloc, cumulation, in);
+    }
+  };
+
   @Nullable
   protected final ChannelPromise channelUnused;
   private final ChannelLogger negotiationLogger;
@@ -48,6 +65,7 @@ public abstract class GrpcHttp2ConnectionHandler extends Http2ConnectionHandler 
     super(decoder, encoder, initialSettings);
     this.channelUnused = channelUnused;
     this.negotiationLogger = negotiationLogger;
+    setCumulator(THREAD_SAFE_SLICE_CUMULATOR);
   }
 
   /**

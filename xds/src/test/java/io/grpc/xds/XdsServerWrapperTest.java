@@ -115,6 +115,8 @@ public class XdsServerWrapperTest {
 
   private static final String STATEFUL_1 = "stateful_1";
   private static final String STATEFUL_2 = "stateful_2";
+  private static final String NESTED_1 = "stateful_nested_1";
+  private static final String NESTED_2 = "stateful_nested_2";
 
   @Rule
   public final MockitoRule mocks = MockitoJUnit.rule();
@@ -1649,6 +1651,83 @@ public class XdsServerWrapperTest {
     assertThat(lds1Filter1.isShutdown()).isFalse();
     assertThat(lds1Filter2.isShutdown()).isTrue();
     assertThat(lds4Filter2.isShutdown()).isFalse();
+  }
+
+  /**
+   * Verifies that filters nested inside another filter's config - the composite filter's matcher
+   * actions being the motivating case - are owned by the chain's flat filter map exactly like
+   * top-level filters: created once, reused while still configured, closed when dropped.
+   */
+  @Test
+  public void filterState_nestedFiltersReconciledLikeTopLevel() {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+    VirtualHost vhost = filterStateTestVhost();
+
+    // LDS 1: one top-level filter owning two nested filters.
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0", createHcm(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)),
+            new NamedFilterConfig(NESTED_2, new StatefulFilter.Config(NESTED_2)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+    verifyServerStarted(serverStart);
+
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("LDS 1: expected an instance for the parent and for each nested filter")
+        .that(lds1Snapshot).hasSize(3);
+    StatefulFilter parent = lds1Snapshot.get(0);
+    StatefulFilter nested1 = lds1Snapshot.get(1);
+    StatefulFilter nested2 = lds1Snapshot.get(2);
+
+    // LDS 2: identical config, so the nested instances - and the state they own - must survive.
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0", createHcm(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)),
+            new NamedFilterConfig(NESTED_2, new StatefulFilter.Config(NESTED_2)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+    assertWithMessage("LDS 2: expected nested filter instances to be reused")
+        .that(statefulFilterProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+    assertThat(nested2.isShutdown()).isFalse();
+
+    // LDS 3: NESTED_2 dropped, which must close it and leave everything else alone.
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0", createHcm(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+    assertThat(parent.isShutdown()).isFalse();
+    assertThat(nested1.isShutdown()).isFalse();
+    assertWithMessage("LDS 3: expected the dropped nested filter to be shut down")
+        .that(nested2.isShutdown()).isTrue();
+  }
+
+  /**
+   * Verifies that nested filters reachable only through an RDS route override are instantiated
+   * when the RDS update arrives, before per-route interceptors are built against them.
+   */
+  @Test
+  public void filterState_nestedFiltersOfRdsOverridesAreInstantiated() throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+
+    String rdsName = "rds.example.com";
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0",
+        createHcmForRds(rdsName, filterStateTestConfigs(STATEFUL_1))), null);
+
+    // Only the top-level filter exists until the routes - and therefore the overrides - arrive.
+    assertThat(statefulFilterProvider.getAllInstances()).hasSize(1);
+
+    // The RDS update carries an override whose nested filter nothing else mentions.
+    VirtualHost vhost = filterStateTestVhost("stateful-vhost", ImmutableMap.of(
+        STATEFUL_1, StatefulFilter.Config.withNested("override",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))));
+    xdsClient.deliverRdsUpdate(rdsName, ImmutableList.of(vhost));
+    verifyServerStarted(serverStart);
+
+    assertWithMessage("Expected the RDS override's nested filter to be instantiated")
+        .that(statefulFilterProvider.getAllInstances()).hasSize(2);
+    assertThat(statefulFilterProvider.getAllInstances().get(1).isShutdown()).isFalse();
   }
 
   @Test

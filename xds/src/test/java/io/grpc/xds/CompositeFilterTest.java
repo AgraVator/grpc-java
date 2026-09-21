@@ -89,7 +89,11 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.junit.After;
@@ -144,6 +148,7 @@ public class CompositeFilterTest {
       when(fakeProvider.typeUrls()).thenReturn(new String[]{FAKE_TYPE_URL});
       when(fakeProvider.isClientFilter()).thenReturn(true);
       when(fakeProvider.isServerFilter()).thenReturn(true);
+      when(fakeConfig.typeUrl()).thenReturn(FAKE_TYPE_URL);
       ConfigOrError<? extends FilterConfig> configRes = ConfigOrError.fromConfig(fakeConfig);
       when(fakeProvider.parseFilterConfig(any(com.google.protobuf.Message.class), any()))
           .thenReturn((ConfigOrError) configRes);
@@ -196,9 +201,27 @@ public class CompositeFilterTest {
           .build();
     }
 
+    /**
+     * Stands in for the {@code activeFilters} map that {@code XdsNameResolver} and
+     * {@code XdsServerWrapper} own: the framework creates every nested filter up front, keyed by
+     * {@code NamedFilterConfig.filterStateKey()}, and {@link CompositeFilter} only ever reads it.
+     */
+    private final Map<String, Filter> activeFilters = new HashMap<>();
+
     private CompositeFilter newFilter(String name) {
       return (CompositeFilter) provider.newInstance(
-          FilterContext.create(name, mock(MetricRecorder.class)));
+          FilterContext.create(
+              name,
+              mock(MetricRecorder.class),
+              key -> activeFilters.computeIfAbsent(key, k -> {
+                int sep = k.lastIndexOf('_');
+                String nestedName = k.substring(0, sep);
+                String typeUrl = k.substring(sep + 1);
+                Filter.Provider p = FAKE_UNSUPPORTED_TYPE_URL.equals(typeUrl)
+                    ? fakeUnsupportedProvider : fakeProvider;
+                return p.newInstance(
+                    FilterContext.create(nestedName, mock(MetricRecorder.class)));
+              })));
     }
 
     private static ExtensionWithMatcher createExtensionWithMatcher(Matcher matcher) {
@@ -943,7 +966,7 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void clientInterceptor_nestedFilterOutlivesRpcAndClosesWithComposite() {
+    public void clientInterceptor_nestedFilterOutlivesRpc() {
       Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
       Matcher matcher = Matcher.newBuilder()
           .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -981,10 +1004,6 @@ public class CompositeFilterTest {
 
       // Closing the RPC must NOT close the nested filter; it is shared across RPCs.
       verify(fakeFilter, never()).close();
-
-      // It is released only when the composite filter itself is closed.
-      filter.close();
-      verify(fakeFilter).close();
     }
 
     @Test
@@ -1266,7 +1285,7 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void serverInterceptor_nestedFilterOutlivesRpcsAndClosesWithComposite() {
+    public void serverInterceptor_nestedFilterOutlivesRpcs() {
       Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
       Matcher matcher = Matcher.newBuilder()
           .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -1314,14 +1333,6 @@ public class CompositeFilterTest {
       listener2.onCancel();
       verify(fakeFilter, never()).close();
       verify(fakeProvider, times(1)).newInstance(any());
-
-      // Closing the composite filter releases the nested filter exactly once.
-      filter.close();
-      verify(fakeFilter, times(1)).close();
-
-      // close() is idempotent.
-      filter.close();
-      verify(fakeFilter, times(1)).close();
     }
 
     /** Parses a top-level composite config whose single action runs the named nested filter. */
@@ -1340,7 +1351,7 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void nestedFilter_oneInstancePerConfigGenerationAcrossRoutes() {
+    public void nestedFilter_resolvedOncePerKeyAcrossRoutes() {
       CompositeFilter filter = newFilter("composite");
       ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
       // The resolver hands the same config object to every route of a single LDS update.
@@ -1350,12 +1361,14 @@ public class CompositeFilterTest {
       filter.buildClientInterceptor(config, null, scheduler);
       filter.buildClientInterceptor(config, null, scheduler);
 
+      // One instance for the one nested name, created by the framework's map, not by the
+      // composite filter.
       verify(fakeProvider, times(1)).newInstance(any());
       verify(fakeFilter, never()).close();
     }
 
     @Test
-    public void nestedFilter_routesOfOneGenerationDoNotEvictEachOther() {
+    public void nestedFilter_routesSelectingDifferentChildrenDoNotEvictEachOther() {
       CompositeFilter filter = newFilter("composite");
       ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
 
@@ -1369,16 +1382,12 @@ public class CompositeFilterTest {
       filter.buildClientInterceptor(topLevel, routeOverride, scheduler);  // route 2 -> child_b
       filter.buildClientInterceptor(topLevel, null, scheduler);           // route 3 -> child_a
 
-      // Generations are keyed on the top-level config's identity, so all three routes belong to
-      // one generation and nothing rotates between them. Were a route to start a new generation,
-      // route 3 would close child_a while route 1's interceptor still holds an interceptor built
-      // from it, and would then hand route 3 a different instance.
       verify(fakeProvider, times(2)).newInstance(any());
       verify(fakeFilter, never()).close();
     }
 
     @Test
-    public void nestedFilter_carriedForwardAcrossConfigGenerations() {
+    public void nestedFilter_reusedAcrossConfigUpdates() {
       CompositeFilter filter = newFilter("composite");
       ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
 
@@ -1387,55 +1396,10 @@ public class CompositeFilterTest {
       filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
 
       // The instance is reused, so the state it owns (connection pools, credential caches)
-      // survives the update instead of being rebuilt.
+      // survives the update instead of being rebuilt. Retiring it is the framework's job: the
+      // composite filter never closes a nested filter.
       verify(fakeProvider, times(1)).newInstance(any());
       verify(fakeFilter, never()).close();
-    }
-
-    @Test
-    public void nestedFilter_droppedFromConfigIsReleasedOnFollowingGeneration() {
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-
-      filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
-      filter.buildClientInterceptor(configWithChild("other"), null, scheduler);
-
-      // Generation 2 may still have routes left to process, any of which could reclaim "child",
-      // so it is only retired here, not closed.
-      verify(fakeFilter, never()).close();
-
-      // Once generation 3 starts, generation 1's leftovers are provably unused.
-      filter.buildClientInterceptor(configWithChild("third"), null, scheduler);
-      verify(fakeFilter, times(1)).close();
-    }
-
-    @Test
-    public void nestedFilter_closeReleasesActiveAndRetiredGenerations() {
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-
-      filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
-      filter.buildClientInterceptor(configWithChild("other"), null, scheduler);
-      verify(fakeProvider, times(2)).newInstance(any());
-      verify(fakeFilter, never()).close();
-
-      // "other" is active and "child" is retired; both must be released.
-      filter.close();
-      verify(fakeFilter, times(2)).close();
-    }
-
-    @Test
-    public void nestedFilter_buildAfterCloseIsRejected() {
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-      filter.close();
-
-      try {
-        filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
-        fail("Expected IllegalStateException");
-      } catch (IllegalStateException expected) {
-        assertThat(expected).hasMessageThat().contains("CompositeFilter is closed");
-      }
     }
 
     @Test
@@ -1664,10 +1628,6 @@ public class CompositeFilterTest {
 
       // The nested filter must survive the RPC; it is shared across RPCs.
       verify(fakeFilter, never()).close();
-
-      // It is released only when the composite filter itself is closed.
-      filter.close();
-      verify(fakeFilter).close();
     }
 
     @Test
@@ -1779,7 +1739,15 @@ public class CompositeFilterTest {
           provider.parseFilterConfig(Any.pack(proto), getFilterContext());
 
       MetricRecorder expectedRecorder = mock(MetricRecorder.class);
-      CompositeFilter filter = new CompositeFilter(expectedRecorder);
+      List<String> lookedUpKeys = new ArrayList<>();
+      CompositeFilter filter = (CompositeFilter) provider.newInstance(
+          FilterContext.create(
+              "composite",
+              expectedRecorder,
+              key -> {
+                lookedUpKeys.add(key);
+                return fakeFilter;
+              }));
       ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
           mock(ScheduledExecutorService.class));
 
@@ -1794,10 +1762,7 @@ public class CompositeFilterTest {
       headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
       call.start(mock(ClientCall.Listener.class), headers);
 
-      ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
-      verify(fakeProvider).newInstance(contextCaptor.capture());
-      assertThat(contextCaptor.getValue().filterName()).isEqualTo("my_child_filter");
-      assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(expectedRecorder);
+      assertThat(lookedUpKeys).containsExactly("my_child_filter_" + FAKE_TYPE_URL);
     }
 
     @Test
@@ -1844,10 +1809,6 @@ public class CompositeFilterTest {
       listener.onComplete();
       verify(childListener).onComplete();
       verify(fakeFilter, never()).close();
-
-      // They are released only when the composite filter itself is closed.
-      filter.close();
-      verify(fakeFilter).close();
     }
 
     @Test
@@ -2882,69 +2843,6 @@ public class CompositeFilterTest {
       assertThat(prefixRes.config.delegates).hasSize(1);
     }
 
-    @Test
-    public void close_nestedFilterThrowsRuntimeException_propagatesAndSuppressesSubsequent() {
-      Filter failing1 = new Filter() {
-        @Override
-        public void close() {
-          throw new IllegalStateException("boom1");
-        }
-      };
-      Filter failing2 = new Filter() {
-        @Override
-        public void close() {
-          throw new IllegalArgumentException("boom2");
-        }
-      };
-      java.util.concurrent.atomic.AtomicInteger count =
-          new java.util.concurrent.atomic.AtomicInteger();
-      when(fakeProvider.newInstance(any(FilterContext.class))).thenAnswer(inv ->
-          count.getAndIncrement() == 0 ? failing1 : failing2);
-
-      Matcher matcher = Matcher.newBuilder()
-          .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "1", createExecuteAction("c1", FAKE_TYPE_URL)))
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "2", createExecuteAction("c2", FAKE_TYPE_URL))))
-          .build();
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
-          provider.parseFilterConfig(
-              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-
-      CompositeFilter filter = newFilter("composite");
-      filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
-
-      RuntimeException thrown = assertThrows(RuntimeException.class, filter::close);
-      assertThat(thrown.getSuppressed()).hasLength(1);
-      assertThat(java.util.Arrays.asList(
-          thrown.getMessage(), thrown.getSuppressed()[0].getMessage()))
-          .containsExactly("boom1", "boom2");
-    }
-
-    @Test
-    public void close_nestedFilterThrowsError_propagatesError() {
-      Filter errorFilter = new Filter() {
-        @Override
-        public void close() {
-          throw new AssertionError("fatal error");
-        }
-      };
-      when(fakeProvider.newInstance(any(FilterContext.class))).thenReturn(errorFilter);
-
-      Matcher matcher = Matcher.newBuilder()
-          .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
-          .build();
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
-          provider.parseFilterConfig(
-              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-
-      CompositeFilter filter = newFilter("composite");
-      filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
-
-      AssertionError err = assertThrows(AssertionError.class, filter::close);
-      assertThat(err).hasMessageThat().isEqualTo("fatal error");
-    }
 
     @Test
     public void compositeFilterConfig_equalsHashCodeToString() {
@@ -3088,6 +2986,161 @@ public class CompositeFilterTest {
       } finally {
         julLogger.setLevel(oldLevel);
       }
+    }
+
+    @Test
+    public void parseFilterConfig_nestedFilterMissingName_rejected() {
+      Matcher.OnMatch missingNameAction = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("execute_action")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("")
+                      .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_TYPE_URL)))
+                  .build())))
+          .build();
+      Matcher matcher = Matcher.newBuilder().setOnNoMatch(missingNameAction).build();
+
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.config).isNull();
+      assertThat(res.errorDetail).contains("Nested filter is missing a name");
+    }
+
+    @Test
+    public void parseFilterConfig_duplicateNameWithinFilterChain_rejected() {
+      TypedExtensionConfig child = TypedExtensionConfig.newBuilder()
+          .setName("dup_child")
+          .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_TYPE_URL))
+          .build();
+      Matcher.OnMatch chainAction = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("execute_chain")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setFilterChain(
+                      io.envoyproxy.envoy.extensions.filters.http.composite.v3
+                          .FilterChainConfiguration.newBuilder()
+                          .addTypedConfig(child)
+                          .addTypedConfig(child))
+                  .build())))
+          .build();
+      Matcher matcher = Matcher.newBuilder().setOnNoMatch(chainAction).build();
+
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.config).isNull();
+      assertThat(res.errorDetail)
+          .contains("ExecuteFilterAction.filter_chain contains duplicate filter name: dup_child");
+    }
+
+    @Test
+    public void parseFilterConfig_conflictingConfigAcrossActions_rejected() {
+      Matcher.OnMatch action1 = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("action_1")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("shared_name")
+                      .setTypedConfig(Any.newBuilder()
+                          .setTypeUrl(FAKE_TYPE_URL)
+                          .setValue(ByteString.copyFromUtf8("cfg-A"))))
+                  .build())))
+          .build();
+      Matcher.OnMatch action2 = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("action_2")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("shared_name")
+                      .setTypedConfig(Any.newBuilder()
+                          .setTypeUrl(FAKE_TYPE_URL)
+                          .setValue(ByteString.copyFromUtf8("cfg-B"))))
+                  .build())))
+          .build();
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("h", "1", action1))
+              .addMatchers(createHeaderFieldMatcher("h", "2", action2)))
+          .build();
+
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.config).isNull();
+      assertThat(res.errorDetail)
+          .contains("Nested filter name shared_name is used by two different filter configs");
+    }
+
+    @Test
+    public void parseFilterConfig_identicalConfigAcrossActions_allowedAndSharesInstance() {
+      TypedExtensionConfig identicalChild = TypedExtensionConfig.newBuilder()
+          .setName("shared_name")
+          .setTypedConfig(Any.newBuilder()
+              .setTypeUrl(FAKE_TYPE_URL)
+              .setValue(ByteString.copyFromUtf8("same-cfg")))
+          .build();
+      Matcher.OnMatch action1 = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("action_1")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(identicalChild)
+                  .build())))
+          .build();
+      Matcher.OnMatch action2 = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("action_2")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(identicalChild)
+                  .build())))
+          .build();
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("h", "1", action1))
+              .addMatchers(createHeaderFieldMatcher("h", "2", action2)))
+          .build();
+
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.errorDetail).isNull();
+
+      CompositeFilter filter = newFilter("composite");
+      filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
+      // Only one underlying Filter instance should be created for the shared name.
+      verify(fakeProvider, times(1)).newInstance(any(FilterContext.class));
+    }
+
+    @Test
+    public void nestedFilterConfigs_exposesAllChildConfigsForFrameworkReconciliation() {
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher(
+                  "h", "1", createExecuteAction("c1", FAKE_TYPE_URL)))
+              .addMatchers(createHeaderFieldMatcher(
+                  "h", "2", createExecuteAction("c2", FAKE_TYPE_URL))))
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.errorDetail).isNull();
+      List<String> keys = new ArrayList<>();
+      for (Filter.NamedFilterConfig nfc : res.config.nestedFilterConfigs()) {
+        keys.add(nfc.filterStateKey());
+      }
+      assertThat(keys).containsExactly("c1_" + FAKE_TYPE_URL, "c2_" + FAKE_TYPE_URL);
+    }
+
+    @Test
+    public void nestedFilter_missingFromActiveFiltersLookup_throwsNpe() {
+      CompositeFilter unreconciled = (CompositeFilter) provider.newInstance(
+          FilterContext.create("composite", mock(MetricRecorder.class), k -> null));
+      NullPointerException thrown = assertThrows(NullPointerException.class,
+          () -> unreconciled.buildClientInterceptor(
+              configWithChild("missing_child"), null, mock(ScheduledExecutorService.class)));
+      assertThat(thrown).hasMessageThat()
+          .contains("nested filter missing_child_" + FAKE_TYPE_URL + " not reconciled");
     }
   }
 

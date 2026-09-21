@@ -161,6 +161,8 @@ public class XdsNameResolverTest {
   // Stateful instance filter names.
   private static final String STATEFUL_1 = "test.stateful.filter.1";
   private static final String STATEFUL_2 = "test.stateful.filter.2";
+  private static final String NESTED_1 = "test.stateful.nested.1";
+  private static final String NESTED_2 = "test.stateful.nested.2";
 
   @Rule
   public final GrpcCleanupRule grpcCleanup = new GrpcCleanupRule();
@@ -1503,6 +1505,219 @@ public class XdsNameResolverTest {
     // creating new filter instances.
     assertWithMessage("RDS 3: Expected Filter instances to be reused on per-route filter overrides")
         .that(rds3Snapshot).isEqualTo(rds1Snapshot);
+  }
+
+  /**
+   * Verifies that filters nested inside another filter's config - the composite filter's matcher
+   * actions being the motivating case - are owned by the resolver's flat {@code activeFilters} map
+   * exactly like top-level filters: created once, reused while still configured, and closed when
+   * the config stops naming them.
+   */
+  @Test
+  public void filterState_nestedFiltersReconciledLikeTopLevel() {
+    StatefulFilter.Provider statefulFilterProvider = filterStateTestSetupResolver();
+    FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+    VirtualHost vhost = filterStateTestVhost();
+
+    // LDS 1: one top-level filter that owns two nested filters.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)),
+            new NamedFilterConfig(NESTED_2, new StatefulFilter.Config(NESTED_2)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    createAndDeliverClusterUpdates(xdsClient, cluster1);
+    assertClusterResolutionResult(call1, cluster1);
+
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("LDS 1: expected an instance for the parent and for each nested filter")
+        .that(lds1Snapshot).hasSize(3);
+    StatefulFilter parent = lds1Snapshot.get(0);
+    StatefulFilter nested1 = lds1Snapshot.get(1);
+    StatefulFilter nested2 = lds1Snapshot.get(2);
+
+    // LDS 2: identical config. Nested filters must be reused, not rebuilt: the state they own is
+    // exactly what a config update must not throw away.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)),
+            new NamedFilterConfig(NESTED_2, new StatefulFilter.Config(NESTED_2)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertWithMessage("LDS 2: expected nested filter instances to be reused")
+        .that(statefulFilterProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+    assertThat(nested1.isShutdown()).isFalse();
+    assertThat(nested2.isShutdown()).isFalse();
+
+    // LDS 3: NESTED_2 dropped from the parent's config. Java has no destructors, so the resolver
+    // has to close it explicitly or whatever it owns leaks.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, StatefulFilter.Config.withNested("parent",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertThat(parent.isShutdown()).isFalse();
+    assertThat(nested1.isShutdown()).isFalse();
+    assertWithMessage("LDS 3: expected the dropped nested filter to be shut down")
+        .that(nested2.isShutdown()).isTrue();
+
+    // LDS 4: the parent itself is dropped, which must take its remaining child with it.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertThat(parent.isShutdown()).isTrue();
+    assertWithMessage("LDS 4: expected nested filters of a dropped parent to be shut down")
+        .that(nested1.isShutdown()).isTrue();
+  }
+
+  /**
+   * Verifies that nested filters reachable only through a per-route override are instantiated too,
+   * while the override itself does not become an instance of its own: an override reconfigures the
+   * instance named by the top-level config, it does not introduce a new one.
+   */
+  @Test
+  public void filterState_nestedFiltersOfRouteOverridesAreInstantiated() {
+    StatefulFilter.Provider statefulFilterProvider = filterStateTestSetupResolver();
+    FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+    // The route override for STATEFUL_1 selects a nested filter that the top-level config does
+    // not mention at all.
+    VirtualHost vhost = filterStateTestVhost(ImmutableMap.of(
+        STATEFUL_1, StatefulFilter.Config.withNested("override",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))));
+
+    xdsClient.deliverLdsUpdateWithFilters(vhost, filterStateTestConfigs(STATEFUL_1));
+    createAndDeliverClusterUpdates(xdsClient, cluster1);
+    assertClusterResolutionResult(call1, cluster1);
+
+    // One instance for the top-level STATEFUL_1, one for the override's nested filter, and none
+    // for the override itself.
+    assertWithMessage("Expected the override's nested filter to be instantiated")
+        .that(statefulFilterProvider.getAllInstances()).hasSize(2);
+  }
+
+  /**
+   * The multi-level composite tree used to reason about this design, encoded as a test.
+   *
+   * <pre>
+   * http_filters:
+   *   [0] "gcp_authn"  cache_size: 100            &lt;- DEPTH 0
+   *   [1] "outer"      composite
+   *         "eu" -&gt; [ "inner" composite
+   *                     "vip" -&gt; [ "gcp_authn"    &lt;- DEPTH 2, SAME NAME as depth 0
+   *                                  cache_size: 5
+   *                                "ext_proc" ]   &lt;- DEPTH 2
+   *                     "std" -&gt; [ "ext_proc" ]   &lt;- DEPTH 2, same name as sibling
+   *                   ,
+   *                   "eu_fault" ]                &lt;- DEPTH 1
+   *         "us" -&gt; [ "ext_proc" ]                &lt;- DEPTH 1, SAME NAME as depth 2
+   *   [2] "router"
+   * </pre>
+   *
+   * <p>Eight config nodes name only five distinct instances, because the resolver's
+   * {@code activeFilters} map is a single flat keyspace shared by every depth. This test pins
+   * three properties that the single-level tests cannot:
+   *
+   * <ol>
+   *   <li><b>The walk recurses past depth 1.</b> {@code "inner"}'s children are reachable only
+   *       through {@code "outer"}.
+   *   <li><b>A child reachable from several parents is instantiated once.</b> {@code "ext_proc"}
+   *       is named three times, at two different depths.
+   *   <li><b>Sharing is by name, so it crosses depths.</b> The depth-2 {@code "gcp_authn"} is the
+   *       <em>same</em> instance as the depth-0 one. gRFC A103 requires filter instance names to
+   *       be unique, so a conformant control plane never builds this tree - but if one does, Java
+   *       shares rather than isolating, exactly as gRPC C-core's {@code Blackboard} does.
+   * </ol>
+   */
+  @Test
+  public void filterState_nestedCompositeTreeSharesOneFlatKeyspace() {
+    StatefulFilter.Provider statefulFilterProvider = filterStateTestSetupResolver();
+    FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+    VirtualHost vhost = filterStateTestVhost();
+
+    String gcpAuthnName = "gcp_authn";
+    String outerName = "outer";
+    String innerName = "inner";
+    String euFaultName = "eu_fault";
+    String extProcName = "ext_proc";
+
+    NamedFilterConfig extProc =
+        new NamedFilterConfig(extProcName, new StatefulFilter.Config(extProcName));
+    NamedFilterConfig euFault =
+        new NamedFilterConfig(euFaultName, new StatefulFilter.Config(euFaultName));
+    // "inner": "vip" -> [gcp_authn(5), ext_proc], "std" -> [ext_proc]. A composite config reports
+    // the children of every action flattened together, duplicates included.
+    NamedFilterConfig inner = new NamedFilterConfig(innerName,
+        StatefulFilter.Config.withNested(innerName,
+            new NamedFilterConfig(gcpAuthnName, new StatefulFilter.Config("cache_size=5")),
+            extProc,
+            extProc));
+    // "outer": "eu" -> [inner, eu_fault], "us" -> [ext_proc].
+    NamedFilterConfig outer = new NamedFilterConfig(outerName,
+        StatefulFilter.Config.withNested(outerName, inner, euFault, extProc));
+    NamedFilterConfig gcpAuthnTop =
+        new NamedFilterConfig(gcpAuthnName, new StatefulFilter.Config("cache_size=100"));
+
+    ImmutableList<NamedFilterConfig> fullTree = ImmutableList.of(
+        gcpAuthnTop,
+        outer,
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
+
+    xdsClient.deliverLdsUpdateWithFilters(vhost, fullTree);
+    createAndDeliverClusterUpdates(xdsClient, cluster1);
+    assertClusterResolutionResult(call1, cluster1);
+
+    ImmutableList<StatefulFilter> instances = statefulFilterProvider.getAllInstances();
+    assertWithMessage("Eight config nodes, five distinct (name, typeUrl) keys")
+        .that(instances).hasSize(5);
+
+    // Creation order is the breadth-first order of the walk: the two roots, then "outer"'s
+    // children, then "inner"'s (which are all already-visited keys and create nothing).
+    StatefulFilter gcpAuthn = instances.get(0);
+    StatefulFilter outerFilter = instances.get(1);
+    StatefulFilter innerFilter = instances.get(2);
+    StatefulFilter euFaultFilter = instances.get(3);
+    StatefulFilter extProcFilter = instances.get(4);
+    // Every instance must be told its own name, not its parent's. Envoy does the opposite: a
+    // nested filter there resolves under the composite's name.
+    assertThat(gcpAuthn.name).isEqualTo(gcpAuthnName);
+    assertThat(outerFilter.name).isEqualTo(outerName);
+    assertThat(innerFilter.name).isEqualTo(innerName);
+    assertThat(euFaultFilter.name).isEqualTo(euFaultName);
+    assertThat(extProcFilter.name).isEqualTo(extProcName);
+
+    // LDS 2: drop the depth-0 "gcp_authn" from http_filters. The depth-2 reference inside
+    // "inner" still names it, so the instance - and the cache it owns - must survive. This only
+    // holds if the walk actually descends two levels.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        outer,
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertWithMessage("LDS 2: expected the depth-2 reference to keep \"gcp_authn\" alive")
+        .that(gcpAuthn.isShutdown()).isFalse();
+    assertWithMessage("LDS 2: expected no new instances")
+        .that(statefulFilterProvider.getAllInstances()).isEqualTo(instances);
+
+    // LDS 3: drop "outer" and restore the depth-0 "gcp_authn". Everything reachable only through
+    // "outer" must be closed, and "gcp_authn" must still be the original instance.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        gcpAuthnTop,
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertWithMessage("LDS 3: \"gcp_authn\" is still named at depth 0")
+        .that(gcpAuthn.isShutdown()).isFalse();
+    assertThat(outerFilter.isShutdown()).isTrue();
+    assertWithMessage("LDS 3: expected the grandchild subtree to be closed too")
+        .that(innerFilter.isShutdown()).isTrue();
+    assertThat(euFaultFilter.isShutdown()).isTrue();
+    assertThat(extProcFilter.isShutdown()).isTrue();
+    assertWithMessage("LDS 3: expected no instance to be rebuilt")
+        .that(statefulFilterProvider.getAllInstances()).isEqualTo(instances);
+
+    // LDS 4: nothing but the router is left.
+    xdsClient.deliverLdsUpdateWithFilters(vhost, ImmutableList.of(
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+    assertClusterResolutionResult(call1, cluster1);
+    assertThat(gcpAuthn.isShutdown()).isTrue();
   }
 
   /**

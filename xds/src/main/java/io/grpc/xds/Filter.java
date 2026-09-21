@@ -26,8 +26,11 @@ import io.grpc.ServerInterceptor;
 import io.grpc.xds.client.Bootstrapper.BootstrapInfo;
 import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 
 /**
@@ -43,6 +46,15 @@ interface Filter extends Closeable {
   /** Represents an opaque data structure holding configuration for a filter. */
   interface FilterConfig {
     String typeUrl();
+
+    /**
+     * Any nested filter configurations owned by this config (for example, child filters inside a
+     * composite filter's matcher tree). Returned configs are reconciled and closed by the xDS
+     * framework alongside top-level filters in {@code activeFilters}.
+     */
+    default Collection<NamedFilterConfig> nestedFilterConfigs() {
+      return Collections.emptyList();
+    }
   }
 
   /**
@@ -182,8 +194,19 @@ interface Filter extends Closeable {
 
     abstract MetricRecorder metricsRecorder();
 
+    @Nullable
+    abstract Function<String, Filter> activeFilterLookup();
+
     static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
-      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder);
+      return create(filterName, metricsRecorder, /* activeFilterLookup= */ null);
+    }
+
+    static FilterContext create(
+        String filterName,
+        MetricRecorder metricsRecorder,
+        @Nullable Function<String, Filter> activeFilterLookup) {
+      return new AutoValue_Filter_FilterContext(
+          filterName, metricsRecorder, activeFilterLookup);
     }
   }
 

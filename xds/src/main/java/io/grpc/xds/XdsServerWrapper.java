@@ -66,11 +66,13 @@ import io.grpc.xds.internal.security.SslContextProviderSupplier;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.SocketAddress;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -735,54 +737,105 @@ final class XdsServerWrapper extends Server {
         removedChains.remove(filterChain.name());
         updateActiveFiltersForChain(
             activeFilters.computeIfAbsent(filterChain.name(), k -> new HashMap<>()),
-            filterChain.httpConnectionManager().httpFilterConfigs());
+            filterChain.httpConnectionManager().httpFilterConfigs(),
+            effectiveVirtualHosts(filterChain.httpConnectionManager()));
       }
 
       // Shutdown all filters of chains missing from the LDS.
       for (String chainToShutdown : removedChains) {
         HashMap<String, Filter> filtersToShutdown = activeFilters.get(chainToShutdown);
         checkNotNull(filtersToShutdown, "filtersToShutdown of chain %s", chainToShutdown);
-        updateActiveFiltersForChain(filtersToShutdown, null);
+        updateActiveFiltersForChain(filtersToShutdown, null, null);
         activeFilters.remove(chainToShutdown);
       }
 
       // Default chain.
       ImmutableList<NamedFilterConfig> defaultChainConfigs = null;
+      ImmutableList<VirtualHost> defaultChainVhosts = null;
       if (defaultFilterChain != null) {
         defaultChainConfigs = defaultFilterChain.httpConnectionManager().httpFilterConfigs();
+        defaultChainVhosts =
+            effectiveVirtualHosts(defaultFilterChain.httpConnectionManager());
       }
-      updateActiveFiltersForChain(activeFiltersDefaultChain, defaultChainConfigs);
+      updateActiveFiltersForChain(
+          activeFiltersDefaultChain, defaultChainConfigs, defaultChainVhosts);
+    }
+
+    /**
+     * The virtual hosts this chain currently routes on: the inlined ones, or the last set
+     * delivered by RDS. Reconciliation has to see them because per-route overrides can name
+     * nested filters that appear nowhere in {@code http_filters}; reconciling against only the
+     * inlined list would close those instances on every LDS update and rebuild them moments
+     * later, discarding exactly the state they exist to hold.
+     */
+    @Nullable
+    private ImmutableList<VirtualHost> effectiveVirtualHosts(HttpConnectionManager hcm) {
+      if (hcm.virtualHosts() != null) {
+        return hcm.virtualHosts();
+      }
+      RouteDiscoveryState rds = routeDiscoveryStates.get(hcm.rdsName());
+      return rds == null ? null : rds.savedVirtualHosts;
     }
 
     // called in syncContext
     private void shutdownActiveFilters() {
       for (HashMap<String, Filter> chainFilters : activeFilters.values()) {
         checkNotNull(chainFilters, "chainFilters");
-        updateActiveFiltersForChain(chainFilters, null);
+        updateActiveFiltersForChain(chainFilters, null, null);
       }
       activeFilters.clear();
-      updateActiveFiltersForChain(activeFiltersDefaultChain, null);
+      updateActiveFiltersForChain(activeFiltersDefaultChain, null, null);
     }
 
     // called in syncContext
     private void updateActiveFiltersForChain(
-        Map<String, Filter> chainFilters, @Nullable List<NamedFilterConfig> filterConfigs) {
+        Map<String, Filter> chainFilters,
+        @Nullable List<NamedFilterConfig> filterConfigs,
+        @Nullable List<VirtualHost> virtualHosts) {
       if (filterConfigs == null) {
         filterConfigs = ImmutableList.of();
       }
 
       Set<String> filtersToShutdown = new HashSet<>(chainFilters.keySet());
-      for (NamedFilterConfig namedFilter : filterConfigs) {
+      // Nested filters (for example the children of a composite filter) are owned by this map
+      // exactly like top-level ones, so the reconciliation walks the whole config tree. Per-route
+      // overrides only contribute their nested configs: the override itself is applied to the
+      // instance named by the top-level config, it is not an instance of its own.
+      Queue<NamedFilterConfig> queue = new ArrayDeque<>(filterConfigs);
+      if (virtualHosts != null) {
+        for (VirtualHost virtualHost : virtualHosts) {
+          collectNestedOverrides(virtualHost.filterConfigOverrides(), queue);
+          for (Route route : virtualHost.routes()) {
+            collectNestedOverrides(route.filterConfigOverrides(), queue);
+            if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
+              for (VirtualHost.Route.RouteAction.ClusterWeight cw
+                  : route.routeAction().weightedClusters()) {
+                collectNestedOverrides(cw.filterConfigOverrides(), queue);
+              }
+            }
+          }
+        }
+      }
+      // The same nested config can be reached from many routes; visit each key once so the walk
+      // stays linear in the size of the config tree.
+      Set<String> visited = new HashSet<>();
+      while (!queue.isEmpty()) {
+        NamedFilterConfig namedFilter = queue.poll();
         String typeUrl = namedFilter.filterConfig.typeUrl();
         String filterKey = namedFilter.filterStateKey();
+        if (!visited.add(filterKey)) {
+          continue;
+        }
 
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
         Filter filter = chainFilters.computeIfAbsent(
             filterKey, k -> provider.newInstance(
-                FilterContext.create(namedFilter.name, new MetricRecorder() {})));
+                FilterContext.create(
+                    namedFilter.name, new MetricRecorder() {}, chainFilters::get)));
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
+        queue.addAll(namedFilter.filterConfig.nestedFilterConfigs());
       }
 
       // Shutdown filters not present in current HCM.
@@ -790,6 +843,19 @@ final class XdsServerWrapper extends Server {
         Filter filterToShutdown = chainFilters.remove(filterKey);
         checkNotNull(filterToShutdown, "filterToShutdown %s", filterKey);
         filterToShutdown.close();
+      }
+    }
+
+    /**
+     * Enqueues the nested configs of every override in {@code overrides}, but not the overrides
+     * themselves: an override reconfigures the instance named by the top-level config rather than
+     * introducing an instance of its own, while the nested filters it selects are instances that
+     * have to exist before the override can be applied.
+     */
+    private void collectNestedOverrides(
+        Map<String, FilterConfig> overrides, Queue<NamedFilterConfig> queue) {
+      for (FilterConfig override : overrides.values()) {
+        queue.addAll(override.nestedFilterConfigs());
       }
     }
 
@@ -801,6 +867,9 @@ final class XdsServerWrapper extends Server {
       // Inlined routes.
       ImmutableList<VirtualHost> vhosts = hcm.virtualHosts();
       if (vhosts != null) {
+        // Reconcile before building interceptors: a filter that hosts other filters resolves its
+        // children out of chainFilters, so they have to exist by the time it is asked to build.
+        updateActiveFiltersForChain(chainFilters, hcm.httpFilterConfigs(), vhosts);
         routingConfig = ServerRoutingConfig.create(vhosts,
             generatePerRouteInterceptors(hcm.httpFilterConfigs(), vhosts, chainFilters));
         return new AtomicReference<>(routingConfig);
@@ -812,6 +881,10 @@ final class XdsServerWrapper extends Server {
 
       ImmutableList<VirtualHost> savedVhosts = rds.savedVirtualHosts;
       if (savedVhosts != null) {
+        // The first RDS update for this chain reaches the selector through here rather than
+        // through updateRdsRoutingConfig, so this is where its overrides' nested filters are
+        // first seen.
+        updateActiveFiltersForChain(chainFilters, hcm.httpFilterConfigs(), savedVhosts);
         routingConfig = ServerRoutingConfig.create(savedVhosts,
             generatePerRouteInterceptors(hcm.httpFilterConfigs(), savedVhosts, chainFilters));
       } else {
@@ -1014,7 +1087,14 @@ final class XdsServerWrapper extends Server {
           if (savedVirtualHosts == null) {
             updatedRoutingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
           } else {
-            HashMap<String, Filter> chainFilters = activeFilters.get(filterChain.name());
+            // The default chain's filters live in their own map, not under a chain name in
+            // activeFilters, so resolve it separately - otherwise a default chain served by RDS
+            // would look like a chain with no filters at all.
+            Map<String, Filter> chainFilters = filterChain.equals(defaultFilterChain)
+                ? activeFiltersDefaultChain
+                : activeFilters.get(filterChain.name());
+            checkNotNull(chainFilters, "chainFilters of chain %s", filterChain.name());
+            updateActiveFiltersForChain(chainFilters, hcm.httpFilterConfigs(), savedVirtualHosts);
             ImmutableMap<Route, ServerInterceptor> interceptors = generatePerRouteInterceptors(
                 hcm.httpFilterConfigs(), savedVirtualHosts, chainFilters);
             updatedRoutingConfig = ServerRoutingConfig.create(savedVirtualHosts, interceptors);

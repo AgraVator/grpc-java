@@ -39,7 +39,6 @@ import io.grpc.ForwardingClientCall;
 import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
-import io.grpc.MetricRecorder;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
@@ -49,17 +48,19 @@ import io.grpc.xds.internal.matcher.MatchContext;
 import io.grpc.xds.internal.matcher.MatchResult;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
-import javax.annotation.concurrent.GuardedBy;
 
 final class CompositeFilter implements Filter {
 
@@ -69,39 +70,10 @@ final class CompositeFilter implements Filter {
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
   private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
 
-  private final MetricRecorder metricsRecorder;
+  private final Function<String, Filter> activeFilterLookup;
 
-  private final Object filtersLock = new Object();
-
-  /**
-   * Nested filter instances claimed by the current configuration generation, keyed by nested
-   * filter name and type URL, mirroring {@link Filter.NamedFilterConfig#filterStateKey}.
-   */
-  @GuardedBy("filtersLock")
-  private final Map<String, Filter> activeNestedFilters = new HashMap<>();
-
-  /**
-   * Nested filters held over from the previous configuration generation. A filter that is still
-   * configured is promoted back into {@link #activeNestedFilters} on first use, preserving the
-   * state it owns; whatever remains unclaimed is closed when the next generation begins.
-   */
-  @GuardedBy("filtersLock")
-  private final Map<String, Filter> retiredNestedFilters = new HashMap<>();
-
-  /**
-   * The top-level {@link FilterConfig} that defines the current generation, compared by identity.
-   * A given LDS update produces exactly one config object, which the resolver then passes to
-   * every route, so a change of identity marks a new generation.
-   */
-  @GuardedBy("filtersLock")
-  @Nullable
-  private FilterConfig currentGeneration;
-
-  @GuardedBy("filtersLock")
-  private boolean closed;
-
-  CompositeFilter(MetricRecorder metricsRecorder) {
-    this.metricsRecorder = Preconditions.checkNotNull(metricsRecorder, "metricsRecorder");
+  CompositeFilter(Function<String, Filter> activeFilterLookup) {
+    this.activeFilterLookup = Preconditions.checkNotNull(activeFilterLookup, "activeFilterLookup");
   }
 
   static final class Provider implements Filter.Provider {
@@ -143,7 +115,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context.metricsRecorder());
+      return new CompositeFilter(context.activeFilterLookup());
     }
 
     @Override
@@ -221,7 +193,12 @@ final class CompositeFilter implements Filter {
       }
       try {
         Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
-        collectDelegates(matcherProto, delegates, context);
+        // Nested filter instances are keyed by name, so a name has to mean the same thing
+        // everywhere in this tree. Scoped to the tree rather than to an action because actions in
+        // sibling branches resolve against one shared instance map.
+        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName =
+            new HashMap<>();
+        collectDelegates(matcherProto, delegates, nestedByName, context);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
         return ConfigOrError.fromConfig(
@@ -278,42 +255,47 @@ final class CompositeFilter implements Filter {
     }
 
     private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
+        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
         FilterConfigParseContext context) {
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
           if (fm.hasOnMatch()) {
-            collectOnMatch(fm.getOnMatch(), map, context);
+            collectOnMatch(fm.getOnMatch(), map, nestedByName, context);
           }
         }
       } else if (matcher.hasMatcherTree()) {
         Matcher.MatcherTree tree = matcher.getMatcherTree();
         if (tree.hasExactMatchMap()) {
           for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
+            collectOnMatch(om, map, nestedByName, context);
           }
         } else if (tree.hasPrefixMatchMap()) {
           for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
+            collectOnMatch(om, map, nestedByName, context);
           }
         }
       }
       if (matcher.hasOnNoMatch()) {
-        collectOnMatch(matcher.getOnNoMatch(), map, context);
+        collectOnMatch(matcher.getOnNoMatch(), map, nestedByName, context);
       }
     }
 
     private void collectOnMatch(Matcher.OnMatch onMatch,
-        Map<TypedExtensionConfig, FilterDelegate> map, FilterConfigParseContext context) {
+        Map<TypedExtensionConfig, FilterDelegate> map,
+        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
+        FilterConfigParseContext context) {
       if (onMatch.hasMatcher()) {
-        collectDelegates(onMatch.getMatcher(), map, context);
+        collectDelegates(onMatch.getMatcher(), map, nestedByName, context);
       } else if (onMatch.hasAction()) {
         TypedExtensionConfig action = onMatch.getAction();
         // Keyed by the action message rather than by action.name: `name` is documentation only
         // ("is not used to select the extension") and the proto imposes no uniqueness rule, so
         // two distinct actions may share a name, and gRPC-Java does not require the name to be
-        // set at all. Identical actions still collapse to one entry, which is intended.
+        // set at all. Identical actions still collapse to one entry, which is intended - and it
+        // also keeps an action repeated across branches from tripping the nested name checks in
+        // createFilterDelegate, since it is only visited once.
         if (!map.containsKey(action)) {
-          FilterDelegate delegate = createFilterDelegate(action, context);
+          FilterDelegate delegate = createFilterDelegate(action, nestedByName, context);
           if (delegate != null) {
             map.put(action, delegate);
           }
@@ -325,8 +307,9 @@ final class CompositeFilter implements Filter {
       return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", false);
     }
 
-    private FilterDelegate createFilterDelegate(
-        TypedExtensionConfig config, FilterConfigParseContext context) {
+    private FilterDelegate createFilterDelegate(TypedExtensionConfig config,
+        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
+        FilterConfigParseContext context) {
       try {
         Any actionAny = config.getTypedConfig();
         if (actionAny.is(SkipFilter.class)) {
@@ -371,8 +354,35 @@ final class CompositeFilter implements Filter {
               "ExecuteFilterAction must specify either typed_config or filter_chain");
         }
         List<DelegateEntry> delegates = new ArrayList<>();
+        // A filter_chain is the nested analogue of the HCM's http_filters list, so it gets the
+        // same rule A39 imposes there: one namespace, no repeats.
+        Set<String> chainNames = new HashSet<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
             : childConfigs) {
+          String name = childFilterConfig.getName();
+          // TypedExtensionConfig.name carries `(validate.rules).string = {min_len: 1}`, and the
+          // name is what nested filter instances are keyed by, so an absent one is not merely
+          // invalid but unusable - every anonymous filter of a given type would alias onto one
+          // instance.
+          if (name.isEmpty()) {
+            throw new IllegalArgumentException("Nested filter is missing a name: "
+                + childFilterConfig.getTypedConfig().getTypeUrl());
+          }
+          if (!chainNames.add(name)) {
+            throw new IllegalArgumentException(
+                "ExecuteFilterAction.filter_chain contains duplicate filter name: " + name);
+          }
+          // The same name may legitimately appear under sibling actions: they share one instance,
+          // which is the intended way to reuse a nested filter's state across matcher branches.
+          // What is not legitimate is sharing an instance while disagreeing about how to configure
+          // it, since both configs would be applied and the winner decided by map iteration order.
+          io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig previous =
+              nestedByName.get(name);
+          if (previous != null && !previous.equals(childFilterConfig)) {
+            throw new IllegalArgumentException("Nested filter name " + name
+                + " is used by two different filter configs");
+          }
+          nestedByName.put(name, childFilterConfig);
           String typeUrl = childFilterConfig.getTypedConfig().getTypeUrl();
           Message rawConfig = childFilterConfig.getTypedConfig();
           try {
@@ -456,6 +466,17 @@ final class CompositeFilter implements Filter {
     @Override
     public String typeUrl() {
       return TYPE_URL_EXTENSION_WITH_MATCHER;
+    }
+
+    @Override
+    public Collection<NamedFilterConfig> nestedFilterConfigs() {
+      List<NamedFilterConfig> nested = new ArrayList<>();
+      for (FilterDelegate delegate : delegates.values()) {
+        for (DelegateEntry entry : delegate.delegates) {
+          nested.add(entry.namedConfig);
+        }
+      }
+      return nested;
     }
 
     /**
@@ -549,11 +570,13 @@ final class CompositeFilter implements Filter {
     final Filter.Provider provider;
     final FilterConfig config;
     final String name;
+    final NamedFilterConfig namedConfig;
 
     DelegateEntry(Filter.Provider provider, FilterConfig config, String name) {
       this.provider = provider;
       this.config = config;
       this.name = name;
+      this.namedConfig = new NamedFilterConfig(name, config);
     }
   }
 
@@ -592,9 +615,6 @@ final class CompositeFilter implements Filter {
   public ClientInterceptor buildClientInterceptor(FilterConfig config,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
     Preconditions.checkNotNull(config, "config");
-    // Done before the early return below, so that a configuration which no longer has a matcher
-    // still releases the nested filters of the generation it replaced.
-    closeAll(rotateGenerationIfNeeded(config));
     CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
     if (effective == null || effective.matcher == null) {
       return null;
@@ -618,7 +638,6 @@ final class CompositeFilter implements Filter {
   public ServerInterceptor buildServerInterceptor(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
     Preconditions.checkNotNull(config, "config");
-    closeAll(rotateGenerationIfNeeded(config));
     CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
     if (effective == null || effective.matcher == null) {
       return null;
@@ -706,7 +725,7 @@ final class CompositeFilter implements Filter {
             Status.UNAVAILABLE.withDescription(
                 "Filter " + entry.name + " is not supported on server side"));
       }
-      ServerInterceptor interceptor = getOrCreateNestedFilter(entry)
+      ServerInterceptor interceptor = getNestedFilter(entry)
           .buildServerInterceptor(entry.config, /* overrideConfig= */ null);
       if (interceptor != null) {
         interceptors.add(interceptor);
@@ -724,7 +743,7 @@ final class CompositeFilter implements Filter {
             Status.UNAVAILABLE.withDescription(
                 "Filter " + entry.name + " is not supported on client side"));
       }
-      ClientInterceptor interceptor = getOrCreateNestedFilter(entry)
+      ClientInterceptor interceptor = getNestedFilter(entry)
           .buildClientInterceptor(entry.config, /* overrideConfig= */ null, scheduler);
       if (interceptor != null) {
         interceptors.add(interceptor);
@@ -733,76 +752,10 @@ final class CompositeFilter implements Filter {
     return ResolvedDelegate.of(delegate, interceptors);
   }
 
-  /**
-   * Rotates the nested filter generations if {@code topLevelConfig} is not the one that defined
-   * the current generation, and returns the filters that are now provably unused.
-   *
-   * <p>Nested filters must outlive a configuration update, because the state they own - a
-   * connection pool, a credential cache - is exactly what would be lost by rebuilding them. So a
-   * new generation retires the previous one wholesale, {@link #getOrCreateNestedFilter} promotes
-   * back anything still configured, and only the leftovers are closed.
-   *
-   * <p>Cleanup has to be driven explicitly rather than by reachability: {@link Filter#close} has
-   * to be called by hand and garbage collection will not do it, so a filter that merely became
-   * unreachable would leak the resources it owns. Hence the explicit rotate-and-reclaim.
-   *
-   * <p>A configuration generation has no explicit end, since the resolver calls
-   * {@code buildXInterceptor} once per route and never signals the last one. A generation's
-   * leftovers can therefore only be released once the following generation begins, which bounds
-   * live instances at two generations instead of letting them grow without limit.
-   */
-  private List<Filter> rotateGenerationIfNeeded(FilterConfig topLevelConfig) {
-    synchronized (filtersLock) {
-      // Identity, not equality: one LDS update yields one config object, shared by every route.
-      if (currentGeneration == topLevelConfig) {
-        return new ArrayList<>();
-      }
-      currentGeneration = topLevelConfig;
-      List<Filter> unclaimed = new ArrayList<>(retiredNestedFilters.values());
-      retiredNestedFilters.clear();
-      retiredNestedFilters.putAll(activeNestedFilters);
-      activeNestedFilters.clear();
-      return unclaimed;
-    }
-  }
-
-  /**
-   * Returns the nested {@link Filter} for {@code entry}, promoting it from the previous
-   * generation when possible and only creating a new instance as a last resort.
-   */
-  private Filter getOrCreateNestedFilter(DelegateEntry entry) {
-    String key = entry.name + "_" + entry.config.typeUrl();
-    synchronized (filtersLock) {
-      Preconditions.checkState(!closed, "CompositeFilter is closed");
-      Filter filter = activeNestedFilters.get(key);
-      if (filter == null) {
-        // Still configured, so carry the instance - and the state it owns - across the update.
-        filter = retiredNestedFilters.remove(key);
-      }
-      if (filter == null) {
-        filter = entry.provider.newInstance(FilterContext.create(entry.name, metricsRecorder));
-      }
-      activeNestedFilters.put(key, filter);
-      return filter;
-    }
-  }
-
-  @Override
-  public void close() {
-    List<Filter> toClose;
-    synchronized (filtersLock) {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      toClose = new ArrayList<>(activeNestedFilters.size() + retiredNestedFilters.size());
-      toClose.addAll(activeNestedFilters.values());
-      toClose.addAll(retiredNestedFilters.values());
-      activeNestedFilters.clear();
-      retiredNestedFilters.clear();
-      currentGeneration = null;
-    }
-    closeAll(toClose);
+  private Filter getNestedFilter(DelegateEntry entry) {
+    String key = entry.namedConfig.filterStateKey();
+    Filter filter = activeFilterLookup.apply(key);
+    return Preconditions.checkNotNull(filter, "nested filter %s not reconciled", key);
   }
 
   private static CompositeFilterConfig getEffectiveConfig(
@@ -826,26 +779,6 @@ final class CompositeFilter implements Filter {
       }
     }
     return Collections.unmodifiableList(list);
-  }
-
-  private static void closeAll(Iterable<Filter> filters) {
-    Throwable firstException = null;
-    for (Filter f : filters) {
-      try {
-        f.close();
-      } catch (Throwable t) {
-        if (firstException == null) {
-          firstException = t;
-        } else {
-          firstException.addSuppressed(t);
-        }
-      }
-    }
-    if (firstException instanceof RuntimeException) {
-      throw (RuntimeException) firstException;
-    } else if (firstException instanceof Error) {
-      throw (Error) firstException;
-    }
   }
 
   private static final class CompositeClientCall<ReqT, RespT>

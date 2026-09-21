@@ -38,10 +38,23 @@ class StatefulFilter implements Filter {
   private final AtomicBoolean shutdown = new AtomicBoolean();
 
   final int idx;
+
+  /**
+   * The xDS instance name this filter was created for, taken from {@link
+   * Filter.FilterContext#filterName()}. Filters nested inside another filter's config must receive
+   * their <em>own</em> name, not their parent's; this field is what lets tests assert that.
+   */
+  @Nullable final String name;
+
   @Nullable volatile String lastCfg = null;
 
   public StatefulFilter(int idx) {
+    this(idx, null);
+  }
+
+  public StatefulFilter(int idx, @Nullable String name) {
     this.idx = idx;
+    this.name = name;
   }
 
   public boolean isShutdown() {
@@ -71,6 +84,9 @@ class StatefulFilter implements Filter {
   public String toString() {
     StringBuilder sb = new StringBuilder().append("StatefulFilter{")
         .append("idx=").append(idx);
+    if (name != null) {
+      sb.append(", filterName=").append(name);
+    }
     if (lastCfg != null) {
       sb.append(", name=").append(lastCfg);
     }
@@ -109,7 +125,7 @@ class StatefulFilter implements Filter {
 
     @Override
     public synchronized StatefulFilter newInstance(FilterContext context) {
-      StatefulFilter filter = new StatefulFilter(counter++);
+      StatefulFilter filter = new StatefulFilter(counter++, context.filterName());
       instances.put(filter.idx, filter);
       return filter;
     }
@@ -145,10 +161,16 @@ class StatefulFilter implements Filter {
 
     private final String typeUrl;
     private final String config;
+    private final ImmutableList<NamedFilterConfig> nested;
 
     public Config(String config, String typeUrl) {
+      this(config, typeUrl, ImmutableList.of());
+    }
+
+    public Config(String config, String typeUrl, ImmutableList<NamedFilterConfig> nested) {
       this.config = config;
       this.typeUrl = typeUrl;
+      this.nested = checkNotNull(nested, "nested");
     }
 
     public Config(String config) {
@@ -157,6 +179,15 @@ class StatefulFilter implements Filter {
 
     public Config() {
       this("<BLANK>", DEFAULT_TYPE_URL);
+    }
+
+    /**
+     * A config that owns {@code nested} child filters, the way a composite filter's config owns
+     * the filters named by its matcher actions. The framework is expected to instantiate and
+     * retire those children alongside this config's own instance.
+     */
+    public static Config withNested(String config, NamedFilterConfig... nested) {
+      return new Config(config, DEFAULT_TYPE_URL, ImmutableList.copyOf(nested));
     }
 
     public static Config fromProto(Message rawProtoMessage, String typeUrl) {
@@ -171,6 +202,11 @@ class StatefulFilter implements Filter {
     @Override
     public String typeUrl() {
       return typeUrl;
+    }
+
+    @Override
+    public ImmutableList<NamedFilterConfig> nestedFilterConfigs() {
+      return nested;
     }
   }
 }

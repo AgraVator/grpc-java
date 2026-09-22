@@ -43,8 +43,12 @@ import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
+import com.google.protobuf.Any;
 import com.google.protobuf.util.Durations;
 import com.google.re2j.Pattern;
+import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ChannelConfigurator;
@@ -1924,6 +1928,129 @@ public class XdsNameResolverTest {
     verify(mockListener, never()).onResult2(any());
     assertThat(lds1Filter1.isShutdown()).isFalse();
     assertThat(lds1Filter2.isShutdown()).isFalse();
+  }
+
+  @Test
+  public void filterState_siblingCompositesNestingSameNamedChild() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      final CompositeFilter.Provider[] holder = new CompositeFilter.Provider[1];
+      CompositeFilter.Provider compositeProvider = new CompositeFilter.Provider(typeUrl -> {
+        if (StatefulFilter.DEFAULT_TYPE_URL.equals(typeUrl)) {
+          return statefulProvider;
+        }
+        if (CompositeFilter.TYPE_URL_EXTENSION_WITH_MATCHER.equals(typeUrl)) {
+          return holder[0];
+        }
+        return null;
+      });
+      holder[0] = compositeProvider;
+      FilterRegistry filterRegistry = FilterRegistry.newRegistry()
+          .register(statefulProvider, compositeProvider, ROUTER_FILTER_PROVIDER);
+      resolver = new XdsNameResolver(targetUri, null, AUTHORITY, null, serviceConfigParser,
+          syncContext, scheduler, xdsClientPoolFactory, mockRandom, filterRegistry, rawBootstrap,
+          metricRecorder, nameResolverArgs);
+      resolver.start(mockListener);
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+      // Two top-level composites each nest a composite called "dup". The two "dup" configs share
+      // a filter state key but select different grandchildren, so both subtrees have to be walked.
+      Any leaf = Any.newBuilder().setTypeUrl(StatefulFilter.DEFAULT_TYPE_URL).build();
+      Any p1Proto = compositeAnyWrapping(executeOnMatch("dup",
+          compositeAnyWrapping(executeOnMatch("childA", leaf))));
+      Any p2Proto = compositeAnyWrapping(executeOnMatch("dup",
+          compositeAnyWrapping(executeOnMatch("childB", leaf))));
+
+      Filter.FilterConfigParseContext ctx = compositeParseContext();
+      io.grpc.xds.ConfigOrError<CompositeFilter.CompositeFilterConfig> r1 =
+          compositeProvider.parseFilterConfig(p1Proto, ctx);
+      io.grpc.xds.ConfigOrError<CompositeFilter.CompositeFilterConfig> r2 =
+          compositeProvider.parseFilterConfig(p2Proto, ctx);
+      assertThat(r1.errorDetail).isNull();
+      assertThat(r2.errorDetail).isNull();
+
+      // Before the fix the BFS deduped on the filter state key, so "dup"'s second occurrence was
+      // skipped, "childB" was never instantiated, and building p2's interceptor threw NPE.
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
+          new NamedFilterConfig("p1", r1.config),
+          new NamedFilterConfig("p2", r2.config),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+
+      ImmutableList.Builder<String> names = ImmutableList.builder();
+      for (StatefulFilter f : statefulProvider.getAllInstances()) {
+        names.add(f.name);
+      }
+      assertThat(names.build()).containsExactly("childA", "childB");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  @Test
+  public void filterState_overrideForFilterAbsentFromListenerIsIgnored() {
+    StatefulFilter.Provider statefulFilterProvider = filterStateTestSetupResolver();
+    FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+    // RDS is parsed independently of LDS, so typed_per_filter_config may name a filter the
+    // listener never declares. Such an override is never applied to anything, so the nested
+    // filters it selects must not be instantiated either.
+    VirtualHost vhost = filterStateTestVhost(ImmutableMap.of(
+        "filter.not.in.listener", StatefulFilter.Config.withNested("orphan-override",
+            new NamedFilterConfig("orphan.nested", new StatefulFilter.Config("orphan.nested")))));
+
+    xdsClient.deliverLdsUpdateWithFilters(vhost, filterStateTestConfigs(STATEFUL_1));
+    createAndDeliverClusterUpdates(xdsClient, cluster1);
+    assertClusterResolutionResult(call1, cluster1);
+
+    ImmutableList.Builder<String> names = ImmutableList.builder();
+    for (StatefulFilter f : statefulFilterProvider.getAllInstances()) {
+      names.add(f.name);
+    }
+    assertThat(names.build()).containsExactly(STATEFUL_1);
+  }
+
+  /** Wraps {@code childAny} in an ExecuteFilterAction reached through a matcher's on_no_match. */
+  private static com.github.xds.type.matcher.v3.Matcher.OnMatch executeOnMatch(
+      String childName, Any childAny) {
+    return com.github.xds.type.matcher.v3.Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_" + childName)
+            .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                .setTypedConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+                    .setName(childName)
+                    .setTypedConfig(childAny)
+                    .build())
+                .build()))
+            .build())
+        .build();
+  }
+
+  private static Any compositeAnyWrapping(
+      com.github.xds.type.matcher.v3.Matcher.OnMatch onMatch) {
+    return Any.pack(ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("composite")
+            .setTypedConfig(Any.pack(Composite.getDefaultInstance()))
+            .build())
+        .setXdsMatcher(com.github.xds.type.matcher.v3.Matcher.newBuilder()
+            .setOnNoMatch(onMatch)
+            .build())
+        .build());
+  }
+
+  private static Filter.FilterConfigParseContext compositeParseContext() {
+    return Filter.FilterConfigParseContext.builder()
+        .bootstrapInfo(BootstrapInfo.builder()
+            .servers(Collections.singletonList(
+                ServerInfo.create("test_target", Collections.emptyMap())))
+            .node(Node.newBuilder().build())
+            .build())
+        .serverInfo(ServerInfo.create(
+            "test_target", Collections.emptyMap(), false, true, false, false))
+        .build();
   }
 
   private StatefulFilter.Provider filterStateTestSetupResolver() {

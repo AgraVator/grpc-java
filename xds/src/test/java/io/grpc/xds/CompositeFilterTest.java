@@ -94,8 +94,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -1092,6 +1095,190 @@ public class CompositeFilterTest {
       assertThat(statusCaptor.getValue().getDescription()).contains("cancelled before start");
     }
 
+    /**
+     * Blocks inside {@code newCall} so the test can act while {@code start()} is between
+     * "started" and "delegate installed". A real channel's {@code newCall} can block on name
+     * resolution or an LB pick, so this window is not artificial.
+     */
+    private static final class BlockingChannel extends Channel {
+      final CountDownLatch inNewCall = new CountDownLatch(1);
+      final CountDownLatch release = new CountDownLatch(1);
+      private final ClientCall<?, ?> call;
+
+      BlockingChannel(ClientCall<?, ?> call) {
+        this.call = call;
+      }
+
+      @SuppressWarnings("unchecked")
+      @Override
+      public <R, P> ClientCall<R, P> newCall(
+          MethodDescriptor<R, P> methodDescriptor, CallOptions callOptions) {
+        inNewCall.countDown();
+        try {
+          assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        return (ClientCall<R, P>) call;
+      }
+
+      @Override
+      public String authority() {
+        return "test-authority";
+      }
+    }
+
+    @Test
+    public void clientInterceptor_requestDuringStartIsNotDropped() throws Exception {
+      CompositeFilter filter = newFilter("composite");
+      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+      when(mockMatcher.match(any())).thenReturn(
+          io.grpc.xds.internal.matcher.MatchResult.create(Collections.emptyList()));
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
+          mock(ScheduledExecutorService.class));
+
+      ClientCall nextCall = mock(ClientCall.class);
+      BlockingChannel next = new BlockingChannel(nextCall);
+      final ClientCall<Void, Void> call =
+          interceptor.interceptCall(createMockMethod(), CallOptions.DEFAULT, next);
+      final Metadata headers = new Metadata();
+
+      Thread starter = new Thread(() -> call.start(mock(ClientCall.Listener.class), headers));
+      starter.start();
+      assertThat(next.inNewCall.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // ClientCall permits request() from any thread, so this is legal even though start() has
+      // not returned. Before the fix the demand went to the no-op call and the RPC hung.
+      call.request(5);
+
+      next.release.countDown();
+      starter.join(5000);
+
+      verify(nextCall).start(any(), eq(headers));
+      verify(nextCall).request(5);
+    }
+
+    @Test
+    public void clientInterceptor_cancelDuringStartClosesListenerWithoutStartingCall()
+        throws Exception {
+      CompositeFilter filter = newFilter("composite");
+      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+      when(mockMatcher.match(any())).thenReturn(
+          io.grpc.xds.internal.matcher.MatchResult.create(Collections.emptyList()));
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
+          mock(ScheduledExecutorService.class));
+
+      ClientCall nextCall = mock(ClientCall.class);
+      BlockingChannel next = new BlockingChannel(nextCall);
+      final ClientCall<Void, Void> call =
+          interceptor.interceptCall(createMockMethod(), CallOptions.DEFAULT, next);
+      final ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      final AtomicReference<Throwable> startFailure = new AtomicReference<>();
+
+      Thread starter = new Thread(() -> {
+        try {
+          call.start(listener, new Metadata());
+        } catch (Throwable t) {
+          startFailure.set(t);
+        }
+      });
+      starter.start();
+      assertThat(next.inNewCall.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // cancel() is the one method explicitly allowed before start() returns.
+      call.cancel("cancelled mid start", null);
+
+      next.release.countDown();
+      starter.join(5000);
+
+      assertThat(startFailure.get()).isNull();
+      // The downstream call was never started, so no stream and no request headers were created.
+      verify(nextCall, never()).start(any(), any());
+      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
+      assertThat(statusCaptor.getValue().getDescription()).contains("cancelled mid start");
+    }
+
+    @Test
+    public void clientInterceptor_cancelIsNeverDeliveredConcurrentlyWithDownstreamStart()
+        throws Exception {
+      CompositeFilter filter = newFilter("composite");
+      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+      when(mockMatcher.match(any())).thenReturn(
+          io.grpc.xds.internal.matcher.MatchResult.create(Collections.emptyList()));
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
+          mock(ScheduledExecutorService.class));
+
+      final CountDownLatch inDownstreamStart = new CountDownLatch(1);
+      final CountDownLatch releaseDownstreamStart = new CountDownLatch(1);
+      final AtomicBoolean startInProgress = new AtomicBoolean();
+      final AtomicBoolean cancelRacedStart = new AtomicBoolean();
+      final AtomicBoolean cancelDelivered = new AtomicBoolean();
+      final ClientCall<Void, Void> downstream = new ClientCall<Void, Void>() {
+        @Override
+        public void start(ClientCall.Listener<Void> responseListener, Metadata headers) {
+          startInProgress.set(true);
+          inDownstreamStart.countDown();
+          try {
+            releaseDownstreamStart.await(5, TimeUnit.SECONDS);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          }
+          startInProgress.set(false);
+        }
+
+        @Override
+        public void cancel(String message, Throwable cause) {
+          cancelDelivered.set(true);
+          if (startInProgress.get()) {
+            cancelRacedStart.set(true);
+          }
+        }
+
+        @Override
+        public void request(int numMessages) {}
+
+        @Override
+        public void halfClose() {}
+
+        @Override
+        public void sendMessage(Void message) {}
+      };
+      Channel next = new Channel() {
+        @SuppressWarnings("unchecked")
+        @Override
+        public <R, P> ClientCall<R, P> newCall(
+            MethodDescriptor<R, P> methodDescriptor, CallOptions callOptions) {
+          return (ClientCall<R, P>) downstream;
+        }
+
+        @Override
+        public String authority() {
+          return "test-authority";
+        }
+      };
+
+      final ClientCall<Void, Void> call =
+          interceptor.interceptCall(createMockMethod(), CallOptions.DEFAULT, next);
+      Thread starter = new Thread(
+          () -> call.start(mock(ClientCall.Listener.class), new Metadata()));
+      starter.start();
+      assertThat(inDownstreamStart.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // The downstream call is mid-start. ClientCall is not thread-safe, so cancel() must not be
+      // handed to it now; the fix keeps delegate unpublished until start() has returned.
+      call.cancel("cancelled mid start", null);
+      releaseDownstreamStart.countDown();
+      starter.join(5000);
+
+      assertThat(cancelRacedStart.get()).isFalse();
+      assertThat(cancelDelivered.get()).isTrue();
+    }
+
     @Test
     public void clientInterceptor_usesOverrideMatcher_overrideMatches() {
       Matcher.OnMatch baseAction = createExecuteAction("child", FAKE_TYPE_URL);
@@ -1843,7 +2030,8 @@ public class CompositeFilterTest {
       io.grpc.xds.internal.matcher.MatchContext clientContext = clientContextCaptor.getValue();
       assertThat(clientContext.getPath()).isEqualTo("/service/method");
       assertThat(clientContext.getHost()).isEqualTo("my-channel-authority:443");
-      assertThat(clientContext.getMethod()).isEqualTo("service/method");
+      // ":method" is the HTTP method, not the gRPC method name; gRPC always uses POST.
+      assertThat(clientContext.getMethod()).isEqualTo("POST");
 
       // Server side verification
       ServerInterceptor serverInterceptor = filter.buildServerInterceptor(config, null);
@@ -1862,7 +2050,8 @@ public class CompositeFilterTest {
       io.grpc.xds.internal.matcher.MatchContext serverContext = serverContextCaptor.getValue();
       assertThat(serverContext.getPath()).isEqualTo("/service/method");
       assertThat(serverContext.getHost()).isEqualTo("my-server-authority:50051");
-      assertThat(serverContext.getMethod()).isEqualTo("service/method");
+      // ":method" is the HTTP method, not the gRPC method name; gRPC always uses POST.
+      assertThat(serverContext.getMethod()).isEqualTo("POST");
     }
 
     @Test

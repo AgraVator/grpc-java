@@ -195,7 +195,9 @@ final class CompositeFilter implements Filter {
         Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
         // Nested filter instances are keyed by name, so a name has to mean the same thing
         // everywhere in this tree. Scoped to the tree rather than to an action because actions in
-        // sibling branches resolve against one shared instance map.
+        // sibling branches resolve against one shared instance map. Per A83 filter state is scoped
+        // to the HCM instance and keyed by filter name, so the keyspace is deliberately flat: two
+        // nested filters of the same name and type are one instance, at any depth.
         Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName =
             new HashMap<>();
         collectDelegates(matcherProto, delegates, nestedByName, context);
@@ -651,9 +653,11 @@ final class CompositeFilter implements Filter {
       public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
           ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
 
+        // ":method" is the HTTP method, which is always POST for gRPC. The gRPC full method name
+        // is carried by ":path" alone.
         MatchContext context = MatchContext.newBuilder()
             .setMetadata(headers)
-            .setMethod(call.getMethodDescriptor().getFullMethodName())
+            .setMethod("POST")
             .setPath("/" + call.getMethodDescriptor().getFullMethodName())
             .setHost(call.getAuthority())
             .build();
@@ -792,6 +796,7 @@ final class CompositeFilter implements Filter {
     private ClientCall<ReqT, RespT> delegate;
     private boolean started;
     private Status cancelStatus;
+    private int pendingRequests;
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
         Channel next, UnifiedMatcher matcher,
@@ -835,6 +840,24 @@ final class CompositeFilter implements Filter {
     }
 
     @Override
+    public void request(int numMessages) {
+      ClientCall<ReqT, RespT> callToRequest;
+      synchronized (lock) {
+        Preconditions.checkState(started, "Not started");
+        if (delegate == null) {
+          // start() is still resolving the matcher tree and building the real call. request() is
+          // the one ClientCall method that may be called from another thread, so the demand has
+          // to be remembered and replayed once the real call has been started; dropping it on the
+          // no-op call would stall the RPC forever.
+          pendingRequests += numMessages;
+          return;
+        }
+        callToRequest = delegate;
+      }
+      callToRequest.request(numMessages);
+    }
+
+    @Override
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
       ClientCall<ReqT, RespT> callToCancel = null;
       synchronized (lock) {
@@ -852,22 +875,25 @@ final class CompositeFilter implements Filter {
 
     @Override
     public void start(Listener<RespT> responseListener, Metadata headers) {
+      Status cancelledBeforeStart;
       synchronized (lock) {
         Preconditions.checkState(!started, "Already started");
         started = true;
-
-        if (cancelStatus != null) {
+        cancelledBeforeStart = cancelStatus;
+        if (cancelledBeforeStart != null) {
           delegate = noopCall();
-          responseListener.onClose(cancelStatus, new Metadata());
-          return;
         }
+      }
+      if (cancelledBeforeStart != null) {
+        responseListener.onClose(cancelledBeforeStart, new Metadata());
+        return;
       }
 
       String host = callOptions.getAuthority() != null
           ? callOptions.getAuthority() : next.authority();
       MatchContext context = MatchContext.newBuilder()
           .setMetadata(headers)
-          .setMethod(method.getFullMethodName())
+          .setMethod("POST")
           .setPath("/" + method.getFullMethodName())
           .setHost(host)
           .build();
@@ -910,15 +936,43 @@ final class CompositeFilter implements Filter {
           ? next.newCall(method, callOptions)
           : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
 
+      Status cancelledMidStart;
       synchronized (lock) {
-        if (cancelStatus != null) {
+        cancelledMidStart = cancelStatus;
+        if (cancelledMidStart != null) {
           delegate = noopCall();
-          responseListener.onClose(cancelStatus, new Metadata());
-          return;
         }
-        delegate = realCall;
       }
+      if (cancelledMidStart != null) {
+        // Deliberately do not start realCall. ClientCallImpl.startInternal rejects a call that was
+        // already cancelled, and starting it only to cancel it would open a stream and send
+        // request headers for an RPC nobody is waiting for. An unstarted call holds no transport
+        // resources, so dropping it leaks nothing; we only have to close the listener ourselves.
+        responseListener.onClose(cancelledMidStart, new Metadata());
+        return;
+      }
+
+      // Start before publishing. While delegate is still null a concurrent cancel() only records
+      // cancelStatus, so it cannot reach a call that has not been started yet, and a concurrent
+      // request() buffers its demand instead of dropping it.
       realCall.start(responseListener, headers);
+
+      int bufferedRequests;
+      Status cancelledDuringStart;
+      synchronized (lock) {
+        delegate = realCall;
+        bufferedRequests = pendingRequests;
+        pendingRequests = 0;
+        cancelledDuringStart = cancelStatus;
+      }
+      if (bufferedRequests > 0) {
+        realCall.request(bufferedRequests);
+      }
+      if (cancelledDuringStart != null) {
+        // A cancel raced with start() and found delegate still null, so it never reached realCall.
+        // Any cancel arriving after this block sees the published delegate and cancels it itself.
+        realCall.cancel(cancelledDuringStart.getDescription(), cancelledDuringStart.getCause());
+      }
     }
 
     private void failCall(Listener<RespT> responseListener, Status status) {

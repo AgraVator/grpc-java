@@ -2072,6 +2072,92 @@ public class XdsServerWrapperTest {
     assertThat(lds1ChainDefaultFilter2.isShutdown()).isFalse();
   }
 
+  /**
+   * An RDS resource that disappears takes its per-route overrides with it, so nested filters that
+   * only those overrides named become unreachable and have to be shut down. Top-level http_filters
+   * instances survive: the listener still declares them.
+   */
+  @Test
+  public void filterState_shutdown_rdsNotFoundShutsDownOverrideOnlyNestedFilters()
+      throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+
+    String rdsName = "rds.example.com";
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0",
+        createHcmForRds(rdsName, filterStateTestConfigs(STATEFUL_1))), null);
+
+    // The RDS resource carries an override whose nested filter nothing else mentions.
+    VirtualHost vhost = filterStateTestVhost("stateful-vhost", ImmutableMap.of(
+        STATEFUL_1, StatefulFilter.Config.withNested("override",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))));
+    xdsClient.deliverRdsUpdate(rdsName, ImmutableList.of(vhost));
+    verifyServerStarted(serverStart);
+
+    ImmutableList<StatefulFilter> all = statefulFilterProvider.getAllInstances();
+    assertThat(all).hasSize(2);
+    StatefulFilter topLevel = all.get(0);
+    StatefulFilter overrideNested = all.get(1);
+    assertThat(topLevel.name).isEqualTo(STATEFUL_1);
+    assertThat(overrideNested.name).isEqualTo(NESTED_1);
+
+    xdsClient.deliverRdsResourceNotFound(rdsName);
+
+    assertWithMessage("top-level filter must survive RDS not-found")
+        .that(topLevel.isShutdown()).isFalse();
+    assertWithMessage("override-only nested filter must be shut down")
+        .that(overrideNested.isShutdown()).isTrue();
+  }
+
+  /** An ambient (transient) RDS error is not a config change, so nothing may be shut down. */
+  @Test
+  public void filterState_noShutdown_onRdsAmbientError() throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+
+    String rdsName = "rds.example.com";
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0",
+        createHcmForRds(rdsName, filterStateTestConfigs(STATEFUL_1))), null);
+    VirtualHost vhost = filterStateTestVhost("stateful-vhost", ImmutableMap.of(
+        STATEFUL_1, StatefulFilter.Config.withNested("override",
+            new NamedFilterConfig(NESTED_1, new StatefulFilter.Config(NESTED_1)))));
+    xdsClient.deliverRdsUpdate(rdsName, ImmutableList.of(vhost));
+    verifyServerStarted(serverStart);
+    ImmutableList<StatefulFilter> all = statefulFilterProvider.getAllInstances();
+    assertThat(all).hasSize(2);
+
+    xdsClient.rdsWatchers.get(rdsName).onAmbientError(
+        Status.UNAVAILABLE.withDescription("transient ADS error"));
+
+    assertThat(all.get(0).isShutdown()).isFalse();
+    assertThat(all.get(1).isShutdown()).isFalse();
+  }
+
+  @Test
+  public void filterState_overrideForFilterAbsentFromListenerIsIgnored() throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+
+    // Routes are parsed without knowledge of the HCM, so typed_per_filter_config may name a
+    // filter the listener never declares. Such an override is inert, so the nested filters it
+    // selects must not be instantiated either.
+    VirtualHost vhost = filterStateTestVhost("stateful-vhost", ImmutableMap.of(
+        "filter.not.in.listener", StatefulFilter.Config.withNested("orphan-override",
+            new NamedFilterConfig("orphan.nested", new StatefulFilter.Config("orphan.nested")))));
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_0",
+        createHcm(vhost, filterStateTestConfigs(STATEFUL_1))), null);
+    verifyServerStarted(serverStart);
+
+    ImmutableList.Builder<String> names = ImmutableList.builder();
+    for (StatefulFilter f : statefulFilterProvider.getAllInstances()) {
+      names.add(f.name);
+    }
+    assertThat(names.build()).containsExactly(STATEFUL_1);
+  }
+
   private FilterRegistry filterStateTestFilterRegistry(
       StatefulFilter.Provider statefulFilterProvider) {
     return FilterRegistry.newRegistry().register(statefulFilterProvider, ROUTER_FILTER_PROVIDER);

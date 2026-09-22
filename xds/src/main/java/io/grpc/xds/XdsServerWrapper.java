@@ -802,28 +802,36 @@ final class XdsServerWrapper extends Server {
       // overrides only contribute their nested configs: the override itself is applied to the
       // instance named by the top-level config, it is not an instance of its own.
       Queue<NamedFilterConfig> queue = new ArrayDeque<>(filterConfigs);
+      Set<String> declaredFilterNames = new HashSet<>();
+      for (NamedFilterConfig filterConfig : filterConfigs) {
+        declaredFilterNames.add(filterConfig.name);
+      }
       if (virtualHosts != null) {
         for (VirtualHost virtualHost : virtualHosts) {
-          collectNestedOverrides(virtualHost.filterConfigOverrides(), queue);
+          collectNestedOverrides(virtualHost.filterConfigOverrides(), declaredFilterNames, queue);
           for (Route route : virtualHost.routes()) {
-            collectNestedOverrides(route.filterConfigOverrides(), queue);
+            collectNestedOverrides(route.filterConfigOverrides(), declaredFilterNames, queue);
             if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
               for (VirtualHost.Route.RouteAction.ClusterWeight cw
                   : route.routeAction().weightedClusters()) {
-                collectNestedOverrides(cw.filterConfigOverrides(), queue);
+                collectNestedOverrides(cw.filterConfigOverrides(), declaredFilterNames, queue);
               }
             }
           }
         }
       }
-      // The same nested config can be reached from many routes; visit each key once so the walk
-      // stays linear in the size of the config tree.
-      Set<String> visited = new HashSet<>();
+      // The same nested config can be reached from many routes; visit each one once so the walk
+      // stays linear in the size of the config tree. The visited set is keyed on the whole
+      // NamedFilterConfig rather than on filterStateKey() because two distinct configs can share a
+      // key: sibling composite filters may each nest a child with the same name and type, and those
+      // children can in turn select different grandchildren. Keying on the state key alone would
+      // stop the walk at the first sibling and leave the other subtree unreconciled.
+      Set<NamedFilterConfig> visited = new HashSet<>();
       while (!queue.isEmpty()) {
         NamedFilterConfig namedFilter = queue.poll();
         String typeUrl = namedFilter.filterConfig.typeUrl();
         String filterKey = namedFilter.filterStateKey();
-        if (!visited.add(filterKey)) {
+        if (!visited.add(namedFilter)) {
           continue;
         }
 
@@ -851,11 +859,20 @@ final class XdsServerWrapper extends Server {
      * themselves: an override reconfigures the instance named by the top-level config rather than
      * introducing an instance of its own, while the nested filters it selects are instances that
      * have to exist before the override can be applied.
+     *
+     * <p>Overrides are keyed by filter name and are parsed without knowledge of the HCM, so an
+     * override can name a filter that {@code http_filters} never declared. Such an override is
+     * never applied to anything, so its nested configs must not be instantiated either.
      */
     private void collectNestedOverrides(
-        Map<String, FilterConfig> overrides, Queue<NamedFilterConfig> queue) {
-      for (FilterConfig override : overrides.values()) {
-        queue.addAll(override.nestedFilterConfigs());
+        Map<String, FilterConfig> overrides,
+        Set<String> declaredFilterNames,
+        Queue<NamedFilterConfig> queue) {
+      for (Map.Entry<String, FilterConfig> override : overrides.entrySet()) {
+        if (!declaredFilterNames.contains(override.getKey())) {
+          continue;
+        }
+        queue.addAll(override.getValue().nestedFilterConfigs());
       }
     }
 
@@ -1083,18 +1100,23 @@ final class XdsServerWrapper extends Server {
             continue;
           }
 
+          // The default chain's filters live in their own map, not under a chain name in
+          // activeFilters, so resolve it separately - otherwise a default chain served by RDS
+          // would look like a chain with no filters at all.
+          Map<String, Filter> chainFilters = filterChain.equals(defaultFilterChain)
+              ? activeFiltersDefaultChain
+              : activeFilters.get(filterChain.name());
+          checkNotNull(chainFilters, "chainFilters of chain %s", filterChain.name());
+          // Reconcile on both branches. When the RDS resource is absent the chain keeps serving,
+          // it just fails every RPC, so the HCM's own http_filters must stay up; but a nested
+          // filter that only existed because a route override selected it is now unreachable and
+          // has to be shut down rather than leak until the chain itself goes away.
+          updateActiveFiltersForChain(chainFilters, hcm.httpFilterConfigs(), savedVirtualHosts);
+
           ServerRoutingConfig updatedRoutingConfig;
           if (savedVirtualHosts == null) {
             updatedRoutingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
           } else {
-            // The default chain's filters live in their own map, not under a chain name in
-            // activeFilters, so resolve it separately - otherwise a default chain served by RDS
-            // would look like a chain with no filters at all.
-            Map<String, Filter> chainFilters = filterChain.equals(defaultFilterChain)
-                ? activeFiltersDefaultChain
-                : activeFilters.get(filterChain.name());
-            checkNotNull(chainFilters, "chainFilters of chain %s", filterChain.name());
-            updateActiveFiltersForChain(chainFilters, hcm.httpFilterConfigs(), savedVirtualHosts);
             ImmutableMap<Route, ServerInterceptor> interceptors = generatePerRouteInterceptors(
                 hcm.httpFilterConfigs(), savedVirtualHosts, chainFilters);
             updatedRoutingConfig = ServerRoutingConfig.create(savedVirtualHosts, interceptors);

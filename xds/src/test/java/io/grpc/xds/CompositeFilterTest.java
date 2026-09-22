@@ -86,6 +86,7 @@ import io.grpc.testing.protobuf.SimpleServiceGrpc;
 import io.grpc.xds.Filter.FilterConfig;
 import io.grpc.xds.Filter.FilterConfigParseContext;
 import io.grpc.xds.Filter.FilterContext;
+import io.grpc.xds.Filter.NamedFilterConfig;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
@@ -97,6 +98,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -124,6 +126,9 @@ public class CompositeFilterTest {
         "type.googleapis.com/envoy.extensions.filters.http.composite.v3.ExecuteFilterAction";
 
     private CompositeFilter.Provider provider;
+    private Function<String, Filter.Provider> registryLookup;
+    private final MetricRecorder metricRecorder = mock(MetricRecorder.class);
+    private final Map<String, Filter> nestedFilters = new HashMap<>();
 
     @Mock
     private Filter.Provider fakeProvider;
@@ -171,7 +176,7 @@ public class CompositeFilterTest {
       when(fakeFailingProvider.parseFilterConfig(any(com.google.protobuf.Message.class), any()))
           .thenReturn(ConfigOrError.fromError("Child filter config parsing failed intentionally"));
 
-      provider = new CompositeFilter.Provider(typeUrl -> {
+      registryLookup = typeUrl -> {
         if (FAKE_TYPE_URL.equals(typeUrl)) {
           return fakeProvider;
         }
@@ -182,7 +187,8 @@ public class CompositeFilterTest {
           return fakeFailingProvider;
         }
         return FilterRegistry.getDefaultRegistry().get(typeUrl);
-      });
+      };
+      provider = new CompositeFilter.Provider(registryLookup);
     }
 
     @After
@@ -202,9 +208,24 @@ public class CompositeFilterTest {
           .build();
     }
 
+    /**
+     * Stands in for the resolver's filter registry: one instance per nested name and type,
+     * created on first use and handed to the composite through {@link FilterContext}.
+     */
+    private Filter acquireNestedFilter(NamedFilterConfig config) {
+      String key = config.filterStateKey();
+      Filter filter = nestedFilters.get(key);
+      if (filter == null) {
+        filter = registryLookup.apply(config.filterConfig.typeUrl()).newInstance(
+            FilterContext.create(config.name, metricRecorder, this::acquireNestedFilter));
+        nestedFilters.put(key, filter);
+      }
+      return filter;
+    }
+
     private CompositeFilter newFilter(String name) {
       return (CompositeFilter) provider.newInstance(
-          FilterContext.create(name, mock(MetricRecorder.class)));
+          FilterContext.create(name, metricRecorder, this::acquireNestedFilter));
     }
 
     private static ExtensionWithMatcher createExtensionWithMatcher(Matcher matcher) {
@@ -1517,21 +1538,6 @@ public class CompositeFilterTest {
       return result.config;
     }
 
-    /** Parses a composite config with one action per named nested filter. */
-    private CompositeFilter.CompositeFilterConfig configWithChildren(String... childNames) {
-      Matcher.MatcherList.Builder matcherList = Matcher.MatcherList.newBuilder();
-      for (String childName : childNames) {
-        matcherList.addMatchers(createHeaderFieldMatcher("foo", childName,
-            createExecuteAction(childName, FAKE_TYPE_URL)));
-      }
-      Matcher matcher = Matcher.newBuilder().setMatcherList(matcherList.build()).build();
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
-          provider.parseFilterConfig(
-              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-      assertThat(result.errorDetail).isNull();
-      return result.config;
-    }
-
     @Test
     public void nestedFilter_resolvedOncePerKeyAcrossRoutes() {
       CompositeFilter filter = newFilter("composite");
@@ -1920,18 +1926,17 @@ public class CompositeFilterTest {
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(Any.pack(proto), getFilterContext());
 
-      MetricRecorder expectedRecorder = mock(MetricRecorder.class);
-      CompositeFilter filter = (CompositeFilter) provider.newInstance(
-          FilterContext.create("composite", expectedRecorder));
+      CompositeFilter filter = newFilter("composite");
       ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
           mock(ScheduledExecutorService.class));
 
-      // The child is instantiated while the interceptor is being built, not per RPC.
+      // The child is instantiated while the interceptor is being built, not per RPC, and by the
+      // registry the composite was given, so it gets the registry's context.
       ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
       verify(fakeProvider).newInstance(contextCaptor.capture());
-      // The child is told its own name, not the composite's, and shares the composite's recorder.
+      // The child is told its own name, not the composite's.
       assertThat(contextCaptor.getValue().filterName()).isEqualTo("my_child_filter");
-      assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(expectedRecorder);
+      assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(metricRecorder);
 
       Channel next = mock(Channel.class);
       when(fakeClientInterceptor.interceptCall(any(), any(), any()))
@@ -3204,8 +3209,13 @@ public class CompositeFilterTest {
       assertThat(res.errorDetail).contains("Nested filter is missing a name");
     }
 
+    /**
+     * A repeated nested name is not an error: nested instances are keyed HCM-wide by name and
+     * type, so a repeat simply selects the same instance, which is how A83 shares state between
+     * match arms. C-core accepts this too.
+     */
     @Test
-    public void parseFilterConfig_duplicateNameWithinFilterChain_rejected() {
+    public void parseFilterConfig_duplicateNameWithinFilterChain_accepted() {
       TypedExtensionConfig child = TypedExtensionConfig.newBuilder()
           .setName("dup_child")
           .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_TYPE_URL))
@@ -3226,13 +3236,17 @@ public class CompositeFilterTest {
       ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-      assertThat(res.config).isNull();
-      assertThat(res.errorDetail)
-          .contains("ExecuteFilterAction.filter_chain contains duplicate filter name: dup_child");
+      assertThat(res.errorDetail).isNull();
+      assertThat(Iterables.getOnlyElement(res.config.delegates.values()).delegates).hasSize(2);
     }
 
+    /**
+     * Sibling actions nesting the same name with different configs share one instance, and each
+     * action builds it with its own config. A check here could not see a same-named top-level
+     * filter, a sibling composite or an RDS override anyway, and C-core accepts this.
+     */
     @Test
-    public void parseFilterConfig_conflictingConfigAcrossActions_rejected() {
+    public void parseFilterConfig_sameNameDifferentConfigAcrossActions_accepted() {
       Matcher.OnMatch action1 = Matcher.OnMatch.newBuilder()
           .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
               .setName("action_1")
@@ -3264,9 +3278,13 @@ public class CompositeFilterTest {
       ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-      assertThat(res.config).isNull();
-      assertThat(res.errorDetail)
-          .contains("Nested filter name shared_name is used by two different filter configs");
+      assertThat(res.errorDetail).isNull();
+      assertThat(res.config.delegates).hasSize(2);
+
+      CompositeFilter filter = newFilter("composite");
+      filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
+      verify(fakeProvider, times(1)).newInstance(any(FilterContext.class));
+      verify(fakeFilter, times(2)).buildClientInterceptor(any(), any(), any());
     }
 
     @Test
@@ -3306,70 +3324,6 @@ public class CompositeFilterTest {
       filter.buildClientInterceptor(res.config, null, mock(ScheduledExecutorService.class));
       // Only one underlying Filter instance should be created for the shared name.
       verify(fakeProvider, times(1)).newInstance(any(FilterContext.class));
-    }
-
-    /** Makes each child instance distinct, so which one was closed can be told apart. */
-    private Map<String, Filter> recordChildInstances() {
-      Map<String, Filter> children = new HashMap<>();
-      when(fakeProvider.newInstance(any(FilterContext.class))).thenAnswer(invocation -> {
-        FilterContext context = invocation.getArgument(0);
-        Filter child = mock(Filter.class);
-        children.put(context.filterName(), child);
-        return child;
-      });
-      return children;
-    }
-
-    @Test
-    public void onConfigUpdateComplete_releasesChildrenTheNewConfigNoLongerReaches() {
-      Map<String, Filter> children = recordChildInstances();
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-
-      filter.buildClientInterceptor(configWithChildren("c1", "c2"), null, scheduler);
-      filter.onConfigUpdateComplete();
-      Filter c1 = children.get("c1");
-      Filter c2 = children.get("c2");
-      verify(c1, never()).close();
-      verify(c2, never()).close();
-
-      // A second update that no longer names c2. c1 must be reused rather than rebuilt - the
-      // state it owns is exactly what an update must not throw away - and c2 must be released
-      // rather than held until the composite itself goes away.
-      filter.buildClientInterceptor(configWithChildren("c1"), null, scheduler);
-      filter.onConfigUpdateComplete();
-      assertThat(children.get("c1")).isSameInstanceAs(c1);
-      verify(c1, never()).close();
-      verify(c2).close();
-    }
-
-    @Test
-    public void onConfigUpdateComplete_keepsChildrenReachedByAnyRoute() {
-      Map<String, Filter> children = recordChildInstances();
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-
-      // Two routes of one update, each selecting a different child. The sweep runs once, after
-      // both, so neither child may be mistaken for unreachable.
-      filter.buildClientInterceptor(configWithChildren("c1"), null, scheduler);
-      filter.buildClientInterceptor(configWithChildren("c2"), null, scheduler);
-      filter.onConfigUpdateComplete();
-
-      verify(children.get("c1"), never()).close();
-      verify(children.get("c2"), never()).close();
-    }
-
-    @Test
-    public void close_closesOwnedChildren() {
-      Map<String, Filter> children = recordChildInstances();
-      CompositeFilter filter = newFilter("composite");
-
-      filter.buildClientInterceptor(
-          configWithChildren("c1", "c2"), null, mock(ScheduledExecutorService.class));
-      filter.close();
-
-      verify(children.get("c1")).close();
-      verify(children.get("c2")).close();
     }
   }
 

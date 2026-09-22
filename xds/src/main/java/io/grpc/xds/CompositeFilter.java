@@ -39,7 +39,6 @@ import io.grpc.ForwardingClientCall;
 import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
-import io.grpc.MetricRecorder;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
@@ -51,17 +50,25 @@ import io.grpc.xds.internal.matcher.UnifiedMatcher;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
+/**
+ * The composite filter of gRFC A103: a matcher tree that selects which nested filters to run for
+ * each RPC.
+ *
+ * <p>The composite holds no instance state of its own. Nested filter instances are owned by the
+ * resolver's or server's filter registry - the same flat map that owns the top-level filters - and
+ * are shared HCM-wide by {@code name_type}: a nested filter and a top-level filter with the same
+ * name and type, or the same name nested under two composites, are one instance. The composite
+ * obtains them through {@link FilterContext#filterAcquirer()} while building interceptors.
+ */
 final class CompositeFilter implements Filter {
 
   static final String TYPE_URL_EXTENSION_WITH_MATCHER =
@@ -70,19 +77,11 @@ final class CompositeFilter implements Filter {
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
   private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
 
-  private final MetricRecorder metricRecorder;
-  /**
-   * The nested filter instances this composite owns, keyed by the child's
-   * {@link NamedFilterConfig#filterStateKey()}. Scoped to this composite rather than shared with
-   * the rest of the listener, so two sibling composites that nest a child of the same name and
-   * type get an instance each.
-   */
-  private final Map<String, Filter> childFilters = new HashMap<>();
-  /** Keys of {@link #childFilters} reached while building interceptors for the current update. */
-  private final Set<String> childFiltersInUse = new HashSet<>();
+  @Nullable
+  private final Function<NamedFilterConfig, Filter> filterAcquirer;
 
-  CompositeFilter(MetricRecorder metricRecorder) {
-    this.metricRecorder = Preconditions.checkNotNull(metricRecorder, "metricRecorder");
+  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterAcquirer) {
+    this.filterAcquirer = filterAcquirer;
   }
 
   static final class Provider implements Filter.Provider {
@@ -118,7 +117,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context.metricsRecorder());
+      return new CompositeFilter(context.filterAcquirer());
     }
 
     @Override
@@ -195,23 +194,7 @@ final class CompositeFilter implements Filter {
       }
       try {
         Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
-        // Nested filter instances are keyed by name, so a name has to mean the same thing
-        // everywhere in this tree. Scoped to the tree rather than to an action because actions in
-        // sibling branches resolve against one shared instance map: the map this composite owns.
-        // Two nested filters of the same name and type are one instance, at any depth.
-        //
-        // A103 does not say how a nested filter's name relates to the HCM-wide namespace A39
-        // defines for http_filters, and the two implementations answer that differently. C-core
-        // keys nested state per filter in a listener-wide blackboard - gcp_authn uses the instance
-        // name, ext_proc uses its target, most filters keep no state - and so validates nested
-        // names not at all. Java scopes them to the composite that declares them, which is why a
-        // name is required here and must not carry two configs within one tree. Two composites
-        // each nesting the same name get an instance each, where C-core would share one; neither
-        // A83 nor A103 requires the sharing, and scoping keeps one composite's children from
-        // colliding with another's.
-        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName =
-            new HashMap<>();
-        collectDelegates(matcherProto, delegates, nestedByName, context);
+        collectDelegates(matcherProto, delegates, context);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
         return ConfigOrError.fromConfig(
@@ -268,37 +251,35 @@ final class CompositeFilter implements Filter {
     }
 
     private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
-        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
         FilterConfigParseContext context) {
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
           if (fm.hasOnMatch()) {
-            collectOnMatch(fm.getOnMatch(), map, nestedByName, context);
+            collectOnMatch(fm.getOnMatch(), map, context);
           }
         }
       } else if (matcher.hasMatcherTree()) {
         Matcher.MatcherTree tree = matcher.getMatcherTree();
         if (tree.hasExactMatchMap()) {
           for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, nestedByName, context);
+            collectOnMatch(om, map, context);
           }
         } else if (tree.hasPrefixMatchMap()) {
           for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, nestedByName, context);
+            collectOnMatch(om, map, context);
           }
         }
       }
       if (matcher.hasOnNoMatch()) {
-        collectOnMatch(matcher.getOnNoMatch(), map, nestedByName, context);
+        collectOnMatch(matcher.getOnNoMatch(), map, context);
       }
     }
 
     private void collectOnMatch(Matcher.OnMatch onMatch,
         Map<TypedExtensionConfig, FilterDelegate> map,
-        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
         FilterConfigParseContext context) {
       if (onMatch.hasMatcher()) {
-        collectDelegates(onMatch.getMatcher(), map, nestedByName, context);
+        collectDelegates(onMatch.getMatcher(), map, context);
       } else if (onMatch.hasAction()) {
         TypedExtensionConfig action = onMatch.getAction();
         // Keyed by the action message rather than by action.name: `name` is an opaque identifier
@@ -307,7 +288,7 @@ final class CompositeFilter implements Filter {
         // collapse to a single entry, which is intended - the same action reached from several
         // matcher branches is one delegate, parsed once.
         if (!map.containsKey(action)) {
-          FilterDelegate delegate = createFilterDelegate(action, nestedByName, context);
+          FilterDelegate delegate = createFilterDelegate(action, context);
           if (delegate != null) {
             map.put(action, delegate);
           }
@@ -325,7 +306,6 @@ final class CompositeFilter implements Filter {
     }
 
     private FilterDelegate createFilterDelegate(TypedExtensionConfig config,
-        Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName,
         FilterConfigParseContext context) {
       try {
         Any actionAny = config.getTypedConfig();
@@ -371,35 +351,24 @@ final class CompositeFilter implements Filter {
               "ExecuteFilterAction must specify either typed_config or filter_chain");
         }
         List<DelegateEntry> delegates = new ArrayList<>();
-        // A filter_chain is the nested analogue of the HCM's http_filters list, so it gets the
-        // same rule A39 imposes there: one namespace, no repeats.
-        Set<String> chainNames = new HashSet<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
             : childConfigs) {
           String name = childFilterConfig.getName();
           // TypedExtensionConfig.name carries `(validate.rules).string = {min_len: 1}`, and the
           // name is what nested filter instances are keyed by, so an absent one is not merely
           // invalid but unusable - every anonymous filter of a given type would alias onto one
-          // instance.
+          // instance. (C-core does not check this; it is a deliberate, stricter check.)
+          //
+          // Nothing else about the name is validated. Nested instances live in the same HCM-wide
+          // map as top-level ones, keyed by name and type, so a repeated name *means* a shared
+          // instance - the A83 mechanism for sharing state such as a gcp_authn cache across
+          // several match arms. A collision check here could only ever see one composite's
+          // config, never a same-named top-level filter, a sibling composite or an RDS override
+          // parsed as a separate resource, and C-core accepts all of these.
           if (name.isEmpty()) {
             throw new IllegalArgumentException("Nested filter is missing a name: "
                 + childFilterConfig.getTypedConfig().getTypeUrl());
           }
-          if (!chainNames.add(name)) {
-            throw new IllegalArgumentException(
-                "ExecuteFilterAction.filter_chain contains duplicate filter name: " + name);
-          }
-          // The same name may legitimately appear under sibling actions: they share one instance,
-          // which is the intended way to reuse a nested filter's state across matcher branches.
-          // What is not legitimate is sharing an instance while disagreeing about how to configure
-          // it, since both configs would be applied and the winner decided by map iteration order.
-          io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig previous =
-              nestedByName.get(name);
-          if (previous != null && !previous.equals(childFilterConfig)) {
-            throw new IllegalArgumentException("Nested filter name " + name
-                + " is used by two different filter configs");
-          }
-          nestedByName.put(name, childFilterConfig);
           String typeUrl = childFilterConfig.getTypedConfig().getTypeUrl();
           Message rawConfig = childFilterConfig.getTypedConfig();
           try {
@@ -733,7 +702,7 @@ final class CompositeFilter implements Filter {
             Status.UNAVAILABLE.withDescription(
                 "Filter " + entry.name + " is not supported on server side"));
       }
-      ServerInterceptor interceptor = getNestedFilter(entry)
+      ServerInterceptor interceptor = nestedFilter(entry)
           .buildServerInterceptor(entry.config, /* overrideConfig= */ null);
       if (interceptor != null) {
         interceptors.add(interceptor);
@@ -751,7 +720,7 @@ final class CompositeFilter implements Filter {
             Status.UNAVAILABLE.withDescription(
                 "Filter " + entry.name + " is not supported on client side"));
       }
-      ClientInterceptor interceptor = getNestedFilter(entry)
+      ClientInterceptor interceptor = nestedFilter(entry)
           .buildClientInterceptor(entry.config, /* overrideConfig= */ null, scheduler);
       if (interceptor != null) {
         interceptors.add(interceptor);
@@ -761,37 +730,13 @@ final class CompositeFilter implements Filter {
   }
 
   /**
-   * The nested filter instance for {@code entry}, created on first use and reused afterwards.
-   *
-   * <p>Instances outlive a single configuration update on purpose: a nested filter may hold a
-   * cache or a side channel that exists precisely to survive updates, and recreating it whenever
-   * the control plane resends a resource would defeat it. They are released in
-   * {@link #onConfigUpdateComplete} once a new configuration stops reaching them.
+   * The nested filter instance for {@code entry}, obtained from the registry that owns every
+   * filter instance of this HCM. The registry creates it on first use, reuses it across updates -
+   * a nested filter may hold a cache or a side channel that exists precisely to survive them - and
+   * closes it once an update no longer reaches it.
    */
-  private Filter getNestedFilter(DelegateEntry entry) {
-    String key = entry.namedConfig.filterStateKey();
-    childFiltersInUse.add(key);
-    return childFilters.computeIfAbsent(
-        key, k -> entry.provider.newInstance(FilterContext.create(entry.name, metricRecorder)));
-  }
-
-  @Override
-  public void onConfigUpdateComplete() {
-    Set<String> unused = new HashSet<>(childFilters.keySet());
-    unused.removeAll(childFiltersInUse);
-    for (String key : unused) {
-      childFilters.remove(key).close();
-    }
-    childFiltersInUse.clear();
-  }
-
-  @Override
-  public void close() {
-    for (Filter child : childFilters.values()) {
-      child.close();
-    }
-    childFilters.clear();
-    childFiltersInUse.clear();
+  private Filter nestedFilter(DelegateEntry entry) {
+    return Preconditions.checkNotNull(filterAcquirer, "filterAcquirer").apply(entry.namedConfig);
   }
 
   private static CompositeFilterConfig getEffectiveConfig(

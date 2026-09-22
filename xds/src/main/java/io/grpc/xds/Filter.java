@@ -28,6 +28,7 @@ import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 
 /**
@@ -132,21 +133,6 @@ interface Filter extends Closeable {
   @Override
   default void close() {}
 
-  /**
-   * Signals that a configuration update has been fully applied: every interceptor the new
-   * configuration calls for has been built.
-   *
-   * <p>Only filters that own other filter instances need this. Such a filter creates its children
-   * lazily, as the configurations that select them are built into interceptors, and cannot tell on
-   * its own when it has seen the last of them: a child may be reachable only from a per-route
-   * override, so the filter learns the full set only once every route has been built. This call is
-   * where it releases the children the new configuration no longer reaches.
-   *
-   * <p>Called in the xDS sync context, and never between the start and the end of building the
-   * interceptors for a single update.
-   */
-  default void onConfigUpdateComplete() {}
-
   /** Context carrying dynamic metadata for a filter. */
   @AutoValue
   abstract static class FilterConfigParseContext {
@@ -197,8 +183,21 @@ interface Filter extends Closeable {
 
     abstract MetricRecorder metricsRecorder();
 
+    /**
+     * Returns the shared filter instance for a nested filter config, creating it on first use.
+     * Only for filters that run other filters; only valid inside {@code build*Interceptor}; null
+     * when the instance was not created by the xDS resolver/server.
+     */
+    @Nullable
+    abstract Function<NamedFilterConfig, Filter> filterAcquirer();
+
     static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
-      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder);
+      return create(filterName, metricsRecorder, null);
+    }
+
+    static FilterContext create(String filterName, MetricRecorder metricsRecorder,
+        @Nullable Function<NamedFilterConfig, Filter> filterAcquirer) {
+      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder, filterAcquirer);
     }
   }
 

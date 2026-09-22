@@ -94,11 +94,16 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -140,9 +145,27 @@ public class XdsServerWrapperTest {
   private CompositeFilter.Provider compositeProvider;
   private ServerRoutingConfig noopConfig = ServerRoutingConfig.create(
       ImmutableList.<VirtualHost>of(), ImmutableMap.<Route, ServerInterceptor>of());
+  // XdsServerWrapper's syncContext swallows exceptions thrown by an update and logs them at
+  // SEVERE, so tests that must not tolerate one watch the log.
+  private final List<LogRecord> severeLogs = new CopyOnWriteArrayList<>();
+  private final Handler severeLogHandler = new Handler() {
+    @Override
+    public void publish(LogRecord record) {
+      if (record.getLevel().intValue() >= Level.SEVERE.intValue()) {
+        severeLogs.add(record);
+      }
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
+  };
 
   @Before
   public void setup() {
+    Logger.getLogger(XdsServerWrapper.class.getName()).addHandler(severeLogHandler);
     when(mockBuilder.build()).thenReturn(mockServer);
     xdsServerWrapper = new XdsServerWrapper("0.0.0.0:1", mockBuilder, listener,
             selectorManager, new FakeXdsClientPoolFactory(xdsClient),
@@ -153,6 +176,7 @@ public class XdsServerWrapperTest {
   @After
   public void tearDown() {
     xdsServerWrapper.shutdownNow();
+    Logger.getLogger(XdsServerWrapper.class.getName()).removeHandler(severeLogHandler);
   }
 
   @Test
@@ -2070,8 +2094,8 @@ public class XdsServerWrapperTest {
         assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
       }
 
-      // RDS 3: the override is gone, so each chain's "x" is unreachable and closed. StatefulFilter
-      // throws on a second close, so a double close would fail the update.
+      // RDS 3: the override is gone, so each chain's "x" is unreachable and closed exactly once:
+      // StatefulFilter throws on a second close, which the update would log at SEVERE.
       xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
       assertThat(statefulProvider.getAllInstances()).isEqualTo(rds2Snapshot);
       for (StatefulFilter filter : rds1Snapshot) {
@@ -2079,15 +2103,74 @@ public class XdsServerWrapperTest {
       }
       assertThat(rds2Snapshot.get(4).isShutdown()).isTrue();
       assertThat(rds2Snapshot.get(5).isShutdown()).isTrue();
+      assertThat(severeLogs).isEmpty();
 
       // RDS 4: resource not found. Nothing is built, so nothing is swept.
       xdsClient.deliverRdsResourceNotFound(rdsName);
       for (StatefulFilter filter : rds1Snapshot) {
         assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
       }
+
+      // RDS 5: the resource is back. The nested instances kept through the error are reused.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds2Snapshot);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+      assertThat(severeLogs).isEmpty();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }
+  }
+
+  /**
+   * While a new chain's RDS is pending, the selector still holds the previous LDS's chains, and a
+   * re-sent RDS rebuilds their routing configs with the previous HCM's filter set. Such a stale
+   * rebuild must not leave the chain without a filter the new LDS added, or the selector update
+   * that follows the pending RDS fails.
+   */
+  @Test
+  public void filterState_staleRdsRebuildWhileNewChainRdsPending_selectorUpdated()
+      throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+    VirtualHost vhost = filterStateTestVhost();
+    FilterChainMatch matchA = createMatchSrcIp("3fff:a::/32");
+    FilterChainMatch matchB = createMatchSrcIp("3fff:b::/32");
+
+    // LDS 1: chain A with STATEFUL_1, routes from rds_a.
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_a",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1)), matchA), null);
+    xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+    xdsClient.deliverRdsUpdate("rds_a", vhost);
+    verifyServerStarted(serverStart);
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
+
+    // LDS 2: chain A gains STATEFUL_2, and a new chain B is served by rds_b, which stays pending.
+    FilterChain lds2ChainA = createFilterChain("chain_a",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1, STATEFUL_2)), matchA);
+    FilterChain lds2ChainB = createFilterChain("chain_b",
+        createHcmForRds("rds_b", filterStateTestConfigs(STATEFUL_1)), matchB);
+    xdsClient.deliverLdsUpdate(ImmutableList.of(lds2ChainA, lds2ChainB), null);
+    assertThat(statefulFilterNames(statefulFilterProvider))
+        .containsExactly(STATEFUL_1, STATEFUL_2, STATEFUL_1).inOrder();
+
+    // rds_a re-sent: rebuilds chain A's routing config as of LDS 1, then rds_b arrives.
+    xdsClient.deliverRdsUpdate("rds_a", vhost);
+    xdsClient.deliverRdsUpdate("rds_b", vhost);
+    assertThat(severeLogs).isEmpty();
+    assertThat(getSelectorRoutingConfigs().keySet()).containsExactly(lds2ChainA, lds2ChainB);
+    assertThat(getSelectorVhosts(lds2ChainA)).containsExactly(vhost);
+    assertThat(getSelectorVhosts(lds2ChainB)).containsExactly(vhost);
+    // Chain A has a live STATEFUL_2 instance.
+    List<StatefulFilter> liveStateful2 = new ArrayList<>();
+    for (StatefulFilter filter : statefulFilterProvider.getAllInstances()) {
+      if (STATEFUL_2.equals(filter.name) && !filter.isShutdown()) {
+        liveStateful2.add(filter);
+      }
+    }
+    assertThat(liveStateful2).hasSize(1);
   }
 
   /**

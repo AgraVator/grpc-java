@@ -21,6 +21,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -1539,54 +1540,30 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void nestedFilter_resolvedOncePerKeyAcrossRoutes() {
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-      // The resolver hands the same config object to every route of a single LDS update.
-      CompositeFilter.CompositeFilterConfig config = configWithChild("child");
-
-      filter.buildClientInterceptor(config, null, scheduler);
-      filter.buildClientInterceptor(config, null, scheduler);
-      filter.buildClientInterceptor(config, null, scheduler);
-
-      // One instance for the one nested name, created by the framework's map, not by the
-      // composite filter.
-      verify(fakeProvider, times(1)).newInstance(any());
-      verify(fakeFilter, never()).close();
-    }
-
-    @Test
-    public void nestedFilter_routesSelectingDifferentChildrenDoNotEvictEachOther() {
-      CompositeFilter filter = newFilter("composite");
+    public void nestedFilter_acquiredThroughFilterContext_neverClosedByComposite() {
+      @SuppressWarnings("unchecked")
+      Function<NamedFilterConfig, Filter> acquirer = mock(Function.class);
+      when(acquirer.apply(any())).thenReturn(fakeFilter);
+      CompositeFilter filter = (CompositeFilter) provider.newInstance(
+          FilterContext.create("composite", metricRecorder, acquirer));
       ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
 
-      // A single LDS update: the resolver hands the same top-level config object to every route,
-      // but individual routes may carry ExtensionWithMatcherPerRoute overrides that select
-      // different nested filters.
+      // The top-level config and an ExtensionWithMatcherPerRoute override selecting another child.
       CompositeFilter.CompositeFilterConfig topLevel = configWithChild("child_a");
       CompositeFilter.CompositeFilterConfig routeOverride = configWithChild("child_b");
+      filter.buildClientInterceptor(topLevel, null, scheduler);
+      filter.buildClientInterceptor(topLevel, routeOverride, scheduler);
+      filter.buildServerInterceptor(topLevel, routeOverride);
 
-      filter.buildClientInterceptor(topLevel, null, scheduler);           // route 1 -> child_a
-      filter.buildClientInterceptor(topLevel, routeOverride, scheduler);  // route 2 -> child_b
-      filter.buildClientInterceptor(topLevel, null, scheduler);           // route 3 -> child_a
-
-      verify(fakeProvider, times(2)).newInstance(any());
-      verify(fakeFilter, never()).close();
-    }
-
-    @Test
-    public void nestedFilter_reusedAcrossConfigUpdates() {
-      CompositeFilter filter = newFilter("composite");
-      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
-
-      // Two separate LDS updates that both still configure "child".
-      filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
-      filter.buildClientInterceptor(configWithChild("child"), null, scheduler);
-
-      // The instance is reused, so the state it owns (connection pools, credential caches)
-      // survives the update instead of being rebuilt. Retiring it is the framework's job: the
-      // composite filter never closes a nested filter.
-      verify(fakeProvider, times(1)).newInstance(any());
+      // Every delegate entry is resolved through the acquirer with its own NamedFilterConfig...
+      for (CompositeFilter.FilterDelegate delegate
+          : Iterables.concat(topLevel.delegates.values(), routeOverride.delegates.values())) {
+        for (CompositeFilter.DelegateEntry entry : delegate.delegates) {
+          verify(acquirer, atLeastOnce()).apply(entry.namedConfig);
+        }
+      }
+      // ...and only through it: the composite neither creates nor retires nested instances.
+      verify(fakeProvider, never()).newInstance(any());
       verify(fakeFilter, never()).close();
     }
 

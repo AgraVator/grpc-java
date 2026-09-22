@@ -545,16 +545,18 @@ final class XdsServerWrapper extends Server {
      * The filter instance for {@code namedFilter}, created on first use and reused across
      * updates. Also marks it as reached by the current update. This is the only path that creates
      * filter instances; filters that run other filters get it as
-     * {@link FilterContext#filterAcquirer()} and must call it only from
-     * {@code build*Interceptor}, never from {@link Filter.Provider#newInstance}, so that the map
-     * is never mutated re-entrantly.
+     * {@link FilterContext#filterAcquirer()} and may call it only from
+     * {@code build*Interceptor}. Acquiring from {@link Filter.Provider#newInstance} is not
+     * supported: the inner instance would be overwritten by the outer put and leak.
      */
     Filter acquire(NamedFilterConfig namedFilter) {
+      syncContext.throwIfNotInThisSynchronizationContext();
       String filterKey = namedFilter.filterStateKey();
       reached.add(filterKey);
       Filter filter = filters.get(filterKey);
       if (filter == null) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
+        // Same registry the nested configs were parsed with, so the typeUrl is always known.
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
         filter = provider.newInstance(
@@ -812,10 +814,9 @@ final class XdsServerWrapper extends Server {
     }
 
     /**
-     * Starts applying an update to a chain: forgets what the previous update reached and acquires
-     * the HCM's top-level filters. The nested ones are acquired while the routes are built, and
-     * whatever is left unreached is closed once they have been, in
-     * {@link #generatePerRouteInterceptors}.
+     * Acquires the HCM's top-level filters, so that they exist as soon as the LDS is processed and
+     * stay alive while its RDS is pending. Nothing is closed here: the chain is reconciled once
+     * its routes are built, in {@link #generatePerRouteInterceptors}.
      */
     // called in syncContext
     private void acquireTopLevelFilters(
@@ -852,6 +853,10 @@ final class XdsServerWrapper extends Server {
             generatePerRouteInterceptors(hcm.httpFilterConfigs(), savedVhosts, chainFilters));
       } else {
         routingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
+        // No routes to build, so reconcile the chain to its top-level filters: the ones the LDS
+        // removed are closed now; nested ones are closed too and recreated once RDS recovers.
+        acquireTopLevelFilters(chainFilters, hcm.httpFilterConfigs());
+        chainFilters.shutdownExcept(chainFilters.reached);
       }
       AtomicReference<ServerRoutingConfig> routingConfigRef = new AtomicReference<>(routingConfig);
       savedRdsRoutingConfigRef.put(filterChain, routingConfigRef);
@@ -865,6 +870,7 @@ final class XdsServerWrapper extends Server {
       syncContext.throwIfNotInThisSynchronizationContext();
 
       checkNotNull(chainFilters, "chainFilters");
+      chainFilters.reached.clear();
       ImmutableMap.Builder<Route, ServerInterceptor> perRouteInterceptors =
           new ImmutableMap.Builder<>();
 
@@ -888,10 +894,8 @@ final class XdsServerWrapper extends Server {
             String name = namedFilter.name;
             FilterConfig config = namedFilter.filterConfig;
             FilterConfig overrideConfig = perRouteOverrides.get(name);
-            String filterKey = namedFilter.filterStateKey();
 
-            Filter filter = chainFilters.filters.get(filterKey);
-            checkNotNull(filter, "chainFilters.get(%s)", filterKey);
+            Filter filter = chainFilters.acquire(namedFilter);
             ServerInterceptor interceptor = filter.buildServerInterceptor(config, overrideConfig);
 
             if (interceptor != null) {
@@ -905,8 +909,9 @@ final class XdsServerWrapper extends Server {
         }
       }
 
-      // Every route of the chain has been built, so every nested filter the update reaches -
-      // possibly only through a per-route override - has been acquired. Anything else is unused.
+      // Every route of the chain has been built, so every filter the update reaches - top-level,
+      // or nested possibly only through a per-route override - has been acquired. Anything else
+      // is unused.
       chainFilters.shutdownExcept(chainFilters.reached);
       return perRouteInterceptors.buildOrThrow();
     }
@@ -1063,9 +1068,6 @@ final class XdsServerWrapper extends Server {
             // swept: the next valid update reconciles.
             updatedRoutingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
           } else {
-            // The top-level filters are all present already; this only marks them as reached so
-            // that the sweep at the end of generatePerRouteInterceptors keeps them.
-            acquireTopLevelFilters(chainFilters, hcm.httpFilterConfigs());
             ImmutableMap<Route, ServerInterceptor> interceptors = generatePerRouteInterceptors(
                 hcm.httpFilterConfigs(), savedVirtualHosts, chainFilters);
             updatedRoutingConfig = ServerRoutingConfig.create(savedVirtualHosts, interceptors);

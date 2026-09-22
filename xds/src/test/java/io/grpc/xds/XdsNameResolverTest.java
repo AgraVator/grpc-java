@@ -1821,6 +1821,144 @@ public class XdsNameResolverTest {
     }
   }
 
+  /**
+   * A nested filter reachable only through a weighted cluster's override is acquired while the
+   * routes are built, so the sweep keeps it; dropping the override closes it.
+   */
+  @Test
+  public void filterState_nestedFilterOfWeightedClusterOverride_createdAndClosedWithIt() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+      ImmutableList<NamedFilterConfig> filterConfigs = ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("a")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
+
+      // LDS 1: the only weighted cluster overrides "c" with a matcher that runs "x" instead.
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestWeightedClusterVhost(
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x")))), filterConfigs);
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x");
+      StatefulFilter nestedX = statefulProvider.getAllInstances().get(0);
+
+      // LDS 2: the override is gone, so "a" is reached and "x" no longer is.
+      xdsClient.deliverLdsUpdateWithFilters(
+          filterStateTestWeightedClusterVhost(NO_FILTER_OVERRIDES), filterConfigs);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x", "a").inOrder();
+      assertThat(nestedX.isShutdown()).isTrue();
+      assertThat(statefulProvider.getAllInstances().get(1).isShutdown()).isFalse();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * "g" is both a top-level filter and nested in "c": one instance, alive as long as either
+   * reaches it. Here the top-level one goes first.
+   */
+  @Test
+  public void filterState_nestedAndTopLevelSameName_topLevelRemovedFirst() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+      NamedFilterConfig topLevelG = new NamedFilterConfig("g", new StatefulFilter.Config("g"));
+      NamedFilterConfig nestingG = new NamedFilterConfig("c", parseComposite(
+          compositeAnyWrapping(executeStatefulChain("g"))));
+      NamedFilterConfig router =
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG);
+
+      xdsClient.deliverLdsUpdateWithFilters(
+          filterStateTestVhost(), ImmutableList.of(topLevelG, nestingG, router));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      StatefulFilter g = statefulProvider.getAllInstances().get(0);
+
+      // LDS 2: the top-level "g" is gone, but "c" still reaches it.
+      xdsClient.deliverLdsUpdateWithFilters(
+          filterStateTestVhost(), ImmutableList.of(nestingG, router));
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      assertThat(g.isShutdown()).isFalse();
+
+      // LDS 3: nothing reaches "g" any more.
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(router));
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      assertThat(g.isShutdown()).isTrue();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /** As above, with the nested "g" going first. */
+  @Test
+  public void filterState_nestedAndTopLevelSameName_nestedRemovedFirst() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+      NamedFilterConfig topLevelG = new NamedFilterConfig("g", new StatefulFilter.Config("g"));
+      NamedFilterConfig nestingG = new NamedFilterConfig("c", parseComposite(
+          compositeAnyWrapping(executeStatefulChain("g"))));
+      NamedFilterConfig router =
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG);
+
+      xdsClient.deliverLdsUpdateWithFilters(
+          filterStateTestVhost(), ImmutableList.of(topLevelG, nestingG, router));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      StatefulFilter g = statefulProvider.getAllInstances().get(0);
+
+      // LDS 2: "c" is gone, but the top-level "g" remains.
+      xdsClient.deliverLdsUpdateWithFilters(
+          filterStateTestVhost(), ImmutableList.of(topLevelG, router));
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      assertThat(g.isShutdown()).isFalse();
+
+      // LDS 3: nothing reaches "g" any more.
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(router));
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("g");
+      assertThat(g.isShutdown()).isTrue();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /** Two nested filters with the same name but different types are two instances. */
+  @Test
+  public void filterState_nestedSameNameDifferentTypeUrl_twoInstances() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      String altTypeUrl = "type.googleapis.com/grpc.test.AltStatefulFilter";
+      StatefulFilter.Provider altStatefulProvider = new StatefulFilter.Provider(altTypeUrl);
+      StatefulFilter.Provider statefulProvider =
+          filterStateTestSetupResolverWithComposite(altStatefulProvider);
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(compositeAnyWrapping(executeChain(
+              statefulTypedConfig("n", StatefulFilter.DEFAULT_TYPE_URL),
+              statefulTypedConfig("n", altTypeUrl))))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("n");
+      assertThat(statefulFilterNames(altStatefulProvider)).containsExactly("n");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
   /** Renaming the composite does not disturb the nested instances it reaches. */
   @Test
   public void filterState_renamedComposite_keepsNestedInstances() {
@@ -2020,15 +2158,34 @@ public class XdsNameResolverTest {
   /** An ExecuteFilterAction running the named StatefulFilters as a filter_chain, in order. */
   private static com.github.xds.type.matcher.v3.Matcher.OnMatch executeStatefulChain(
       String... nestedNames) {
+    io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig[] typedConfigs =
+        new io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig[nestedNames.length];
+    for (int i = 0; i < nestedNames.length; i++) {
+      typedConfigs[i] = statefulTypedConfig(nestedNames[i], StatefulFilter.DEFAULT_TYPE_URL);
+    }
+    return executeChain(typedConfigs);
+  }
+
+  private static io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig statefulTypedConfig(
+      String name, String typeUrl) {
+    return io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+        .setName(name)
+        .setTypedConfig(Any.newBuilder().setTypeUrl(typeUrl).build())
+        .build();
+  }
+
+  /** An ExecuteFilterAction running {@code typedConfigs} as a filter_chain, in order. */
+  private static com.github.xds.type.matcher.v3.Matcher.OnMatch executeChain(
+      io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig... typedConfigs) {
     FilterChainConfiguration.Builder chain = FilterChainConfiguration.newBuilder();
-    for (String name : nestedNames) {
-      chain.addTypedConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
-          .setName(name)
-          .setTypedConfig(Any.newBuilder().setTypeUrl(StatefulFilter.DEFAULT_TYPE_URL).build()));
+    List<String> names = new ArrayList<>();
+    for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig typedConfig : typedConfigs) {
+      chain.addTypedConfig(typedConfig);
+      names.add(typedConfig.getName());
     }
     return com.github.xds.type.matcher.v3.Matcher.OnMatch.newBuilder()
         .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
-            .setName("action_" + String.join("_", nestedNames))
+            .setName("action_" + String.join("_", names))
             .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
                 .setFilterChain(chain)
                 .build()))
@@ -2114,6 +2271,21 @@ public class XdsNameResolverTest {
         "stateful-vhost",
         ImmutableList.of(expectedLdsResourceName),
         ImmutableList.of(filterStateTestRoute(perRouteOverrides)),
+        NO_FILTER_OVERRIDES);
+  }
+
+  /** A vhost routing call1 to cluster1 through a single weighted cluster carrying overrides. */
+  private VirtualHost filterStateTestWeightedClusterVhost(
+      ImmutableMap<String, FilterConfig> weightedClusterOverrides) {
+    return VirtualHost.create(
+        "stateful-vhost",
+        ImmutableList.of(expectedLdsResourceName),
+        ImmutableList.of(Route.forAction(
+            RouteMatch.withPathExactOnly(call1.getFullMethodNameForPath()),
+            RouteAction.forWeightedClusters(
+                ImmutableList.of(ClusterWeight.create(cluster1, 100, weightedClusterOverrides)),
+                NO_HASH_POLICIES, null, null, true),
+            NO_FILTER_OVERRIDES)),
         NO_FILTER_OVERRIDES);
   }
 

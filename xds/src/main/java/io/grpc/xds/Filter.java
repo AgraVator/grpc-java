@@ -83,15 +83,19 @@ interface Filter extends Closeable {
      * <p>For xDS gRPC clients, new filter instances are created per combination of:
      * <ol>
      *   <li><code>XdsNameResolver</code> instance,</li>
-     *   <li>Filter name+typeUrl in HttpConnectionManager (HCM) http_filters.</li>
+     *   <li>Filter name+typeUrl anywhere in the HttpConnectionManager (HCM) filter configs.</li>
      * </ol>
      *
      * <p>For xDS-enabled gRPC servers, new filter instances are created per combination of:
      * <ol>
      *   <li>Server instance,</li>
      *   <li>FilterChain name,</li>
-     *   <li>Filter name+typeUrl in FilterChain's HCM.http_filters.</li>
+     *   <li>Filter name+typeUrl anywhere in the FilterChain's HCM filter configs.</li>
      * </ol>
+     *
+     * <p>"Anywhere" covers the HCM's http_filters as well as the filters nested in them (see
+     * {@link FilterContext#filterAcquirer()}), including ones reachable only through per-route
+     * typed_per_filter_config overrides delivered via RDS.
      */
     Filter newInstance(FilterContext context);
 

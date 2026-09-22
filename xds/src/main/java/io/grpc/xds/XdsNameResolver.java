@@ -750,8 +750,9 @@ final class XdsNameResolver extends NameResolver {
      * The filter instance for {@code namedFilter}, created on first use and reused across updates.
      * Also marks it as reached by the current update. This is the only path that creates filter
      * instances; filters that run other filters get it as {@link FilterContext#filterAcquirer()}
-     * and must call it only from {@code build*Interceptor}, never from
-     * {@link Filter.Provider#newInstance}, so that the map is never mutated re-entrantly.
+     * and may call it only from {@code build*Interceptor}. Acquiring from
+     * {@link Filter.Provider#newInstance} is not supported: the inner instance would be
+     * overwritten by the outer put and leak.
      */
     // called in syncContext
     private Filter acquireFilter(NamedFilterConfig namedFilter) {

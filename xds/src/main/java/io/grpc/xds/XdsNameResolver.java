@@ -70,7 +70,6 @@ import io.grpc.xds.client.XdsInitializationException;
 import io.grpc.xds.client.XdsLogger;
 import io.grpc.xds.client.XdsLogger.XdsLogLevel;
 import java.io.InputStream;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -79,7 +78,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -731,96 +729,40 @@ final class XdsNameResolver extends NameResolver {
       ImmutableList<NamedFilterConfig> filterConfigs = httpConnectionManager.httpFilterConfigs();
       long streamDurationNano = httpConnectionManager.httpMaxStreamDurationNano();
 
-      updateActiveFilters(filterConfigs, virtualHost);
+      updateActiveFilters(filterConfigs);
       updateRoutes(update, virtualHost, streamDurationNano, filterConfigs);
+      // Only now has every route been built, so a filter that owns other filter instances has seen
+      // every config that selects one and can release the rest.
+      for (Filter filter : activeFilters.values()) {
+        filter.onConfigUpdateComplete();
+      }
     }
 
     // called in syncContext
     private void updateActiveFilters(@Nullable List<NamedFilterConfig> filterConfigs) {
-      updateActiveFilters(filterConfigs, null);
-    }
-
-    // called in syncContext
-    private void updateActiveFilters(
-        @Nullable List<NamedFilterConfig> filterConfigs, @Nullable VirtualHost virtualHost) {
       if (filterConfigs == null) {
         filterConfigs = ImmutableList.of();
       }
       Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
-      // Nested filters (for example the children of a composite filter) are owned by this map
-      // exactly like top-level ones, so the reconciliation walks the whole config tree. Per-route
-      // overrides only contribute their nested configs: the override itself is applied to the
-      // instance named by the top-level config, it is not an instance of its own.
-      Queue<NamedFilterConfig> queue = new ArrayDeque<>(filterConfigs);
-      Set<String> declaredFilterNames = new HashSet<>();
-      for (NamedFilterConfig filterConfig : filterConfigs) {
-        declaredFilterNames.add(filterConfig.name);
-      }
-      if (virtualHost != null) {
-        collectNestedOverrides(virtualHost.filterConfigOverrides(), declaredFilterNames, queue);
-        for (Route route : virtualHost.routes()) {
-          collectNestedOverrides(route.filterConfigOverrides(), declaredFilterNames, queue);
-          if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
-            for (VirtualHost.Route.RouteAction.ClusterWeight cw
-                : route.routeAction().weightedClusters()) {
-              collectNestedOverrides(cw.filterConfigOverrides(), declaredFilterNames, queue);
-            }
-          }
-        }
-      }
-      // The same nested config can be reached from many routes; visit each one once so the walk
-      // stays linear in the size of the config tree. The visited set is keyed on the whole
-      // NamedFilterConfig rather than on filterStateKey() because two distinct configs can share a
-      // key: sibling composite filters may each nest a child with the same name and type, and those
-      // children can in turn select different grandchildren. Keying on the state key alone would
-      // stop the walk at the first sibling and leave the other subtree unreconciled.
-      Set<NamedFilterConfig> visited = new HashSet<>();
-      while (!queue.isEmpty()) {
-        NamedFilterConfig namedFilter = queue.poll();
+      for (NamedFilterConfig namedFilter : filterConfigs) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
         String filterKey = namedFilter.filterStateKey();
-        if (!visited.add(namedFilter)) {
-          continue;
-        }
 
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
         Filter filter = activeFilters.computeIfAbsent(
             filterKey, k -> provider.newInstance(
-                FilterContext.create(
-                    namedFilter.name, nameResolverArgs.getMetricRecorder(), activeFilters::get)));
+                FilterContext.create(namedFilter.name, nameResolverArgs.getMetricRecorder())));
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
-        queue.addAll(namedFilter.filterConfig.nestedFilterConfigs());
       }
 
-      // Shutdown filters not present in current HCM.
+      // Shutdown filters not present in current HCM. A filter that owns other filter instances
+      // releases them from its own close().
       for (String filterKey : filtersToShutdown) {
         Filter filterToShutdown = activeFilters.remove(filterKey);
         checkNotNull(filterToShutdown, "filterToShutdown %s", filterKey);
         filterToShutdown.close();
-      }
-    }
-
-    /**
-     * Enqueues the nested configs of every override in {@code overrides}, but not the overrides
-     * themselves: an override reconfigures the instance named by the top-level config rather than
-     * introducing an instance of its own, while the nested filters it selects are instances that
-     * have to exist before the override can be applied.
-     *
-     * <p>Overrides are keyed by filter name and are parsed without knowledge of the HCM, so an
-     * override can name a filter that {@code http_filters} never declared. Such an override is
-     * never applied to anything, so its nested configs must not be instantiated either.
-     */
-    private void collectNestedOverrides(
-        Map<String, FilterConfig> overrides,
-        Set<String> declaredFilterNames,
-        Queue<NamedFilterConfig> queue) {
-      for (Map.Entry<String, FilterConfig> override : overrides.entrySet()) {
-        if (!declaredFilterNames.contains(override.getKey())) {
-          continue;
-        }
-        queue.addAll(override.getValue().nestedFilterConfigs());
       }
     }
 

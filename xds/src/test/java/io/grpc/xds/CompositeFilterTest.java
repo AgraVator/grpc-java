@@ -89,10 +89,8 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
@@ -204,27 +202,9 @@ public class CompositeFilterTest {
           .build();
     }
 
-    /**
-     * Stands in for the {@code activeFilters} map that {@code XdsNameResolver} and
-     * {@code XdsServerWrapper} own: the framework creates every nested filter up front, keyed by
-     * {@code NamedFilterConfig.filterStateKey()}, and {@link CompositeFilter} only ever reads it.
-     */
-    private final Map<String, Filter> activeFilters = new HashMap<>();
-
     private CompositeFilter newFilter(String name) {
       return (CompositeFilter) provider.newInstance(
-          FilterContext.create(
-              name,
-              mock(MetricRecorder.class),
-              key -> activeFilters.computeIfAbsent(key, k -> {
-                int sep = k.lastIndexOf('_');
-                String nestedName = k.substring(0, sep);
-                String typeUrl = k.substring(sep + 1);
-                Filter.Provider p = FAKE_UNSUPPORTED_TYPE_URL.equals(typeUrl)
-                    ? fakeUnsupportedProvider : fakeProvider;
-                return p.newInstance(
-                    FilterContext.create(nestedName, mock(MetricRecorder.class)));
-              })));
+          FilterContext.create(name, mock(MetricRecorder.class)));
     }
 
     private static ExtensionWithMatcher createExtensionWithMatcher(Matcher matcher) {
@@ -1537,6 +1517,21 @@ public class CompositeFilterTest {
       return result.config;
     }
 
+    /** Parses a composite config with one action per named nested filter. */
+    private CompositeFilter.CompositeFilterConfig configWithChildren(String... childNames) {
+      Matcher.MatcherList.Builder matcherList = Matcher.MatcherList.newBuilder();
+      for (String childName : childNames) {
+        matcherList.addMatchers(createHeaderFieldMatcher("foo", childName,
+            createExecuteAction(childName, FAKE_TYPE_URL)));
+      }
+      Matcher matcher = Matcher.newBuilder().setMatcherList(matcherList.build()).build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(result.errorDetail).isNull();
+      return result.config;
+    }
+
     @Test
     public void nestedFilter_resolvedOncePerKeyAcrossRoutes() {
       CompositeFilter filter = newFilter("composite");
@@ -1926,17 +1921,17 @@ public class CompositeFilterTest {
           provider.parseFilterConfig(Any.pack(proto), getFilterContext());
 
       MetricRecorder expectedRecorder = mock(MetricRecorder.class);
-      List<String> lookedUpKeys = new ArrayList<>();
       CompositeFilter filter = (CompositeFilter) provider.newInstance(
-          FilterContext.create(
-              "composite",
-              expectedRecorder,
-              key -> {
-                lookedUpKeys.add(key);
-                return fakeFilter;
-              }));
+          FilterContext.create("composite", expectedRecorder));
       ClientInterceptor interceptor = filter.buildClientInterceptor(result.config, null,
           mock(ScheduledExecutorService.class));
+
+      // The child is instantiated while the interceptor is being built, not per RPC.
+      ArgumentCaptor<FilterContext> contextCaptor = ArgumentCaptor.forClass(FilterContext.class);
+      verify(fakeProvider).newInstance(contextCaptor.capture());
+      // The child is told its own name, not the composite's, and shares the composite's recorder.
+      assertThat(contextCaptor.getValue().filterName()).isEqualTo("my_child_filter");
+      assertThat(contextCaptor.getValue().metricsRecorder()).isSameInstanceAs(expectedRecorder);
 
       Channel next = mock(Channel.class);
       when(fakeClientInterceptor.interceptCall(any(), any(), any()))
@@ -1949,7 +1944,8 @@ public class CompositeFilterTest {
       headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
       call.start(mock(ClientCall.Listener.class), headers);
 
-      assertThat(lookedUpKeys).containsExactly("my_child_filter_" + FAKE_TYPE_URL);
+      // Serving an RPC must not create another instance.
+      verify(fakeProvider).newInstance(any(FilterContext.class));
     }
 
     @Test
@@ -3312,35 +3308,68 @@ public class CompositeFilterTest {
       verify(fakeProvider, times(1)).newInstance(any(FilterContext.class));
     }
 
-    @Test
-    public void nestedFilterConfigs_exposesAllChildConfigsForFrameworkReconciliation() {
-      Matcher matcher = Matcher.newBuilder()
-          .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "1", createExecuteAction("c1", FAKE_TYPE_URL)))
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "2", createExecuteAction("c2", FAKE_TYPE_URL))))
-          .build();
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
-          provider.parseFilterConfig(
-              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-      assertThat(res.errorDetail).isNull();
-      List<String> keys = new ArrayList<>();
-      for (Filter.NamedFilterConfig nfc : res.config.nestedFilterConfigs()) {
-        keys.add(nfc.filterStateKey());
-      }
-      assertThat(keys).containsExactly("c1_" + FAKE_TYPE_URL, "c2_" + FAKE_TYPE_URL);
+    /** Makes each child instance distinct, so which one was closed can be told apart. */
+    private Map<String, Filter> recordChildInstances() {
+      Map<String, Filter> children = new HashMap<>();
+      when(fakeProvider.newInstance(any(FilterContext.class))).thenAnswer(invocation -> {
+        FilterContext context = invocation.getArgument(0);
+        Filter child = mock(Filter.class);
+        children.put(context.filterName(), child);
+        return child;
+      });
+      return children;
     }
 
     @Test
-    public void nestedFilter_missingFromActiveFiltersLookup_throwsNpe() {
-      CompositeFilter unreconciled = (CompositeFilter) provider.newInstance(
-          FilterContext.create("composite", mock(MetricRecorder.class), k -> null));
-      NullPointerException thrown = assertThrows(NullPointerException.class,
-          () -> unreconciled.buildClientInterceptor(
-              configWithChild("missing_child"), null, mock(ScheduledExecutorService.class)));
-      assertThat(thrown).hasMessageThat()
-          .contains("nested filter missing_child_" + FAKE_TYPE_URL + " not reconciled");
+    public void onConfigUpdateComplete_releasesChildrenTheNewConfigNoLongerReaches() {
+      Map<String, Filter> children = recordChildInstances();
+      CompositeFilter filter = newFilter("composite");
+      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+      filter.buildClientInterceptor(configWithChildren("c1", "c2"), null, scheduler);
+      filter.onConfigUpdateComplete();
+      Filter c1 = children.get("c1");
+      Filter c2 = children.get("c2");
+      verify(c1, never()).close();
+      verify(c2, never()).close();
+
+      // A second update that no longer names c2. c1 must be reused rather than rebuilt - the
+      // state it owns is exactly what an update must not throw away - and c2 must be released
+      // rather than held until the composite itself goes away.
+      filter.buildClientInterceptor(configWithChildren("c1"), null, scheduler);
+      filter.onConfigUpdateComplete();
+      assertThat(children.get("c1")).isSameInstanceAs(c1);
+      verify(c1, never()).close();
+      verify(c2).close();
+    }
+
+    @Test
+    public void onConfigUpdateComplete_keepsChildrenReachedByAnyRoute() {
+      Map<String, Filter> children = recordChildInstances();
+      CompositeFilter filter = newFilter("composite");
+      ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+
+      // Two routes of one update, each selecting a different child. The sweep runs once, after
+      // both, so neither child may be mistaken for unreachable.
+      filter.buildClientInterceptor(configWithChildren("c1"), null, scheduler);
+      filter.buildClientInterceptor(configWithChildren("c2"), null, scheduler);
+      filter.onConfigUpdateComplete();
+
+      verify(children.get("c1"), never()).close();
+      verify(children.get("c2"), never()).close();
+    }
+
+    @Test
+    public void close_closesOwnedChildren() {
+      Map<String, Filter> children = recordChildInstances();
+      CompositeFilter filter = newFilter("composite");
+
+      filter.buildClientInterceptor(
+          configWithChildren("c1", "c2"), null, mock(ScheduledExecutorService.class));
+      filter.close();
+
+      verify(children.get("c1")).close();
+      verify(children.get("c2")).close();
     }
   }
 

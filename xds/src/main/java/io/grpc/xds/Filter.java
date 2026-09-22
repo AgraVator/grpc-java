@@ -26,11 +26,8 @@ import io.grpc.ServerInterceptor;
 import io.grpc.xds.client.Bootstrapper.BootstrapInfo;
 import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
-import java.util.Collection;
-import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.function.Function;
 import javax.annotation.Nullable;
 
 /**
@@ -46,15 +43,6 @@ interface Filter extends Closeable {
   /** Represents an opaque data structure holding configuration for a filter. */
   interface FilterConfig {
     String typeUrl();
-
-    /**
-     * Any nested filter configurations owned by this config (for example, child filters inside a
-     * composite filter's matcher tree). Returned configs are reconciled and closed by the xDS
-     * framework alongside top-level filters in {@code activeFilters}.
-     */
-    default Collection<NamedFilterConfig> nestedFilterConfigs() {
-      return Collections.emptyList();
-    }
   }
 
   /**
@@ -144,6 +132,21 @@ interface Filter extends Closeable {
   @Override
   default void close() {}
 
+  /**
+   * Signals that a configuration update has been fully applied: every interceptor the new
+   * configuration calls for has been built.
+   *
+   * <p>Only filters that own other filter instances need this. Such a filter creates its children
+   * lazily, as the configurations that select them are built into interceptors, and cannot tell on
+   * its own when it has seen the last of them: a child may be reachable only from a per-route
+   * override, so the filter learns the full set only once every route has been built. This call is
+   * where it releases the children the new configuration no longer reaches.
+   *
+   * <p>Called in the xDS sync context, and never between the start and the end of building the
+   * interceptors for a single update.
+   */
+  default void onConfigUpdateComplete() {}
+
   /** Context carrying dynamic metadata for a filter. */
   @AutoValue
   abstract static class FilterConfigParseContext {
@@ -194,19 +197,8 @@ interface Filter extends Closeable {
 
     abstract MetricRecorder metricsRecorder();
 
-    @Nullable
-    abstract Function<String, Filter> activeFilterLookup();
-
     static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
-      return create(filterName, metricsRecorder, /* activeFilterLookup= */ null);
-    }
-
-    static FilterContext create(
-        String filterName,
-        MetricRecorder metricsRecorder,
-        @Nullable Function<String, Filter> activeFilterLookup) {
-      return new AutoValue_Filter_FilterContext(
-          filterName, metricsRecorder, activeFilterLookup);
+      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder);
     }
   }
 

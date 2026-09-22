@@ -145,8 +145,8 @@ final class CompositeFilter implements Filter {
               "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
         }
         // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
-        // per-route override may still supply one. The deprecated `matcher` field is ignored,
-        // per A103.
+        // per-route override may still supply one. A present one must carry a matcher_list or
+        // matcher_tree (A106). The deprecated `matcher` field is ignored, per A103.
         return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
@@ -175,7 +175,8 @@ final class CompositeFilter implements Filter {
         // the top-level config", and there an absent matcher is permitted and makes the filter a
         // no-op. Since the override replaces the top-level matcher outright, an absent one
         // replaces it with nothing: the filter stops matching on this route. Rejecting it here
-        // would NACK a config the spec calls valid.
+        // would NACK a config the spec calls valid. A present one is validated like the top-level
+        // one, so it must carry a matcher_list or matcher_tree.
         return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
@@ -250,8 +251,18 @@ final class CompositeFilter implements Filter {
           .equals(typeUrl);
     }
 
+    /**
+     * Walks {@code matcher} and every matcher nested in its on_match branches, parsing each
+     * action into {@code map}. A106 requires every Matcher to have a matcher_list or a
+     * matcher_tree; one with neither (an empty one, or one with only on_no_match) is rejected,
+     * as C-core does, rather than accepted as an always-on_no_match matcher.
+     */
     private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
         FilterConfigParseContext context) {
+      if (!matcher.hasMatcherList() && !matcher.hasMatcherTree()) {
+        throw new IllegalArgumentException(
+            "xds_matcher: no matcher_list or matcher_tree specified");
+      }
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
           if (fm.hasOnMatch()) {

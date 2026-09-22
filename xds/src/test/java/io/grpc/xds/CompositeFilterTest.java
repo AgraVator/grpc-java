@@ -296,6 +296,30 @@ public class CompositeFilterTest {
           .build();
     }
 
+    /**
+     * A Matcher must have a matcher_list or matcher_tree (A106). This one's single field matcher
+     * keys on a header no test sends, so {@code onNoMatch} is what always runs.
+     */
+    private static Matcher.Builder matcherFallingThroughTo(Matcher.OnMatch onNoMatch) {
+      return Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("x-never-sent", "never", onNoMatch)))
+          .setOnNoMatch(onNoMatch);
+    }
+
+    private static Matcher.Builder matcherFallingThroughTo(Matcher.OnMatch.Builder onNoMatch) {
+      return matcherFallingThroughTo(onNoMatch.build());
+    }
+
+    /** A matcher whose single field matcher never matches and that has no on_no_match. */
+    private static Matcher matcherNeverMatching() {
+      return Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher(
+                  "x-never-sent", "never", createExecuteAction("child", FAKE_TYPE_URL))))
+          .build();
+    }
+
     private static Matcher.MatcherList.FieldMatcher createHeaderFieldMatcher(
         String headerName, String headerValue, Matcher.OnMatch onMatch) {
       return Matcher.MatcherList.FieldMatcher.newBuilder()
@@ -377,9 +401,8 @@ public class CompositeFilterTest {
     public void parseFilterConfig_equalProtosProduceEqualConfigs() {
       // The xDS client decides whether to wake watchers by comparing parsed resources, so a
       // control plane re-sending an unchanged listener must not look like a change.
-      ExtensionWithMatcher proto = createExtensionWithMatcher(Matcher.newBuilder()
-          .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
-          .build());
+      ExtensionWithMatcher proto = createExtensionWithMatcher(
+          matcherFallingThroughTo(createExecuteAction("child", FAKE_TYPE_URL)).build());
 
       CompositeFilter.CompositeFilterConfig first =
           provider.parseFilterConfig(Any.pack(proto), getFilterContext()).config;
@@ -394,14 +417,12 @@ public class CompositeFilterTest {
     @Test
     public void parseFilterConfig_differentProtosProduceUnequalConfigs() {
       CompositeFilter.CompositeFilterConfig first = provider.parseFilterConfig(
-          Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
-              .setOnNoMatch(createExecuteAction("child_a", FAKE_TYPE_URL))
-              .build())),
+          Any.pack(createExtensionWithMatcher(
+              matcherFallingThroughTo(createExecuteAction("child_a", FAKE_TYPE_URL)).build())),
           getFilterContext()).config;
       CompositeFilter.CompositeFilterConfig second = provider.parseFilterConfig(
-          Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
-              .setOnNoMatch(createExecuteAction("child_b", FAKE_TYPE_URL))
-              .build())),
+          Any.pack(createExtensionWithMatcher(
+              matcherFallingThroughTo(createExecuteAction("child_b", FAKE_TYPE_URL)).build())),
           getFilterContext()).config;
 
       assertThat(first).isNotEqualTo(second);
@@ -490,16 +511,6 @@ public class CompositeFilterTest {
       assertThat(result1.errorDetail).isNull();
       assertThat(result1.config).isNotNull();
       assertThat(result1.config.matcher).isNull();
-
-      ExtensionWithMatcher protoEmptyMatcher =
-          createExtensionWithMatcher(Matcher.getDefaultInstance());
-
-      ConfigOrError<CompositeFilter.CompositeFilterConfig> result2 =
-          provider.parseFilterConfig(Any.pack(protoEmptyMatcher), getFilterContext());
-
-      assertThat(result2.errorDetail).isNull();
-      assertThat(result2.config).isNotNull();
-      assertThat(result2.config.matcher).isNotNull();
     }
 
     @Test
@@ -629,7 +640,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
       ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -665,7 +676,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
       ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -695,6 +706,50 @@ public class CompositeFilterTest {
           provider.parseFilterConfigOverride(Any.pack(configProto), getFilterContext());
 
       assertThat(result.errorDetail).contains("Expected ExtensionWithMatcherPerRoute but got");
+    }
+
+    @Test
+    public void parseFilterConfig_emptyXdsMatcher_rejected() {
+      // Unlike an absent xds_matcher, a present one must have a matcher_list or matcher_tree.
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result = provider.parseFilterConfig(
+          Any.pack(createExtensionWithMatcher(Matcher.getDefaultInstance())), getFilterContext());
+      assertThat(result.errorDetail)
+          .contains("xds_matcher: no matcher_list or matcher_tree specified");
+    }
+
+    @Test
+    public void parseFilterConfig_onNoMatchOnlyXdsMatcher_rejected() {
+      Matcher matcher = Matcher.newBuilder()
+          .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result = provider.parseFilterConfig(
+          Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(result.errorDetail)
+          .contains("xds_matcher: no matcher_list or matcher_tree specified");
+    }
+
+    @Test
+    public void parseFilterConfig_nestedMatcherWithoutListOrTree_rejected() {
+      Matcher inner = Matcher.newBuilder()
+          .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
+          .build();
+      Matcher outer = matcherFallingThroughTo(
+          Matcher.OnMatch.newBuilder().setMatcher(inner).build()).build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result = provider.parseFilterConfig(
+          Any.pack(createExtensionWithMatcher(outer)), getFilterContext());
+      assertThat(result.errorDetail)
+          .contains("xds_matcher: no matcher_list or matcher_tree specified");
+    }
+
+    @Test
+    public void parseFilterConfigOverride_emptyXdsMatcher_rejected() {
+      ExtensionWithMatcherPerRoute proto = ExtensionWithMatcherPerRoute.newBuilder()
+          .setXdsMatcher(Matcher.getDefaultInstance())
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          provider.parseFilterConfigOverride(Any.pack(proto), getFilterContext());
+      assertThat(result.errorDetail)
+          .contains("xds_matcher: no matcher_list or matcher_tree specified");
     }
 
     @Test
@@ -762,7 +817,7 @@ public class CompositeFilterTest {
 
     @Test
     public void clientInterceptor_noMatchFailsWithUnavailable() {
-      Matcher matcher = Matcher.newBuilder().build();
+      Matcher matcher = matcherNeverMatching();
       ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -1347,8 +1402,8 @@ public class CompositeFilterTest {
       ConfigOrError<CompositeFilter.CompositeFilterConfig> baseResult =
           provider.parseFilterConfig(Any.pack(baseProto), getFilterContext());
 
-      // Override matcher has no match rules
-      Matcher overrideMatcher = Matcher.newBuilder().build();
+      // Override matcher matches nothing the RPC sends
+      Matcher overrideMatcher = matcherNeverMatching();
       ExtensionWithMatcherPerRoute overrideProto = ExtensionWithMatcherPerRoute.newBuilder()
           .setXdsMatcher(overrideMatcher)
           .build();
@@ -1409,7 +1464,7 @@ public class CompositeFilterTest {
 
     @Test
     public void serverInterceptor_noMatchFailsWithUnavailable() {
-      Matcher matcher = Matcher.newBuilder().build();
+      Matcher matcher = matcherNeverMatching();
       ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -1799,7 +1854,7 @@ public class CompositeFilterTest {
 
     @Test
     public void clientInterceptor_unaryCall_methodsSafeAfterNoMatch() {
-      Matcher matcher = Matcher.newBuilder().build();
+      Matcher matcher = matcherNeverMatching();
       ExtensionWithMatcher proto = createExtensionWithMatcher(matcher);
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -2283,8 +2338,7 @@ public class CompositeFilterTest {
               .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
           .build();
 
-      Matcher matcher = Matcher.newBuilder()
-          .setOnNoMatch(badAction)
+      Matcher matcher = matcherFallingThroughTo(badAction)
           .build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -2364,13 +2418,11 @@ public class CompositeFilterTest {
               .setTypedConfig(Any.newBuilder().setTypeUrl(EXECUTE_ACTION_TYPE_URL).build()))
           .build();
 
-      Matcher innerMatcher = Matcher.newBuilder()
-          .setOnNoMatch(badAction)
+      Matcher innerMatcher = matcherFallingThroughTo(badAction)
           .build();
 
-      Matcher outerMatcher = Matcher.newBuilder()
-          .setOnNoMatch(Matcher.OnMatch.newBuilder().setMatcher(innerMatcher).build())
-          .build();
+      Matcher outerMatcher = matcherFallingThroughTo(
+          Matcher.OnMatch.newBuilder().setMatcher(innerMatcher).build()).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2395,9 +2447,8 @@ public class CompositeFilterTest {
                   .putMap("l3/", badAction)))
           .build();
 
-      Matcher level2 = Matcher.newBuilder()
-          .setOnNoMatch(Matcher.OnMatch.newBuilder().setMatcher(level3).build())
-          .build();
+      Matcher level2 = matcherFallingThroughTo(
+          Matcher.OnMatch.newBuilder().setMatcher(level3).build()).build();
 
       Matcher level1 = Matcher.newBuilder()
           .setMatcherTree(Matcher.MatcherTree.newBuilder()
@@ -2435,7 +2486,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(badAction).build();
+      Matcher matcher = matcherFallingThroughTo(badAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2459,7 +2510,7 @@ public class CompositeFilterTest {
           .setAction(bareAction)
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(bareFilterAction).build();
+      Matcher matcher = matcherFallingThroughTo(bareFilterAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2484,7 +2535,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2508,7 +2559,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2536,7 +2587,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(corruptSkip).build();
+      Matcher matcher = matcherFallingThroughTo(corruptSkip).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2557,7 +2608,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(corruptedAction).build();
+      Matcher matcher = matcherFallingThroughTo(corruptedAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2585,7 +2636,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(action).build();
+      Matcher matcher = matcherFallingThroughTo(action).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2614,7 +2665,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(action).build();
+      Matcher matcher = matcherFallingThroughTo(action).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2649,7 +2700,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2682,7 +2733,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2723,7 +2774,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2758,7 +2809,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(matchAction).build();
+      Matcher matcher = matcherFallingThroughTo(matchAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfig(
@@ -2773,8 +2824,7 @@ public class CompositeFilterTest {
       when(fakeProvider.parseFilterConfig(any(com.google.protobuf.Message.class), any()))
           .thenReturn((ConfigOrError) ConfigOrError.fromConfig(RouterFilter.ROUTER_CONFIG));
 
-      Matcher matcher = Matcher.newBuilder()
-          .setOnNoMatch(createExecuteAction("child", FAKE_TYPE_URL))
+      Matcher matcher = matcherFallingThroughTo(createExecuteAction("child", FAKE_TYPE_URL))
           .build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
@@ -2799,8 +2849,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder()
-          .setOnNoMatch(Matcher.OnMatch.newBuilder()
+      Matcher matcher = matcherFallingThroughTo(Matcher.OnMatch.newBuilder()
               .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
                   .setName("action")
                   .setTypedConfig(Any.pack(action))))
@@ -2827,8 +2876,7 @@ public class CompositeFilterTest {
               .build())
           .build();
 
-      Matcher matcher = Matcher.newBuilder()
-          .setOnNoMatch(Matcher.OnMatch.newBuilder()
+      Matcher matcher = matcherFallingThroughTo(Matcher.OnMatch.newBuilder()
               .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
                   .setName("action")
                   .setTypedConfig(Any.pack(action))))
@@ -3026,8 +3074,7 @@ public class CompositeFilterTest {
 
     @Test
     public void compositeFilterConfig_equalsHashCodeToString() {
-      Matcher matcherProto = Matcher.newBuilder()
-          .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
+      Matcher matcherProto = matcherFallingThroughTo(createExecuteAction("c1", FAKE_TYPE_URL))
           .build();
       ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
           provider.parseFilterConfig(
@@ -3079,8 +3126,7 @@ public class CompositeFilterTest {
         when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(null);
         when(fakeFilter.buildServerInterceptor(any(), any())).thenReturn(null);
 
-        Matcher matcher = Matcher.newBuilder()
-            .setOnNoMatch(createExecuteAction("c1", FAKE_TYPE_URL))
+        Matcher matcher = matcherFallingThroughTo(createExecuteAction("c1", FAKE_TYPE_URL))
             .build();
         ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
             provider.parseFilterConfig(
@@ -3179,7 +3225,7 @@ public class CompositeFilterTest {
                       .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_TYPE_URL)))
                   .build())))
           .build();
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(missingNameAction).build();
+      Matcher matcher = matcherFallingThroughTo(missingNameAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
           provider.parseFilterConfig(
@@ -3210,7 +3256,7 @@ public class CompositeFilterTest {
                           .addTypedConfig(child))
                   .build())))
           .build();
-      Matcher matcher = Matcher.newBuilder().setOnNoMatch(chainAction).build();
+      Matcher matcher = matcherFallingThroughTo(chainAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
           provider.parseFilterConfig(

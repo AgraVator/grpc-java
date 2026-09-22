@@ -52,6 +52,7 @@ import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPer
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.FilterChainConfiguration;
+import io.envoyproxy.envoy.type.matcher.v3.HttpRequestHeaderMatchInput;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ChannelConfigurator;
@@ -2146,9 +2147,7 @@ public class XdsNameResolverTest {
     io.grpc.xds.ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
         compositeProvider.parseFilterConfigOverride(
             Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
-                .setXdsMatcher(com.github.xds.type.matcher.v3.Matcher.newBuilder()
-                    .setOnNoMatch(onMatch)
-                    .build())
+                .setXdsMatcher(matcherFallingThroughTo(onMatch))
                 .build()),
             compositeParseContext());
     assertThat(result.errorDetail).isNull();
@@ -2216,10 +2215,34 @@ public class XdsNameResolverTest {
             .setName("composite")
             .setTypedConfig(Any.pack(Composite.getDefaultInstance()))
             .build())
-        .setXdsMatcher(com.github.xds.type.matcher.v3.Matcher.newBuilder()
-            .setOnNoMatch(onMatch)
-            .build())
+        .setXdsMatcher(matcherFallingThroughTo(onMatch))
         .build());
+  }
+
+  /**
+   * A Matcher must have a matcher_list or matcher_tree (A106). This one's single field matcher
+   * keys on a header no test sends, so {@code onNoMatch} is what always runs.
+   */
+  private static com.github.xds.type.matcher.v3.Matcher matcherFallingThroughTo(
+      com.github.xds.type.matcher.v3.Matcher.OnMatch onNoMatch) {
+    return com.github.xds.type.matcher.v3.Matcher.newBuilder()
+        .setMatcherList(com.github.xds.type.matcher.v3.Matcher.MatcherList.newBuilder()
+            .addMatchers(com.github.xds.type.matcher.v3.Matcher.MatcherList.FieldMatcher
+                .newBuilder()
+                .setPredicate(com.github.xds.type.matcher.v3.Matcher.MatcherList.Predicate
+                    .newBuilder()
+                    .setSinglePredicate(com.github.xds.type.matcher.v3.Matcher.MatcherList
+                        .Predicate.SinglePredicate.newBuilder()
+                        .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                            .setName("request_headers")
+                            .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
+                                .setHeaderName("x-never-sent")
+                                .build())))
+                        .setValueMatch(com.github.xds.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("never"))))
+                .setOnMatch(onNoMatch)))
+        .setOnNoMatch(onNoMatch)
+        .build();
   }
 
   private static Filter.FilterConfigParseContext compositeParseContext() {

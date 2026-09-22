@@ -736,7 +736,10 @@ final class CompositeFilter implements Filter {
    * closes it once an update no longer reaches it.
    */
   private Filter nestedFilter(DelegateEntry entry) {
-    return Preconditions.checkNotNull(filterAcquirer, "filterAcquirer").apply(entry.namedConfig);
+    return Preconditions.checkNotNull(filterAcquirer,
+        "CompositeFilter needs FilterContext.filterAcquirer() to build interceptors; instances "
+            + "must be created by the xDS resolver/server (3-arg FilterContext.create)")
+        .apply(entry.namedConfig);
   }
 
   private static CompositeFilterConfig getEffectiveConfig(

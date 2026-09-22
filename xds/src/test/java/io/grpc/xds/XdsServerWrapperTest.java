@@ -175,8 +175,8 @@ public class XdsServerWrapperTest {
 
   @After
   public void tearDown() {
-    xdsServerWrapper.shutdownNow();
     Logger.getLogger(XdsServerWrapper.class.getName()).removeHandler(severeLogHandler);
+    xdsServerWrapper.shutdownNow();
   }
 
   @Test
@@ -2171,6 +2171,65 @@ public class XdsServerWrapperTest {
       }
     }
     assertThat(liveStateful2).hasSize(1);
+  }
+
+  /**
+   * An RDS error closes nothing, but an LDS update processed while the chain's RDS is still
+   * unavailable reconciles the chain to its top-level filters right away: what the LDS dropped
+   * is closed, and so are the nested instances, which are recreated once RDS recovers.
+   */
+  @Test
+  public void filterState_ldsWhileRdsNotFound_reconcilesToTopLevelFilters() throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      NamedFilterConfig nestingA = new NamedFilterConfig("c", parseComposite(
+          compositeAnyWrapping(executeStatefulChain("a"))));
+      NamedFilterConfig stateful1 =
+          new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1));
+      NamedFilterConfig stateful2 =
+          new NamedFilterConfig(STATEFUL_2, new StatefulFilter.Config(STATEFUL_2));
+      NamedFilterConfig router =
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG);
+
+      // LDS 1 + RDS 1: everything is created.
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(stateful1, stateful2, nestingA, router))), null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, STATEFUL_2, "a").inOrder();
+
+      // RDS 2: resource not found. Nothing is built, so nothing is swept.
+      xdsClient.deliverRdsResourceNotFound(rdsName);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+
+      // LDS 2: STATEFUL_2 dropped while RDS is still unavailable. The chain is reconciled to its
+      // top-level filters: STATEFUL_2 is closed now, and so is the nested "a".
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(stateful1, nestingA, router))), null);
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
+      assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(rds1Snapshot.get(1).isShutdown()).isTrue();
+      assertThat(rds1Snapshot.get(2).isShutdown()).isTrue();
+
+      // RDS 3: the resource is back. STATEFUL_1 is reused, "a" is recreated.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, STATEFUL_2, "a", "a").inOrder();
+      assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(statefulProvider.getAllInstances().get(3).isShutdown()).isFalse();
+      assertThat(severeLogs).isEmpty();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
   }
 
   /**

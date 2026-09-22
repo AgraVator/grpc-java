@@ -816,7 +816,8 @@ final class XdsServerWrapper extends Server {
     /**
      * Acquires the HCM's top-level filters, so that they exist as soon as the LDS is processed and
      * stay alive while its RDS is pending. Nothing is closed here: the chain is reconciled once
-     * its routes are built, in {@link #generatePerRouteInterceptors}.
+     * its routes are built, in {@link #generatePerRouteInterceptors}, or, when RDS has no routes,
+     * in {@link #generateRoutingConfig}.
      */
     // called in syncContext
     private void acquireTopLevelFilters(

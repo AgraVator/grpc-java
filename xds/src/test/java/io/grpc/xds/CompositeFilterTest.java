@@ -1562,7 +1562,9 @@ public class CompositeFilterTest {
           verify(acquirer, atLeastOnce()).apply(entry.namedConfig);
         }
       }
-      // ...and only through it: the composite neither creates nor retires nested instances.
+      // ...and only through it: the composite neither creates nor retires nested instances, not
+      // even when it is closed itself.
+      filter.close();
       verify(fakeProvider, never()).newInstance(any());
       verify(fakeFilter, never()).close();
     }

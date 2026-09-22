@@ -97,12 +97,6 @@ final class CompositeFilter implements Filter {
       };
     }
 
-    // The experimental flag is reported through the side predicates rather than checked in
-    // parseFilterConfig, so that a disabled composite filter looks like any other filter this
-    // build does not support. That distinction matters: XdsListenerResource honours the
-    // http_filter's is_optional flag when a filter is unsupported, but treats a parse error as
-    // fatal, so checking the flag while parsing would NACK the whole listener over an optional
-    // filter. Mirrors ExternalProcessorFilter.Provider.isClientFilter().
     @Override
     public boolean isClientFilter() {
       return isSupported();
@@ -169,13 +163,12 @@ final class CompositeFilter implements Filter {
               "Expected ExtensionWithMatcherPerRoute but got: " + any.getTypeUrl());
         }
         ExtensionWithMatcherPerRoute proto = any.unpack(ExtensionWithMatcherPerRoute.class);
-        // Unlike the top-level config, a per-route override carries nothing but the matcher, so
-        // an absent one is a configuration error rather than a no-op.
-        if (!proto.hasXdsMatcher()) {
-          return ConfigOrError.fromError(
-              "ExtensionWithMatcherPerRoute.xds_matcher: field not set");
-        }
-        return parseMatcherConfig(proto.getXdsMatcher(), context);
+        // A103 requires xds_matcher to be "validated the same way as the corresponding field in
+        // the top-level config", and there an absent matcher is permitted and makes the filter a
+        // no-op. Since the override replaces the top-level matcher outright, an absent one
+        // replaces it with nothing: the filter stops matching on this route. Rejecting it here
+        // would NACK a config the spec calls valid.
+        return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
       }
@@ -198,6 +191,16 @@ final class CompositeFilter implements Filter {
         // sibling branches resolve against one shared instance map. Per A83 filter state is scoped
         // to the HCM instance and keyed by filter name, so the keyspace is deliberately flat: two
         // nested filters of the same name and type are one instance, at any depth.
+        //
+        // A103 does not say how a nested filter's name relates to the HCM-wide namespace A39
+        // defines for http_filters, and the two implementations answer that differently. C-core
+        // keys nested state per filter - gcp_authn uses the instance name, ext_proc uses its
+        // target, most filters keep no state - and so validates nested names not at all. Java
+        // keys every filter uniformly in activeFilters, which is why a name is required here and
+        // must not carry two configs within one tree. The check stops at the tree on purpose:
+        // across two composites, one name resolving to one shared instance that each configures
+        // for itself is what C-core's blackboard does for gcp_authn, so it is tolerated rather
+        // than rejected.
         Map<String, io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> nestedByName =
             new HashMap<>();
         collectDelegates(matcherProto, delegates, nestedByName, context);
@@ -290,12 +293,11 @@ final class CompositeFilter implements Filter {
         collectDelegates(onMatch.getMatcher(), map, nestedByName, context);
       } else if (onMatch.hasAction()) {
         TypedExtensionConfig action = onMatch.getAction();
-        // Keyed by the action message rather than by action.name: `name` is documentation only
-        // ("is not used to select the extension") and the proto imposes no uniqueness rule, so
-        // two distinct actions may share a name, and gRPC-Java does not require the name to be
-        // set at all. Identical actions still collapse to one entry, which is intended - and it
-        // also keeps an action repeated across branches from tripping the nested name checks in
-        // createFilterDelegate, since it is only visited once.
+        // Keyed by the action message rather than by action.name: `name` is an opaque identifier
+        // that "is not used to select the extension", and nothing constrains it to be unique
+        // across actions, so two distinct actions may legitimately share one. Identical actions
+        // collapse to a single entry, which is intended - the same action reached from several
+        // matcher branches is one delegate, parsed once.
         if (!map.containsKey(action)) {
           FilterDelegate delegate = createFilterDelegate(action, nestedByName, context);
           if (delegate != null) {
@@ -305,6 +307,11 @@ final class CompositeFilter implements Filter {
       }
     }
 
+    // Both side predicates delegate here rather than parseFilterConfig checking the flag, so that
+    // a disabled composite filter looks like any other filter this build does not support. That
+    // distinction matters: XdsListenerResource honours the http_filter's is_optional flag when a
+    // filter is unsupported, but treats a parse error as fatal, so checking the flag while
+    // parsing would NACK the whole listener over an optional filter.
     private boolean isSupported() {
       return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", false);
     }
@@ -764,9 +771,10 @@ final class CompositeFilter implements Filter {
 
   private static CompositeFilterConfig getEffectiveConfig(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    // A per-route override replaces the top-level config outright, per A103. No null-matcher
-    // guard is needed: parseFilterConfigOverride rejects an override without a matcher, so an
-    // override that reaches here always has one.
+    // A per-route override replaces the top-level config outright, per A103 - including its
+    // matcher, which may legitimately be absent on either path. Callers guard for that: both
+    // buildClientInterceptor and buildServerInterceptor return no interceptor when the effective
+    // matcher is null, which is the no-op passthrough A103 asks for.
     return (CompositeFilterConfig) (overrideConfig != null ? overrideConfig : config);
   }
 

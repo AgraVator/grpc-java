@@ -371,8 +371,8 @@ public class CompositeFilterTest {
 
     @Test
     public void parseFilterConfig_actionsSharingANameAreBothRetained() {
-      // An action's `name` is documentation only -- the proto says it "is not used to select the
-      // extension" -- and nothing requires it to be unique or even set. Keying delegates by name
+      // An action's `name` is documentation only. The proto says it "is not used to select the
+      // extension", and nothing requires it to be unique or even set. Keying delegates by name
       // silently dropped the second action, so a matcher branch could resolve to the wrong child
       // filter, or to none at all.
       Matcher.OnMatch first = createExecuteActionNamed("dup", "childA", FAKE_TYPE_URL);
@@ -3384,7 +3384,7 @@ public class CompositeFilterTest {
      * GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER environment variable."
      *
      * <p>This must be set before the JUnit rules run, because {@link DataPlaneRule} starts the xDS
-     * server - and parses its LDS - during {@code starting()}.
+     * server and parses its LDS during {@code starting()}.
      */
     @BeforeClass
     public static void enableCompositeFilter() {
@@ -3828,8 +3828,8 @@ public class CompositeFilterTest {
      * <p>Unlike the client tests, the xDS server is already running and serving the default
      * by the time a test body starts, so an assertion made too early can pass against the *old*
      * config. Every matcher in this class keys off {@link #MATCH_HEADER} and declares no
-     * {@code on_no_match}, so a header-less RPC returns UNAVAILABLE once - and only once - the
-     * composite filter is live. That makes it a reliable barrier.
+     * {@code on_no_match}, so a header-less RPC returns UNAVAILABLE exactly when the composite
+     * filter is live. That makes it a reliable barrier.
      */
     private void awaitCompositeFilterActive() {
       long deadline = System.nanoTime()

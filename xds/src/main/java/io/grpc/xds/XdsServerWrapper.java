@@ -910,9 +910,9 @@ final class XdsServerWrapper extends Server {
         }
       }
 
-      // Every route of the chain has been built, so every filter the update reaches - top-level,
-      // or nested possibly only through a per-route override - has been acquired. Anything else
-      // is unused.
+      // Every route of the chain has been built, so every filter this update reaches, including
+      // nested filters reached only through a per-route override, has been acquired. Anything
+      // else is unused.
       chainFilters.shutdownExcept(chainFilters.reached);
       return perRouteInterceptors.buildOrThrow();
     }
@@ -1056,7 +1056,7 @@ final class XdsServerWrapper extends Server {
           }
 
           // The default chain's filters live in their own map, not under a chain name in
-          // activeFilters, so resolve it separately - otherwise a default chain served by RDS
+          // activeFilters, so resolve it separately. Otherwise a default chain served by RDS
           // would look like a chain with no filters at all.
           ChainFilters chainFilters = filterChain.equals(defaultFilterChain)
               ? activeFiltersDefaultChain

@@ -64,10 +64,10 @@ import javax.annotation.Nullable;
  * each RPC.
  *
  * <p>The composite holds no instance state of its own. Nested filter instances are owned by the
- * resolver's or server's filter registry - the same flat map that owns the top-level filters - and
- * are shared HCM-wide by {@code name_type}: a nested filter and a top-level filter with the same
- * name and type, or the same name nested under two composites, are one instance. The composite
- * obtains them through {@link FilterContext#filterAcquirer()} while building interceptors.
+ * same registry in the resolver or server that owns the top-level filters, keyed by filter name
+ * and type. Filters with the same name and type share one instance, whether nested or top-level.
+ * The composite obtains them through {@link FilterContext#filterAcquirer()} when building
+ * interceptors.
  */
 final class CompositeFilter implements Filter {
 
@@ -296,7 +296,7 @@ final class CompositeFilter implements Filter {
         // Keyed by the action message rather than by action.name: `name` is an opaque identifier
         // that "is not used to select the extension", and nothing constrains it to be unique
         // across actions, so two distinct actions may legitimately share one. Identical actions
-        // collapse to a single entry, which is intended - the same action reached from several
+        // collapse to a single entry, which is intended: the same action reached from several
         // matcher branches is one delegate, parsed once.
         if (!map.containsKey(action)) {
           FilterDelegate delegate = createFilterDelegate(action, context);
@@ -321,8 +321,8 @@ final class CompositeFilter implements Filter {
       try {
         Any actionAny = config.getTypedConfig();
         if (actionAny.is(SkipFilter.class)) {
-          // SkipFilter declares no fields, so there is nothing to read - but the payload is still
-          // unpacked, so that malformed wire bytes are rejected rather than silently treated as
+          // SkipFilter declares no fields, so there is nothing to read. The payload is still
+          // unpacked so that malformed wire bytes are rejected rather than silently treated as
           // a skip.
           try {
             SkipFilter unused = actionAny.unpack(SkipFilter.class);
@@ -366,16 +366,15 @@ final class CompositeFilter implements Filter {
             : childConfigs) {
           String name = childFilterConfig.getName();
           // TypedExtensionConfig.name carries `(validate.rules).string = {min_len: 1}`, and the
-          // name is what nested filter instances are keyed by, so an absent one is not merely
-          // invalid but unusable - every anonymous filter of a given type would alias onto one
-          // instance. (C-core does not check this; it is a deliberate, stricter check.)
+          // name is what nested filter instances are keyed by. Without it, every anonymous filter
+          // of a given type would alias onto one instance. C-core does not check this.
           //
           // Nothing else about the name is validated. Nested instances live in the same HCM-wide
-          // map as top-level ones, keyed by name and type, so a repeated name *means* a shared
-          // instance - the A83 mechanism for sharing state such as a gcp_authn cache across
-          // several match arms. A collision check here could only ever see one composite's
-          // config, never a same-named top-level filter, a sibling composite or an RDS override
-          // parsed as a separate resource, and C-core accepts all of these.
+          // map as top-level ones, keyed by name and type, so a repeated name means a shared
+          // instance (the A83 mechanism for sharing state such as a gcp_authn cache). A collision
+          // check here could only see one composite's config, never a same-named top-level
+          // filter, a sibling composite or an RDS override parsed as a separate resource, and
+          // C-core accepts all of these.
           if (name.isEmpty()) {
             throw new IllegalArgumentException("Nested filter is missing a name: "
                 + childFilterConfig.getTypedConfig().getTypeUrl());
@@ -742,9 +741,9 @@ final class CompositeFilter implements Filter {
 
   /**
    * The nested filter instance for {@code entry}, obtained from the registry that owns every
-   * filter instance of this HCM. The registry creates it on first use, reuses it across updates -
-   * a nested filter may hold a cache or a side channel that exists precisely to survive them - and
-   * closes it once an update no longer reaches it.
+   * filter instance of this HCM. The registry creates it on first use, reuses it across updates
+   * so that state such as a cache or a side channel survives them, and closes it once an update
+   * no longer reaches it.
    */
   private Filter nestedFilter(DelegateEntry entry) {
     return Preconditions.checkNotNull(filterAcquirer,
@@ -755,7 +754,7 @@ final class CompositeFilter implements Filter {
 
   private static CompositeFilterConfig getEffectiveConfig(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    // A per-route override replaces the top-level config outright, per A103 - including its
+    // A per-route override replaces the top-level config outright, per A103, including its
     // matcher, which may legitimately be absent on either path. Callers guard for that: both
     // buildClientInterceptor and buildServerInterceptor return no interceptor when the effective
     // matcher is null, which is the no-op passthrough A103 asks for.

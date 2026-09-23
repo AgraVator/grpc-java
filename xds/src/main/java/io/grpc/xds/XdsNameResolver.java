@@ -741,8 +741,8 @@ final class XdsNameResolver extends NameResolver {
         }
       }
       updateRoutes(update, virtualHost, streamDurationNano, filterConfigs);
-      // Only now has every route been built, so every nested filter the update reaches - possibly
-      // only through a per-route override - has been acquired. Anything else is unused.
+      // Every route has been built, so every filter this update reaches, including nested filters
+      // reached only through a per-route override, has been acquired. Anything else is unused.
       shutdownFiltersExcept(reached);
     }
 

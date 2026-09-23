@@ -733,6 +733,12 @@ final class CompositeFilter implements Filter {
     return Collections.unmodifiableList(list);
   }
 
+  /**
+   * Relies on the {@link ClientCall} contract: {@code start()} must complete before any method
+   * other than {@code cancel()} is called, so a {@code cancel()} racing {@code start()} from
+   * another thread is outside the contract. The delegate is published before it is started, so
+   * whatever the listener sends from inside {@code start()} already reaches it.
+   */
   private static final class CompositeClientCall<ReqT, RespT>
       extends ForwardingClientCall<ReqT, RespT> {
     private final MethodDescriptor<ReqT, RespT> method;
@@ -740,8 +746,7 @@ final class CompositeFilter implements Filter {
     private final Channel next;
     private final UnifiedMatcher matcher;
     private final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> delegatesMap;
-    // Published before it is started, so that anything the listener sends from inside start()
-    // already reaches it. Null until start().
+    // Null until start().
     private volatile ClientCall<ReqT, RespT> delegate;
     // cancel() is the only method allowed before start(); it is recorded and reported from start().
     private Status cancelledBeforeStart;

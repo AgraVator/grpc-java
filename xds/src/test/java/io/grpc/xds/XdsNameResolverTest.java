@@ -2133,6 +2133,38 @@ public class XdsNameResolverTest {
   }
 
   /**
+   * An override for a filter name the HCM does not have is never applied, so the nested filter it
+   * declares is not created; the same override under the composite's name creates it.
+   */
+  @Test
+  public void filterState_overrideOfAbsentTopLevelFilter_nestedFilterNotCreated() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+      xdsClient.deliverLdsUpdateForRdsNameWithFilters(RDS_RESOURCE_NAME, ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("a")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+      CompositeFilter.CompositeFilterConfig override =
+          parseCompositeOverride(executeStatefulChain("x"));
+
+      xdsClient.deliverRdsUpdate(RDS_RESOURCE_NAME,
+          filterStateTestTwoRouteVhost(ImmutableMap.of("not-in-hcm", override)));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a");
+
+      xdsClient.deliverRdsUpdate(RDS_RESOURCE_NAME,
+          filterStateTestTwoRouteVhost(ImmutableMap.of("c", override)));
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "x");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
    * With the composite flag off, an optional RDS override for the composite is dropped when the
    * route is parsed, so the StatefulFilter it nests is never instantiated.
    */

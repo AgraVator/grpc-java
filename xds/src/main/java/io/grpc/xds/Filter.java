@@ -28,8 +28,11 @@ import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
 import javax.annotation.Nullable;
@@ -56,26 +59,29 @@ interface Filter extends Closeable {
 
   /**
    * Collects every filter config that needs an instance: the HCM's top-level configs plus the
-   * nested configs of those and of every per-route override in {@code vhosts}, recursively.
+   * nested configs of those and of their per-route overrides in {@code vhosts}, recursively.
    */
   static List<NamedFilterConfig> collectAllFilterConfigs(
       @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
     List<NamedFilterConfig> result = new ArrayList<>();
-    if (hcmConfigs != null) {
-      for (NamedFilterConfig config : hcmConfigs) {
-        result.add(config);
-        collectNestedFilterConfigs(config.filterConfig, result);
-      }
+    if (hcmConfigs == null) {
+      return result;
+    }
+    Set<String> hcmNames = new HashSet<>();
+    for (NamedFilterConfig config : hcmConfigs) {
+      result.add(config);
+      hcmNames.add(config.name);
+      collectNestedFilterConfigs(config.filterConfig, result);
     }
     if (vhosts != null) {
       for (VirtualHost vhost : vhosts) {
-        collectNestedFilterConfigs(vhost.filterConfigOverrides().values(), result);
+        collectNestedFilterConfigs(vhost.filterConfigOverrides(), hcmNames, result);
         for (VirtualHost.Route route : vhost.routes()) {
-          collectNestedFilterConfigs(route.filterConfigOverrides().values(), result);
+          collectNestedFilterConfigs(route.filterConfigOverrides(), hcmNames, result);
           if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
             for (VirtualHost.Route.RouteAction.ClusterWeight weight
                 : route.routeAction().weightedClusters()) {
-              collectNestedFilterConfigs(weight.filterConfigOverrides().values(), result);
+              collectNestedFilterConfigs(weight.filterConfigOverrides(), hcmNames, result);
             }
           }
         }
@@ -84,10 +90,16 @@ interface Filter extends Closeable {
     return result;
   }
 
-  static void collectNestedFilterConfigs(
-      Iterable<FilterConfig> configs, List<NamedFilterConfig> result) {
-    for (FilterConfig config : configs) {
-      collectNestedFilterConfigs(config, result);
+  /**
+   * Collects the nested configs of the overrides for filters in {@code hcmNames}. An override
+   * whose top-level filter is absent is never applied, so nothing is instantiated for it.
+   */
+  static void collectNestedFilterConfigs(Map<String, FilterConfig> overrides,
+      Set<String> hcmNames, List<NamedFilterConfig> result) {
+    for (Map.Entry<String, FilterConfig> override : overrides.entrySet()) {
+      if (hcmNames.contains(override.getKey())) {
+        collectNestedFilterConfigs(override.getValue(), result);
+      }
     }
   }
 

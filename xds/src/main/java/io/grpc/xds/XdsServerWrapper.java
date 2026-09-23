@@ -871,7 +871,7 @@ final class XdsServerWrapper extends Server {
       syncContext.throwIfNotInThisSynchronizationContext();
 
       checkNotNull(chainFilters, "chainFilters");
-      chainFilters.reached.clear();
+      acquireTopLevelFilters(chainFilters, filterConfigs);
       ImmutableMap.Builder<Route, ServerInterceptor> perRouteInterceptors =
           new ImmutableMap.Builder<>();
 

@@ -2174,6 +2174,48 @@ public class XdsServerWrapperTest {
     assertThat(liveStateful2).hasSize(1);
   }
 
+  /** An RDS whose virtual host has no routes must not close the chain's top-level filters. */
+  @Test
+  public void filterState_rdsWithNoRoutes_keepsTopLevelFilters() throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+              new NamedFilterConfig("c", parseComposite(
+                  compositeAnyWrapping(executeStatefulChain("a")))),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))),
+          null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+
+      // RDS 1: a route, so the nested "a" is created too.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
+      StatefulFilter topLevel = rds1Snapshot.get(0);
+
+      // RDS 2: the virtual host has no routes. The top-level filter is still in the HCM.
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create("stateful-vhost",
+          ImmutableList.of("stateful.test.example.com"), ImmutableList.of(), NO_FILTER_OVERRIDES));
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
+      assertThat(topLevel.isShutdown()).isFalse();
+
+      // RDS 3: routes are back; the top-level instance is reused.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulProvider.getAllInstances().get(0)).isSameInstanceAs(topLevel);
+      assertThat(topLevel.isShutdown()).isFalse();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
   /**
    * An RDS error closes nothing, but an LDS update processed while the chain's RDS is still
    * unavailable reconciles the chain to its top-level filters right away: what the LDS dropped

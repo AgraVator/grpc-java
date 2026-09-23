@@ -51,7 +51,11 @@ interface Filter extends Closeable {
   interface FilterConfig {
     String typeUrl();
 
-    /** Filter configs this config runs as nested filters; each needs its own instance. */
+    /**
+     * Filter configs this config runs as nested filters. Each needs an instance, shared by
+     * {@link NamedFilterConfig#filterStateKey()} with every other config that declares the same
+     * name and type.
+     */
     default List<NamedFilterConfig> nestedFilterConfigs() {
       return Collections.emptyList();
     }

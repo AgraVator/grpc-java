@@ -3007,89 +3007,118 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void noopCallMethods_andCancelBeforeStart_andNullChildInterceptor_andFineLogging()
-        throws Exception {
+    public void cancelBeforeStart_realCallNeverCreatedAndCallIsNoop() {
+      ClientInterceptor clientInterceptor = newFilter("composite").buildClientInterceptor(
+          passthroughCompositeConfig(), null, mock(ScheduledExecutorService.class));
+      Channel nextChannel = mock(Channel.class);
+      ClientCall<Void, Void> call = clientInterceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT, nextChannel);
+
+      call.cancel("cancel before start", null);
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      call.start(listener, new Metadata());
+
+      verify(nextChannel, never()).newCall(any(), any());
+      ArgumentCaptor<Status> statusCap = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCap.capture(), any(Metadata.class));
+      assertThat(statusCap.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
+      // The cancelled call ignores everything else.
+      call.request(2);
+      call.sendMessage(null);
+      call.halfClose();
+      call.cancel("again", null);
+    }
+
+    @Test
+    public void startTwice_throwsIllegalState() {
+      ClientInterceptor clientInterceptor = newFilter("composite").buildClientInterceptor(
+          passthroughCompositeConfig(), null, mock(ScheduledExecutorService.class));
+      ClientCall<Void, Void> call = clientInterceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT, passthroughChannel());
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      call.start(listener, new Metadata());
+
+      assertThrows(IllegalStateException.class, () -> call.start(listener, new Metadata()));
+    }
+
+    @Test
+    public void nullChildInterceptor_passesThroughOnBothSides() {
+      CompositeFilter.CompositeFilterConfig config = passthroughCompositeConfig();
+      CompositeFilter filter = newFilter("composite");
+
+      ServerInterceptor serverInterceptor = filter.buildServerInterceptor(config, null);
+      ServerCall<Void, Void> serverCall = mock(ServerCall.class);
+      when(serverCall.getMethodDescriptor()).thenReturn(createMockMethod());
+      ServerCallHandler<Void, Void> nextHandler = mock(ServerCallHandler.class);
+      serverInterceptor.interceptCall(serverCall, new Metadata(), nextHandler);
+      verify(nextHandler).startCall(eq(serverCall), any(Metadata.class));
+
+      ClientInterceptor clientInterceptor = filter.buildClientInterceptor(
+          config, null, mock(ScheduledExecutorService.class));
+      Channel nextChannel = mock(Channel.class);
+      when(nextChannel.newCall(any(), any())).thenReturn(mock(ClientCall.class));
+      // The authority comes from the CallOptions when set, else from the channel.
+      ClientCall<Void, Void> call = clientInterceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT.withAuthority("override-auth"), nextChannel);
+      call.start(mock(ClientCall.Listener.class), new Metadata());
+      verify(nextChannel).newCall(any(), any());
+    }
+
+    @Test
+    public void fineLogging_doesNotAffectCalls() {
       java.util.logging.Logger julLogger =
           java.util.logging.Logger.getLogger(CompositeFilter.class.getName());
       java.util.logging.Level oldLevel = julLogger.getLevel();
       julLogger.setLevel(java.util.logging.Level.FINE);
       try {
-        // Child filter returning null interceptor (passthrough) on both client and server
-        when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(null);
-        when(fakeFilter.buildServerInterceptor(any(), any())).thenReturn(null);
-
-        Matcher matcher = matcherFallingThroughTo(createExecuteAction("c1", FAKE_TYPE_URL))
-            .build();
-        ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
-            provider.parseFilterConfig(
-                Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-
+        CompositeFilter.CompositeFilterConfig config = passthroughCompositeConfig();
         CompositeFilter filter = newFilter("composite");
-        ClientInterceptor clientInterceptor = filter.buildClientInterceptor(
-            res.config, null, mock(ScheduledExecutorService.class));
-        ServerInterceptor serverInterceptor = filter.buildServerInterceptor(res.config, null);
 
-        // Server call with FINE logging and null child interceptor
+        ServerInterceptor serverInterceptor = filter.buildServerInterceptor(config, null);
         ServerCall<Void, Void> serverCall = mock(ServerCall.class);
         when(serverCall.getMethodDescriptor()).thenReturn(createMockMethod());
         ServerCallHandler<Void, Void> nextHandler = mock(ServerCallHandler.class);
         serverInterceptor.interceptCall(serverCall, new Metadata(), nextHandler);
         verify(nextHandler).startCall(eq(serverCall), any(Metadata.class));
 
-        // Client call cancelled before start: the real call is never created.
-        Channel nextChannel = mock(Channel.class);
+        ClientInterceptor clientInterceptor = filter.buildClientInterceptor(
+            config, null, mock(ScheduledExecutorService.class));
         ClientCall<Void, Void> call = clientInterceptor.interceptCall(
-            createMockMethod(), CallOptions.DEFAULT, nextChannel);
-        call.cancel("cancel before start", null);
-        ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
-        call.start(listener, new Metadata());
-        verify(nextChannel, never()).newCall(any(), any());
-
-        ArgumentCaptor<Status> statusCap = ArgumentCaptor.forClass(Status.class);
-        verify(listener).onClose(statusCap.capture(), any(Metadata.class));
-        assertThat(statusCap.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
-
-        // Exercise NOOP_CALL methods on the cancelled call
-        call.request(2);
-        call.sendMessage(null);
-        call.halfClose();
-        call.cancel("again", null);
-
-        // Starting an already-started call throws IllegalStateException
-        assertThrows(IllegalStateException.class, () -> call.start(listener, new Metadata()));
-
-        // Exercise CallOptions authority override branch (callOptions.getAuthority() != null)
-        Channel passthroughNext = new Channel() {
-          @Override
-          public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
-              MethodDescriptor<ReqT, RespT> m, CallOptions co) {
-            return mock(ClientCall.class);
-          }
-
-          @Override
-          public String authority() {
-            return "default-auth";
-          }
-        };
-        ClientCall<Void, Void> authCall = clientInterceptor.interceptCall(
-            createMockMethod(), CallOptions.DEFAULT.withAuthority("override-auth"),
-            passthroughNext);
-        authCall.start(mock(ClientCall.Listener.class), new Metadata());
-
-        // Exercise NOOP_CALL.start directly so 100% of methods/lines in CompositeFilter are covered
-        java.lang.reflect.Field noopField = null;
-        for (Class<?> inner : CompositeFilter.class.getDeclaredClasses()) {
-          if (inner.getSimpleName().equals("CompositeClientCall")) {
-            noopField = inner.getDeclaredField("NOOP_CALL");
-            noopField.setAccessible(true);
-            ClientCall<?, ?> noop = (ClientCall<?, ?>) noopField.get(null);
-            noop.start(null, null);
-            break;
-          }
-        }
+            createMockMethod(), CallOptions.DEFAULT, passthroughChannel());
+        call.start(mock(ClientCall.Listener.class), new Metadata());
       } finally {
         julLogger.setLevel(oldLevel);
       }
+    }
+
+    /**
+     * A composite config whose matcher always runs a child filter that builds no interceptor on
+     * either side, so the composite passes RPCs straight through.
+     */
+    private CompositeFilter.CompositeFilterConfig passthroughCompositeConfig() {
+      when(fakeFilter.buildClientInterceptor(any(), any(), any())).thenReturn(null);
+      when(fakeFilter.buildServerInterceptor(any(), any())).thenReturn(null);
+      Matcher matcher = matcherFallingThroughTo(createExecuteAction("c1", FAKE_TYPE_URL))
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> res = provider.parseFilterConfig(
+          Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(res.errorDetail).isNull();
+      return res.config;
+    }
+
+    private static Channel passthroughChannel() {
+      return new Channel() {
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
+            MethodDescriptor<ReqT, RespT> m, CallOptions co) {
+          return mock(ClientCall.class);
+        }
+
+        @Override
+        public String authority() {
+          return "default-auth";
+        }
+      };
     }
 
     /** C-core accepts an empty nested name; the instance is then keyed by its type alone. */

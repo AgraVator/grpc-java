@@ -222,6 +222,7 @@ public class XdsNameResolverTest {
   ArgumentCaptor<Status> errorCaptor;
   private XdsNameResolver resolver;
   private CompositeFilter.Provider compositeProvider;
+  private FilterRegistry compositeRegistry;
   private TestCall<?, ?> testCall;
   private boolean originalEnableTimeout;
   private String targetUri = AUTHORITY;
@@ -2132,6 +2133,40 @@ public class XdsNameResolverTest {
   }
 
   /**
+   * With the composite flag off, an optional RDS override for the composite is dropped when the
+   * route is parsed, so the StatefulFilter it nests is never instantiated.
+   */
+  @Test
+  public void filterState_compositeOverrideWithFlagOff_nestedFilterNotCreated() {
+    assertThat(System.getProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER")).isNull();
+    StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+    FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+    xdsClient.deliverLdsUpdateForRdsNameWithFilters(RDS_RESOURCE_NAME, ImmutableList.of(
+        new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+        new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+
+    Map<String, Any> rawOverrides = ImmutableMap.of("c", Any.pack(
+        io.envoyproxy.envoy.config.route.v3.FilterConfig.newBuilder()
+            .setIsOptional(true)
+            .setConfig(Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+                .setXdsMatcher(matcherFallingThroughTo(executeStatefulChain("a")))
+                .build()))
+            .build()));
+    StructOrError<Map<String, FilterConfig>> parsed =
+        XdsRouteConfigureResource.parseOverrideFilterConfigs(rawOverrides, compositeRegistry,
+            new XdsResourceType.Args(
+                ServerInfo.create("test_target", Collections.emptyMap(), false, true, false, false),
+                "1.0", null, bootstrapInfo, null, null));
+    assertThat(parsed.getErrorDetail()).isNull();
+
+    xdsClient.deliverRdsUpdate(RDS_RESOURCE_NAME,
+        filterStateTestTwoRouteVhost(ImmutableMap.copyOf(parsed.getStruct())));
+    createAndDeliverClusterUpdates(xdsClient, cluster1);
+    assertClusterResolutionResult(call1, cluster1);
+    assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1);
+  }
+
+  /**
    * Starts the resolver with a registry holding StatefulFilter, the composite filter, the router
    * and {@code extraProviders}. The composite resolves nested filter types through that same
    * registry.
@@ -2139,12 +2174,12 @@ public class XdsNameResolverTest {
   private StatefulFilter.Provider filterStateTestSetupResolverWithComposite(
       Filter.Provider... extraProviders) {
     StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
-    FilterRegistry filterRegistry = FilterRegistry.newRegistry();
-    compositeProvider = new CompositeFilter.Provider(filterRegistry::get);
-    filterRegistry.register(statefulProvider, compositeProvider, ROUTER_FILTER_PROVIDER);
-    filterRegistry.register(extraProviders);
+    compositeRegistry = FilterRegistry.newRegistry();
+    compositeProvider = new CompositeFilter.Provider(compositeRegistry::get);
+    compositeRegistry.register(statefulProvider, compositeProvider, ROUTER_FILTER_PROVIDER);
+    compositeRegistry.register(extraProviders);
     resolver = new XdsNameResolver(targetUri, null, AUTHORITY, null, serviceConfigParser,
-        syncContext, scheduler, xdsClientPoolFactory, mockRandom, filterRegistry, rawBootstrap,
+        syncContext, scheduler, xdsClientPoolFactory, mockRandom, compositeRegistry, rawBootstrap,
         metricRecorder, nameResolverArgs);
     resolver.start(mockListener);
     return statefulProvider;

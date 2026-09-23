@@ -1607,6 +1607,50 @@ public class GrpcXdsClientImplDataTest {
   }
 
   @Test
+  public void parseOverrideFilterConfigs_supportedOnNeitherSide() {
+    FilterRegistry registry = FilterRegistry.newRegistry();
+    registry.register(new io.grpc.xds.Filter.Provider() {
+      @Override
+      public String[] typeUrls() {
+        return new String[] {"type.googleapis.com/google.protobuf.StringValue"};
+      }
+
+      @Override
+      public io.grpc.xds.Filter newInstance(FilterContext context) {
+        throw new AssertionError("must not be instantiated");
+      }
+
+      @Override
+      public ConfigOrError<? extends FilterConfig> parseFilterConfig(
+          Message rawProtoMessage, FilterConfigParseContext context) {
+        throw new AssertionError("must not be parsed");
+      }
+
+      @Override
+      public ConfigOrError<? extends FilterConfig> parseFilterConfigOverride(
+          Message rawProtoMessage, FilterConfigParseContext context) {
+        throw new AssertionError("must not be parsed");
+      }
+    });
+    Map<String, Any> optionalOverride = ImmutableMap.of(
+        "flagged.filter",
+        Any.pack(io.envoyproxy.envoy.config.route.v3.FilterConfig.newBuilder()
+            .setIsOptional(true).setConfig(Any.pack(StringValue.of("string value")))
+            .build()));
+    assertThat(XdsRouteConfigureResource
+        .parseOverrideFilterConfigs(optionalOverride, registry, getXdsResourceTypeArgs(true))
+        .getStruct()).isEmpty();
+
+    Map<String, Any> requiredOverride = ImmutableMap.of(
+        "flagged.filter", Any.pack(StringValue.of("string value")));
+    assertThat(XdsRouteConfigureResource
+        .parseOverrideFilterConfigs(requiredOverride, registry, getXdsResourceTypeArgs(true))
+        .getErrorDetail()).isEqualTo(
+            "HttpFilter [flagged.filter]"
+                + "(type.googleapis.com/google.protobuf.StringValue) is required but unsupported");
+  }
+
+  @Test
   public void parseHttpConnectionManager_xffNumTrustedHopsUnsupported()
       throws ResourceInvalidException {
     @SuppressWarnings("deprecation")

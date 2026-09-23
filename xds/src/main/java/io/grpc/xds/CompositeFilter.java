@@ -798,12 +798,11 @@ final class CompositeFilter implements Filter {
     private final Channel next;
     private final UnifiedMatcher matcher;
     private final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> delegatesMap;
-    private final Object lock = new Object();
-    private ClientCall<ReqT, RespT> delegate;
-    private boolean started;
-    private boolean realCallStarted;
-    private Status cancelStatus;
-    private int pendingRequests;
+    // Published before it is started, so that anything the listener sends from inside start()
+    // already reaches it. Null until start().
+    private volatile ClientCall<ReqT, RespT> delegate;
+    // cancel() is the only method allowed before start(); it is recorded and reported from start().
+    private Status cancelledBeforeStart;
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
         Channel next, UnifiedMatcher matcher,
@@ -840,59 +839,28 @@ final class CompositeFilter implements Filter {
 
     @Override
     protected ClientCall<ReqT, RespT> delegate() {
-      synchronized (lock) {
-        Preconditions.checkState(started, "Not started");
-        return delegate != null ? delegate : noopCall();
-      }
-    }
-
-    @Override
-    public void request(int numMessages) {
-      ClientCall<ReqT, RespT> callToRequest;
-      synchronized (lock) {
-        Preconditions.checkState(started, "Not started");
-        if (!realCallStarted) {
-          // start() is still resolving the matcher tree or starting the real call. request() is
-          // the one ClientCall method that may be called from another thread, so the demand has
-          // to be remembered and replayed once the real call has been started; dropping it on the
-          // no-op call would stall the RPC forever.
-          pendingRequests += numMessages;
-          return;
-        }
-        callToRequest = delegate;
-      }
-      callToRequest.request(numMessages);
+      ClientCall<ReqT, RespT> call = delegate;
+      Preconditions.checkState(call != null, "Not started");
+      return call;
     }
 
     @Override
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
-      ClientCall<ReqT, RespT> callToCancel = null;
-      synchronized (lock) {
-        if (cancelStatus == null) {
-          cancelStatus = Status.CANCELLED.withDescription(message).withCause(cause);
-        }
-        if (realCallStarted) {
-          callToCancel = delegate;
-        }
+      ClientCall<ReqT, RespT> call = delegate;
+      if (call == null) {
+        cancelledBeforeStart = Status.CANCELLED.withDescription(message).withCause(cause);
+        return;
       }
-      if (callToCancel != null) {
-        callToCancel.cancel(message, cause);
-      }
+      call.cancel(message, cause);
     }
 
     @Override
     public void start(Listener<RespT> responseListener, Metadata headers) {
-      Status cancelledBeforeStart;
-      synchronized (lock) {
-        Preconditions.checkState(!started, "Already started");
-        started = true;
-        cancelledBeforeStart = cancelStatus;
-        if (cancelledBeforeStart != null) {
-          delegate = noopCall();
-        }
-      }
+      Preconditions.checkState(delegate == null, "Already started");
       if (cancelledBeforeStart != null) {
-        responseListener.onClose(cancelledBeforeStart, new Metadata());
+        // Never create the real call: it would only be cancelled, and an unstarted call holds no
+        // transport resources.
+        failCall(responseListener, cancelledBeforeStart);
         return;
       }
 
@@ -949,49 +917,14 @@ final class CompositeFilter implements Filter {
       ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
           ? next.newCall(method, callOptions)
           : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
-
-      Status cancelledMidStart;
-      synchronized (lock) {
-        cancelledMidStart = cancelStatus;
-        delegate = cancelledMidStart != null ? noopCall() : realCall;
-      }
-      if (cancelledMidStart != null) {
-        // Deliberately do not start realCall. ClientCallImpl.startInternal rejects a call that was
-        // already cancelled, and starting it only to cancel it would open a stream and send
-        // request headers for an RPC nobody is waiting for. An unstarted call holds no transport
-        // resources, so dropping it leaks nothing; we only have to close the listener ourselves.
-        responseListener.onClose(cancelledMidStart, new Metadata());
-        return;
-      }
-
-      // The delegate is published before it is started: with direct executors the transport may
-      // deliver onReady inside start(), and whatever the listener then sends must reach realCall.
-      // Until realCallStarted is set, cancel() only records cancelStatus and request() buffers
-      // its demand, so neither reaches a call that has not finished starting.
+      // With a direct executor the transport may deliver onReady inside start(), and whatever the
+      // listener then sends must reach realCall.
+      delegate = realCall;
       realCall.start(responseListener, headers);
-
-      int bufferedRequests;
-      Status cancelledDuringStart;
-      synchronized (lock) {
-        realCallStarted = true;
-        bufferedRequests = pendingRequests;
-        pendingRequests = 0;
-        cancelledDuringStart = cancelStatus;
-      }
-      if (bufferedRequests > 0) {
-        realCall.request(bufferedRequests);
-      }
-      if (cancelledDuringStart != null) {
-        // A cancel raced with start() and found realCallStarted unset, so it never reached
-        // realCall. Any cancel arriving after this block cancels the delegate itself.
-        realCall.cancel(cancelledDuringStart.getDescription(), cancelledDuringStart.getCause());
-      }
     }
 
     private void failCall(Listener<RespT> responseListener, Status status) {
-      synchronized (lock) {
-        delegate = noopCall();
-      }
+      delegate = noopCall();
       responseListener.onClose(status, new Metadata());
     }
   }

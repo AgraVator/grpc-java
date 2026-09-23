@@ -1823,8 +1823,8 @@ public class XdsNameResolverTest {
   }
 
   /**
-   * A nested filter reachable only through a weighted cluster's override is acquired while the
-   * routes are built, so the sweep keeps it; dropping the override closes it.
+   * A nested filter declared only by a weighted cluster's override is created with it and closed
+   * when the override is dropped; the one declared by the HCM exists throughout.
    */
   @Test
   public void filterState_nestedFilterOfWeightedClusterOverride_createdAndClosedWithIt() {
@@ -1842,16 +1842,17 @@ public class XdsNameResolverTest {
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x")))), filterConfigs);
       createAndDeliverClusterUpdates(xdsClient, cluster1);
       assertClusterResolutionResult(call1, cluster1);
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x");
-      StatefulFilter nestedX = statefulProvider.getAllInstances().get(0);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "x").inOrder();
+      StatefulFilter nestedA = statefulProvider.getAllInstances().get(0);
+      StatefulFilter nestedX = statefulProvider.getAllInstances().get(1);
 
-      // LDS 2: the override is gone, so "a" is reached and "x" no longer is.
+      // LDS 2: the override is gone, so "x" is no longer declared; "a" is reused.
       xdsClient.deliverLdsUpdateWithFilters(
           filterStateTestWeightedClusterVhost(NO_FILTER_OVERRIDES), filterConfigs);
       assertClusterResolutionResult(call1, cluster1);
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x", "a").inOrder();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "x").inOrder();
+      assertThat(nestedA.isShutdown()).isFalse();
       assertThat(nestedX.isShutdown()).isTrue();
-      assertThat(statefulProvider.getAllInstances().get(1).isShutdown()).isFalse();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }
@@ -2060,9 +2061,9 @@ public class XdsNameResolverTest {
     }
   }
 
-  /** If building the routes throws, no sweep runs, so nothing is closed. */
+  /** The registry is reconciled before the routes are built, even if building them then throws. */
   @Test
-  public void filterState_noShutdownWhenBuildingRoutesThrows() {
+  public void filterState_droppedFiltersClosedEvenWhenBuildingRoutesThrows() {
     System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     try {
       String throwingTypeUrl = "type.googleapis.com/grpc.test.ThrowingFilter";
@@ -2092,7 +2093,7 @@ public class XdsNameResolverTest {
       assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a");
 
       // LDS 2 drops "c" and adds a filter whose interceptor cannot be built. The sync context
-      // rethrows the failure; the registry must be left as it was.
+      // rethrows the failure; "c"'s nested "a" was already closed by then.
       AssertionError thrown = assertThrows(AssertionError.class, () ->
           xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
               new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
@@ -2101,7 +2102,7 @@ public class XdsNameResolverTest {
       assertThat(thrown).hasCauseThat().hasMessageThat().isEqualTo("cannot build");
       assertThat(statefulProvider.getAllInstances()).isEqualTo(lds1Snapshot);
       assertThat(lds1Snapshot.get(0).isShutdown()).isFalse();
-      assertThat(lds1Snapshot.get(1).isShutdown()).isFalse();
+      assertThat(lds1Snapshot.get(1).isShutdown()).isTrue();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }

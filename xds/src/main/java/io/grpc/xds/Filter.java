@@ -26,6 +26,9 @@ import io.grpc.ServerInterceptor;
 import io.grpc.xds.client.Bootstrapper.BootstrapInfo;
 import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Function;
@@ -44,6 +47,55 @@ interface Filter extends Closeable {
   /** Represents an opaque data structure holding configuration for a filter. */
   interface FilterConfig {
     String typeUrl();
+
+    /** Filter configs this config runs as nested filters; each needs its own instance. */
+    default List<NamedFilterConfig> nestedFilterConfigs() {
+      return Collections.emptyList();
+    }
+  }
+
+  /**
+   * Collects every filter config that needs an instance: the HCM's top-level configs plus the
+   * nested configs of those and of every per-route override in {@code vhosts}, recursively.
+   */
+  static List<NamedFilterConfig> collectAllFilterConfigs(
+      @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
+    List<NamedFilterConfig> result = new ArrayList<>();
+    if (hcmConfigs != null) {
+      for (NamedFilterConfig config : hcmConfigs) {
+        result.add(config);
+        collectNestedFilterConfigs(config.filterConfig, result);
+      }
+    }
+    if (vhosts != null) {
+      for (VirtualHost vhost : vhosts) {
+        collectNestedFilterConfigs(vhost.filterConfigOverrides().values(), result);
+        for (VirtualHost.Route route : vhost.routes()) {
+          collectNestedFilterConfigs(route.filterConfigOverrides().values(), result);
+          if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
+            for (VirtualHost.Route.RouteAction.ClusterWeight weight
+                : route.routeAction().weightedClusters()) {
+              collectNestedFilterConfigs(weight.filterConfigOverrides().values(), result);
+            }
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  static void collectNestedFilterConfigs(
+      Iterable<FilterConfig> configs, List<NamedFilterConfig> result) {
+    for (FilterConfig config : configs) {
+      collectNestedFilterConfigs(config, result);
+    }
+  }
+
+  static void collectNestedFilterConfigs(FilterConfig config, List<NamedFilterConfig> result) {
+    for (NamedFilterConfig nested : config.nestedFilterConfigs()) {
+      result.add(nested);
+      collectNestedFilterConfigs(nested.filterConfig, result);
+    }
   }
 
   /**
@@ -188,20 +240,20 @@ interface Filter extends Closeable {
     abstract MetricRecorder metricsRecorder();
 
     /**
-     * Returns the shared filter instance for a nested filter config, creating it on first use.
+     * Looks up the shared instance of a config from {@link FilterConfig#nestedFilterConfigs}.
      * Only for filters that run other filters; only valid inside {@code build*Interceptor}; null
      * when the instance was not created by the xDS resolver/server.
      */
     @Nullable
-    abstract Function<NamedFilterConfig, Filter> filterAcquirer();
+    abstract Function<NamedFilterConfig, Filter> filterLookup();
 
     static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
       return create(filterName, metricsRecorder, null);
     }
 
     static FilterContext create(String filterName, MetricRecorder metricsRecorder,
-        @Nullable Function<NamedFilterConfig, Filter> filterAcquirer) {
-      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder, filterAcquirer);
+        @Nullable Function<NamedFilterConfig, Filter> filterLookup) {
+      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder, filterLookup);
     }
   }
 

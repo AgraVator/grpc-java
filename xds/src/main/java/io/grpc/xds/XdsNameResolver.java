@@ -25,7 +25,6 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import com.google.protobuf.util.Durations;
@@ -75,7 +74,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -678,8 +676,6 @@ final class XdsNameResolver extends NameResolver {
     @Nullable
     private Set<String> existingClusters;  // clusters to which new requests can be routed
     private StatusOr<XdsConfig> lastConfigOrStatus;
-    // Keys of activeFilters reached by the update being applied.
-    private final Set<String> reached = new HashSet<>();
 
     private ResolveState(String ldsResourceName) {
       authority = overrideAuthority != null ? overrideAuthority : encodedServiceAuthority;
@@ -703,7 +699,7 @@ final class XdsNameResolver extends NameResolver {
 
       stopped = true;
       xdsDependencyManager.shutdown();
-      shutdownFiltersExcept(ImmutableSet.of());
+      updateActiveFilters(null, null);
     }
 
     @Override
@@ -715,7 +711,7 @@ final class XdsNameResolver extends NameResolver {
 
       lastConfigOrStatus = updateOrStatus;
       if (!updateOrStatus.hasValue()) {
-        shutdownFiltersExcept(ImmutableSet.of());
+        updateActiveFilters(null, null);
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -725,7 +721,7 @@ final class XdsNameResolver extends NameResolver {
       HttpConnectionManager httpConnectionManager = update.getListener().httpConnectionManager();
       if (httpConnectionManager == null) {
         logger.log(XdsLogLevel.INFO, "API Listener: httpConnectionManager does not exist.");
-        shutdownFiltersExcept(ImmutableSet.of());
+        updateActiveFilters(null, null);
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -734,54 +730,38 @@ final class XdsNameResolver extends NameResolver {
       ImmutableList<NamedFilterConfig> filterConfigs = httpConnectionManager.httpFilterConfigs();
       long streamDurationNano = httpConnectionManager.httpMaxStreamDurationNano();
 
-      reached.clear();
-      if (filterConfigs != null) {
-        for (NamedFilterConfig namedFilter : filterConfigs) {
-          acquireFilter(namedFilter);
-        }
-      }
+      updateActiveFilters(
+          filterConfigs, virtualHost == null ? null : Collections.singletonList(virtualHost));
       updateRoutes(update, virtualHost, streamDurationNano, filterConfigs);
-      // Every route has been built, so every filter this update reaches, including nested filters
-      // reached only through a per-route override, has been acquired. Anything else is unused.
-      shutdownFiltersExcept(reached);
     }
 
     /**
-     * The filter instance for {@code namedFilter}, created on first use and reused across updates.
-     * Also marks it as reached by the current update. This is the only path that creates filter
-     * instances; filters that run other filters get it as {@link FilterContext#filterAcquirer()}
-     * and may call it only from {@code build*Interceptor}. Acquiring from
-     * {@link Filter.Provider#newInstance} is not supported: the inner instance would be
-     * overwritten by the outer put and leak.
+     * Creates the instances declared by the HCM filters and the per-route overrides, top-level and
+     * nested alike, and closes the instances nothing declares anymore.
      */
     // called in syncContext
-    private Filter acquireFilter(NamedFilterConfig namedFilter) {
-      syncContext.throwIfNotInThisSynchronizationContext();
-      String filterKey = namedFilter.filterStateKey();
-      reached.add(filterKey);
-      Filter filter = activeFilters.get(filterKey);
-      if (filter == null) {
+    private void updateActiveFilters(
+        @Nullable List<NamedFilterConfig> filterConfigs, @Nullable List<VirtualHost> vhosts) {
+      Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
+      for (NamedFilterConfig namedFilter : Filter.collectAllFilterConfigs(filterConfigs, vhosts)) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
+        String filterKey = namedFilter.filterStateKey();
+
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
-        filter = provider.newInstance(FilterContext.create(
-            namedFilter.name, nameResolverArgs.getMetricRecorder(), this::acquireFilter));
+        Filter filter = activeFilters.computeIfAbsent(
+            filterKey, k -> provider.newInstance(FilterContext.create(
+                namedFilter.name, nameResolverArgs.getMetricRecorder(),
+                cfg -> activeFilters.get(cfg.filterStateKey()))));
         checkNotNull(filter, "filter %s", filterKey);
-        activeFilters.put(filterKey, filter);
+        filtersToShutdown.remove(filterKey);
       }
-      return filter;
-    }
 
-    // called in syncContext
-    private void shutdownFiltersExcept(Set<String> keep) {
       // Shutdown filters not present in current HCM.
-      Iterator<Map.Entry<String, Filter>> it = activeFilters.entrySet().iterator();
-      while (it.hasNext()) {
-        Map.Entry<String, Filter> entry = it.next();
-        if (!keep.contains(entry.getKey())) {
-          it.remove();
-          entry.getValue().close();
-        }
+      for (String filterKey : filtersToShutdown) {
+        Filter filterToShutdown = activeFilters.remove(filterKey);
+        checkNotNull(filterToShutdown, "filterToShutdown %s", filterKey);
+        filterToShutdown.close();
       }
     }
 

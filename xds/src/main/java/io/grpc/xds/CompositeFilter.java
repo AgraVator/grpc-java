@@ -66,8 +66,8 @@ import javax.annotation.Nullable;
  * <p>The composite holds no instance state of its own. Nested filter instances are owned by the
  * same registry in the resolver or server that owns the top-level filters, keyed by filter name
  * and type. Filters with the same name and type share one instance, whether nested or top-level.
- * The composite obtains them through {@link FilterContext#filterAcquirer()} when building
- * interceptors.
+ * The config declares them through {@link FilterConfig#nestedFilterConfigs()} and the composite
+ * obtains them through {@link FilterContext#filterLookup()} when building interceptors.
  */
 final class CompositeFilter implements Filter {
 
@@ -78,10 +78,10 @@ final class CompositeFilter implements Filter {
   private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
 
   @Nullable
-  private final Function<NamedFilterConfig, Filter> filterAcquirer;
+  private final Function<NamedFilterConfig, Filter> filterLookup;
 
-  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterAcquirer) {
-    this.filterAcquirer = filterAcquirer;
+  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterLookup) {
+    this.filterLookup = filterLookup;
   }
 
   static final class Provider implements Filter.Provider {
@@ -117,7 +117,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context.filterAcquirer());
+      return new CompositeFilter(context.filterLookup());
     }
 
     @Override
@@ -461,6 +461,18 @@ final class CompositeFilter implements Filter {
       return TYPE_URL_EXTENSION_WITH_MATCHER;
     }
 
+    /** The direct children; the collector recurses into each child's own nested configs. */
+    @Override
+    public List<NamedFilterConfig> nestedFilterConfigs() {
+      List<NamedFilterConfig> nested = new ArrayList<>();
+      for (FilterDelegate delegate : delegates.values()) {
+        for (DelegateEntry entry : delegate.delegates) {
+          nested.add(entry.namedConfig);
+        }
+      }
+      return nested;
+    }
+
     /**
      * Value equality, so that a control plane re-sending an unchanged resource does not look like
      * a configuration change. The xDS client compares parsed resources to decide whether to notify
@@ -745,15 +757,16 @@ final class CompositeFilter implements Filter {
 
   /**
    * The nested filter instance for {@code entry}, obtained from the registry that owns every
-   * filter instance of this HCM. The registry creates it on first use, reuses it across updates
-   * so that state such as a cache or a side channel survives them, and closes it once an update
-   * no longer reaches it.
+   * filter instance of this HCM. The registry creates it from {@link
+   * CompositeFilterConfig#nestedFilterConfigs()}, reuses it across updates so that state such as
+   * a cache or a side channel survives them, and closes it once no config declares it.
    */
   private Filter nestedFilter(DelegateEntry entry) {
-    return Preconditions.checkNotNull(filterAcquirer,
-        "CompositeFilter needs FilterContext.filterAcquirer() to build interceptors; instances "
-            + "must be created by the xDS resolver/server (3-arg FilterContext.create)")
-        .apply(entry.namedConfig);
+    Function<NamedFilterConfig, Filter> lookup = Preconditions.checkNotNull(filterLookup,
+        "CompositeFilter needs FilterContext.filterLookup() to build interceptors; instances "
+            + "must be created by the xDS resolver/server (3-arg FilterContext.create)");
+    return Preconditions.checkNotNull(lookup.apply(entry.namedConfig),
+        "No filter instance for nested filter %s", entry.namedConfig.filterStateKey());
   }
 
   private static CompositeFilterConfig getEffectiveConfig(

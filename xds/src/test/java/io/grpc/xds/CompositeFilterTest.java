@@ -4070,7 +4070,7 @@ public class CompositeFilterTest {
       // Matches every RPC with no nested filters, so only the composite's own call wrapping runs.
       UnifiedMatcher matchAll = mock(UnifiedMatcher.class);
       when(matchAll.match(any())).thenReturn(MatchResult.create(Collections.emptyList()));
-      ClientInterceptor interceptor = new CompositeFilter(/* filterAcquirer= */ null)
+      ClientInterceptor interceptor = new CompositeFilter(/* filterLookup= */ null)
           .buildClientInterceptor(
               new CompositeFilter.CompositeFilterConfig(matchAll, Collections.emptyMap()), null,
               mock(ScheduledExecutorService.class));

@@ -1697,13 +1697,9 @@ public class XdsServerWrapperTest {
     xdsClient.deliverLdsUpdate(fc1, null);
     xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
     verify(listener, never()).onServing();
-    // Server didn't start, but filter instances should have already been created.
-    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("LDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
-    // Naming: lds<LDS#>Filter<name#>
-    StatefulFilter lds1Filter1 = lds1Snapshot.get(0);
-    StatefulFilter lds1Filter2 = lds1Snapshot.get(1);
-    assertThat(lds1Filter1).isNotSameInstanceAs(lds1Filter2);
+    // Filter instances are created with the first selector, once the RDS arrives.
+    assertWithMessage("LDS 1: no filter instances before RDS")
+        .that(statefulFilterProvider.getAllInstances()).isEmpty();
 
     // RDS 1.
     VirtualHost vhost1 = filterStateTestVhost();
@@ -1711,10 +1707,12 @@ public class XdsServerWrapperTest {
     verifyServerStarted(serverStart);
     assertThat(getSelectorRoutingConfigs()).hasSize(1);
     assertThat(getSelectorVhosts(fc1)).containsExactly(vhost1);
-    // Initial RDS update should not generate Filter instances.
-    ImmutableList<StatefulFilter> rds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("RDS 1: Expected Filter instances to be reused across RDS route updates")
-        .that(rds1Snapshot).isEqualTo(lds1Snapshot);
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("RDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
+    // Naming: lds<LDS#>Filter<name#>
+    StatefulFilter lds1Filter1 = lds1Snapshot.get(0);
+    StatefulFilter lds1Filter2 = lds1Snapshot.get(1);
+    assertThat(lds1Filter1).isNotSameInstanceAs(lds1Filter2);
 
     // RDS 2: exactly the same as RDS 1.
     xdsClient.deliverRdsUpdate(rdsName, vhost1);
@@ -2007,17 +2005,18 @@ public class XdsServerWrapperTest {
     xdsClient.deliverLdsUpdate(chainA, chainDefault);
     xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
     verify(listener, never()).onServing();
-    // Server didn't start, but filter instances should have already been created.
-    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("LDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
-    // Naming: lds<LDS#>Chain<name>Filter<name#>
-    StatefulFilter lds1ChainAFilter1 = lds1Snapshot.get(0);
-    StatefulFilter lds1ChainDefaultFilter2 = lds1Snapshot.get(1);
+    // Filter instances are created with the first selector, once the RDS arrives.
+    assertWithMessage("LDS 1: no filter instances before RDS")
+        .that(statefulFilterProvider.getAllInstances()).isEmpty();
 
     // RDS 1: Standard vhost with a route.
     xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
     verifyServerStarted(serverStart);
-    assertThat(statefulFilterProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("RDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
+    // Naming: lds<LDS#>Chain<name>Filter<name#>
+    StatefulFilter lds1ChainAFilter1 = lds1Snapshot.get(0);
+    StatefulFilter lds1ChainDefaultFilter2 = lds1Snapshot.get(1);
 
     // RDS 2: RDS_RESOURCE_NAME not found.
     xdsClient.deliverRdsResourceNotFound(rdsName);
@@ -2075,21 +2074,21 @@ public class XdsServerWrapperTest {
               new NamedFilterConfig("c", nestingA),
               new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))));
       xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
-      // Top-level filters exist before the routes arrive; nested ones only once routes are built.
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, STATEFUL_2);
+      // Nothing exists before the first selector is built.
+      assertThat(statefulFilterNames(statefulProvider)).isEmpty();
 
-      // RDS 1: two routes, no overrides.
+      // RDS 1: two routes, no overrides. Each chain creates its top-level and nested filters.
       xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
       verifyServerStarted(serverStart);
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, STATEFUL_2, "a", "a");
+          .containsExactly(STATEFUL_1, "a", STATEFUL_2, "a").inOrder();
       ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
 
       // RDS 2: the second route overrides "c" with a matcher that runs "x" instead.
       xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x")))));
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, STATEFUL_2, "a", "a", "x", "x");
+          .containsExactly(STATEFUL_1, "a", STATEFUL_2, "a", "x", "x").inOrder();
       ImmutableList<StatefulFilter> rds2Snapshot = statefulProvider.getAllInstances();
       for (StatefulFilter filter : rds2Snapshot) {
         assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
@@ -2154,24 +2153,76 @@ public class XdsServerWrapperTest {
     FilterChain lds2ChainB = createFilterChain("chain_b",
         createHcmForRds("rds_b", filterStateTestConfigs(STATEFUL_1)), matchB);
     xdsClient.deliverLdsUpdate(ImmutableList.of(lds2ChainA, lds2ChainB), null);
-    assertThat(statefulFilterNames(statefulFilterProvider))
-        .containsExactly(STATEFUL_1, STATEFUL_2, STATEFUL_1).inOrder();
+    // LDS 2 is not applied until rds_b arrives, so it creates nothing yet.
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
 
     // rds_a re-sent: rebuilds chain A's routing config as of LDS 1, then rds_b arrives.
     xdsClient.deliverRdsUpdate("rds_a", vhost);
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
     xdsClient.deliverRdsUpdate("rds_b", vhost);
     assertThat(severeLogs).isEmpty();
     assertThat(getSelectorRoutingConfigs().keySet()).containsExactly(lds2ChainA, lds2ChainB);
     assertThat(getSelectorVhosts(lds2ChainA)).containsExactly(vhost);
     assertThat(getSelectorVhosts(lds2ChainB)).containsExactly(vhost);
-    // Chain A has a live STATEFUL_2 instance.
-    List<StatefulFilter> liveStateful2 = new ArrayList<>();
+    // Chain A gained STATEFUL_2 and chain B its own STATEFUL_1; nothing was closed.
+    assertThat(statefulFilterNames(statefulFilterProvider))
+        .containsExactly(STATEFUL_1, STATEFUL_2, STATEFUL_1).inOrder();
     for (StatefulFilter filter : statefulFilterProvider.getAllInstances()) {
-      if (STATEFUL_2.equals(filter.name) && !filter.isShutdown()) {
-        liveStateful2.add(filter);
-      }
+      assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
     }
-    assertThat(liveStateful2).hasSize(1);
+  }
+
+  /**
+   * While a new chain's RDS is pending, a re-sent RDS rebuilds the routing configs of the served
+   * chains, including a default chain that the pending LDS has modified. The rebuild must resolve
+   * the served default chain's filters even though it no longer equals the LDS's default chain.
+   */
+  @Test
+  public void filterState_staleRdsRebuildOfModifiedDefaultChainWhileRdsPending()
+      throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+    VirtualHost vhost1 = filterStateTestVhost("vhost-1");
+    VirtualHost vhost2 = filterStateTestVhost("vhost-2");
+    FilterChainMatch matchA = createMatchSrcIp("3fff:a::/32");
+    FilterChainMatch matchB = createMatchSrcIp("3fff:b::/32");
+
+    // LDS 1: chain A and the default chain, both served by rds_a.
+    FilterChain lds1ChainA = createFilterChain("chain_a",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1)), matchA);
+    FilterChain lds1Default = createFilterChain("chain_default",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1)));
+    xdsClient.deliverLdsUpdate(ImmutableList.of(lds1ChainA), lds1Default);
+    xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+    xdsClient.deliverRdsUpdate("rds_a", vhost1);
+    verifyServerStarted(serverStart);
+    assertThat(getSelectorVhosts(lds1ChainA)).containsExactly(vhost1);
+    assertThat(selectorManager.getSelectorToUpdateSelector().getDefaultRoutingConfig().get()
+        .virtualHosts()).containsExactly(vhost1);
+
+    // LDS 2: the default chain gains STATEFUL_2, and a new chain B is served by rds_b, which
+    // stays pending, so the selector keeps serving LDS 1's chains.
+    FilterChain lds2Default = createFilterChain("chain_default",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1, STATEFUL_2)));
+    FilterChain lds2ChainB = createFilterChain("chain_b",
+        createHcmForRds("rds_b", filterStateTestConfigs(STATEFUL_1)), matchB);
+    xdsClient.deliverLdsUpdate(ImmutableList.of(lds1ChainA, lds2ChainB), lds2Default);
+
+    // rds_a updated: the served chains, LDS 1's default chain included, pick up the new routes.
+    xdsClient.deliverRdsUpdate("rds_a", vhost2);
+    assertThat(severeLogs).isEmpty();
+    assertThat(getSelectorRoutingConfigs().keySet()).containsExactly(lds1ChainA);
+    assertThat(getSelectorVhosts(lds1ChainA)).containsExactly(vhost2);
+    assertThat(selectorManager.getSelectorToUpdateSelector().getDefaultRoutingConfig().get()
+        .virtualHosts()).containsExactly(vhost2);
+
+    // rds_b arrives: LDS 2 is applied.
+    xdsClient.deliverRdsUpdate("rds_b", vhost2);
+    assertThat(severeLogs).isEmpty();
+    assertThat(getSelectorRoutingConfigs().keySet()).containsExactly(lds1ChainA, lds2ChainB);
+    assertThat(selectorManager.getSelectorToUpdateSelector().getDefaultRoutingConfig().get()
+        .virtualHosts()).containsExactly(vhost2);
   }
 
   /** An RDS whose virtual host has no routes must not close the chain's top-level filters. */
@@ -2218,11 +2269,11 @@ public class XdsServerWrapperTest {
 
   /**
    * An RDS error closes nothing, but an LDS update processed while the chain's RDS is still
-   * unavailable reconciles the chain to its top-level filters right away: what the LDS dropped
-   * is closed, and so are the nested instances, which are recreated once RDS recovers.
+   * unavailable reconciles the chain to the filters the LDS declares right away: what the LDS
+   * dropped is closed, and the nested instances the LDS still declares are kept.
    */
   @Test
-  public void filterState_ldsWhileRdsNotFound_reconcilesToTopLevelFilters() throws Exception {
+  public void filterState_ldsWhileRdsNotFound_reconcilesToLdsFilters() throws Exception {
     System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     try {
       StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
@@ -2254,21 +2305,20 @@ public class XdsServerWrapperTest {
         assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
       }
 
-      // LDS 2: STATEFUL_2 dropped while RDS is still unavailable. The chain is reconciled to its
-      // top-level filters: STATEFUL_2 is closed now, and so is the nested "a".
+      // LDS 2: STATEFUL_2 dropped while RDS is still unavailable. The chain is reconciled to the
+      // LDS filters: STATEFUL_2 is closed now; the nested "a" is still declared and kept.
       xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
           ImmutableList.of(stateful1, nestingA, router))), null);
       assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
       assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
       assertThat(rds1Snapshot.get(1).isShutdown()).isTrue();
-      assertThat(rds1Snapshot.get(2).isShutdown()).isTrue();
+      assertThat(rds1Snapshot.get(2).isShutdown()).isFalse();
 
-      // RDS 3: the resource is back. STATEFUL_1 is reused, "a" is recreated.
+      // RDS 3: the resource is back. STATEFUL_1 and "a" are reused.
       xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
-      assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, STATEFUL_2, "a", "a").inOrder();
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
       assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
-      assertThat(statefulProvider.getAllInstances().get(3).isShutdown()).isFalse();
+      assertThat(rds1Snapshot.get(2).isShutdown()).isFalse();
       assertThat(severeLogs).isEmpty();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");

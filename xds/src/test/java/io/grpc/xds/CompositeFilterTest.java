@@ -1209,6 +1209,38 @@ public class CompositeFilterTest {
       assertThat(statusCaptor.getValue().getDescription()).contains("cancelled before start");
     }
 
+    /** An override parsed by another filter is ignored, as C-core's GetOverrideConfig does. */
+    @Test
+    public void buildInterceptor_overrideOfAnotherFilterType_ignored() {
+      Matcher.OnMatch baseAction = createExecuteAction("child", FAKE_TYPE_URL);
+      Matcher baseMatcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("foo", "bar", baseAction))
+              .build())
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> baseResult =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(baseMatcher)), getFilterContext());
+      FilterConfig foreignOverride = mock(FilterConfig.class);
+      when(foreignOverride.typeUrl()).thenReturn("type.googleapis.com/some.other.Filter");
+
+      CompositeFilter filter = newFilter("composite");
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          baseResult.config, foreignOverride, mock(ScheduledExecutorService.class));
+      assertThat(filter.buildServerInterceptor(baseResult.config, foreignOverride)).isNotNull();
+
+      ClientCall childCall = mock(ClientCall.class);
+      when(fakeClientInterceptor.interceptCall(any(), any(), any())).thenReturn(childCall);
+      ClientCall<Void, Void> call = interceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT, mock(Channel.class));
+      Metadata headers = new Metadata();
+      headers.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "bar");
+      call.start(mock(ClientCall.Listener.class), headers);
+
+      // The top-level matcher ran and selected the child.
+      verify(childCall).start(any(), eq(headers));
+    }
+
     @Test
     public void clientInterceptor_usesOverrideMatcher_overrideMatches() {
       Matcher.OnMatch baseAction = createExecuteAction("child", FAKE_TYPE_URL);

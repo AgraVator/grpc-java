@@ -707,8 +707,12 @@ final class CompositeFilter implements Filter {
   private static CompositeFilterConfig getEffectiveConfig(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
     // A per-route override replaces the top-level config outright, per A103. Only the top-level
-    // matcher may be absent; callers then build no interceptor, the no-op passthrough.
-    return (CompositeFilterConfig) (overrideConfig != null ? overrideConfig : config);
+    // matcher may be absent; callers then build no interceptor, the no-op passthrough. An
+    // override of another filter's type is ignored, as C-core's GetOverrideConfig does.
+    if (overrideConfig instanceof CompositeFilterConfig) {
+      return (CompositeFilterConfig) overrideConfig;
+    }
+    return (CompositeFilterConfig) config;
   }
 
   static <I> List<ResolvedDelegate<I>> resolveDelegates(@Nullable MatchResult matchResult,

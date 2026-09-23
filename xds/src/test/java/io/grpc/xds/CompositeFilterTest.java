@@ -3060,9 +3060,10 @@ public class CompositeFilterTest {
       }
     }
 
+    /** C-core accepts an empty nested name; the instance is then keyed by its type alone. */
     @Test
-    public void parseFilterConfig_nestedFilterMissingName_rejected() {
-      Matcher.OnMatch missingNameAction = Matcher.OnMatch.newBuilder()
+    public void parseFilterConfig_nestedFilterEmptyName_accepted() {
+      Matcher.OnMatch emptyNameAction = Matcher.OnMatch.newBuilder()
           .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
               .setName("execute_action")
               .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
@@ -3071,13 +3072,15 @@ public class CompositeFilterTest {
                       .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_TYPE_URL)))
                   .build())))
           .build();
-      Matcher matcher = matcherFallingThroughTo(missingNameAction).build();
+      Matcher matcher = matcherFallingThroughTo(emptyNameAction).build();
 
       ConfigOrError<CompositeFilter.CompositeFilterConfig> res =
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
-      assertThat(res.config).isNull();
-      assertThat(res.errorDetail).contains("Nested filter is missing a name");
+      assertThat(res.errorDetail).isNull();
+      NamedFilterConfig nested = Iterables.getOnlyElement(res.config.nestedFilterConfigs());
+      assertThat(nested.name).isEmpty();
+      assertThat(nested.filterStateKey()).isEqualTo("_" + FAKE_TYPE_URL);
     }
 
     /**

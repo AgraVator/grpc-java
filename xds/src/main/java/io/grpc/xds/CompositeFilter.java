@@ -325,21 +325,11 @@ final class CompositeFilter implements Filter {
         List<NamedFilterConfig> delegates = new ArrayList<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
             : childConfigs) {
-          String name = childFilterConfig.getName();
-          // TypedExtensionConfig.name carries `(validate.rules).string = {min_len: 1}`, and the
-          // name is what nested filter instances are keyed by. Without it, every anonymous filter
-          // of a given type would alias onto one instance. C-core does not check this.
-          //
-          // Nothing else about the name is validated. Nested instances live in the same HCM-wide
-          // map as top-level ones, keyed by name and type, so a repeated name means a shared
-          // instance (the A83 mechanism for sharing state such as a gcp_authn cache). A collision
-          // check here could only see one composite's config, never a same-named top-level
-          // filter, a sibling composite or an RDS override parsed as a separate resource, and
-          // C-core accepts all of these.
-          if (name.isEmpty()) {
-            throw new IllegalArgumentException("Nested filter is missing a name: "
-                + childFilterConfig.getTypedConfig().getTypeUrl());
-          }
+          // The name is not validated, not even for emptiness. Nested instances live in the same
+          // HCM-wide map as top-level ones, keyed by name and type, so a repeated name means a
+          // shared instance. A collision check here could only see one composite's config, never
+          // a same-named top-level filter, a sibling composite or an RDS override parsed as a
+          // separate resource, and C-core accepts all of these.
           String typeUrl = childFilterConfig.getTypedConfig().getTypeUrl();
           Message rawConfig = childFilterConfig.getTypedConfig();
           try {

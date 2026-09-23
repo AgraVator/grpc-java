@@ -1750,6 +1750,29 @@ public class XdsNameResolverTest {
     }
   }
 
+  /** Empty-named nested filters of one type share one instance, like C-core's gcp_authn. */
+  @Test
+  public void filterState_emptyNamedNestedFiltersShareInstance() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
+          new NamedFilterConfig("p1", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("")))),
+          new NamedFilterConfig("p2", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
   /** A nested filter and a top-level filter with the same name and type are one instance. */
   @Test
   public void filterState_nestedAndTopLevelSameNameShareInstance() {

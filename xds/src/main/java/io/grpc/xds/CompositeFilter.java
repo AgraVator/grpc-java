@@ -257,10 +257,7 @@ final class CompositeFilter implements Filter {
         // collapse to a single entry, which is intended: the same action reached from several
         // matcher branches is one delegate, parsed once.
         if (!map.containsKey(action)) {
-          FilterDelegate delegate = createFilterDelegate(action, context);
-          if (delegate != null) {
-            map.put(action, delegate);
-          }
+          map.put(action, createFilterDelegate(action, context));
         }
       }
     }

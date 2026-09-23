@@ -173,9 +173,11 @@ public class CompositeFilterTest {
       when(fakeUnsupportedProvider.typeUrls()).thenReturn(new String[]{FAKE_UNSUPPORTED_TYPE_URL});
       when(fakeUnsupportedProvider.isClientFilter()).thenReturn(false);
       when(fakeUnsupportedProvider.isServerFilter()).thenReturn(false);
+      FilterConfig fakeUnsupportedConfig = mock(FilterConfig.class);
+      when(fakeUnsupportedConfig.typeUrl()).thenReturn(FAKE_UNSUPPORTED_TYPE_URL);
       when(fakeUnsupportedProvider.parseFilterConfig(
           any(com.google.protobuf.Message.class), any()))
-          .thenReturn((ConfigOrError) configRes);
+          .thenReturn((ConfigOrError) ConfigOrError.fromConfig(fakeUnsupportedConfig));
 
       when(fakeFailingProvider.typeUrls()).thenReturn(new String[]{FAKE_FAILING_PARSE_TYPE_URL});
       when(fakeFailingProvider.isClientFilter()).thenReturn(true);
@@ -1484,8 +1486,8 @@ public class CompositeFilterTest {
       // Every delegate entry is resolved through the acquirer with its own NamedFilterConfig...
       for (CompositeFilter.FilterDelegate delegate
           : Iterables.concat(topLevel.delegates.values(), routeOverride.delegates.values())) {
-        for (CompositeFilter.DelegateEntry entry : delegate.delegates) {
-          verify(acquirer, atLeastOnce()).apply(entry.namedConfig);
+        for (NamedFilterConfig nested : delegate.delegates) {
+          verify(acquirer, atLeastOnce()).apply(nested);
         }
       }
       // ...and only through it: the composite neither creates nor retires nested instances, not
@@ -3869,8 +3871,8 @@ public class CompositeFilterTest {
       // Matches every RPC with no nested filters, so only the composite's own call wrapping runs.
       UnifiedMatcher matchAll = mock(UnifiedMatcher.class);
       when(matchAll.match(any())).thenReturn(MatchResult.create(Collections.emptyList()));
-      ClientInterceptor interceptor = new CompositeFilter(/* filterLookup= */ null)
-          .buildClientInterceptor(
+      ClientInterceptor interceptor =
+          new CompositeFilter(/* filterLookup= */ null, typeUrl -> null).buildClientInterceptor(
               new CompositeFilter.CompositeFilterConfig(matchAll, Collections.emptyMap()), null,
               mock(ScheduledExecutorService.class));
       ManagedChannel channel = grpcCleanup.register(InProcessChannelBuilder.forName(serverName)

@@ -79,9 +79,12 @@ final class CompositeFilter implements Filter {
 
   @Nullable
   private final Function<NamedFilterConfig, Filter> filterLookup;
+  private final Function<String, Filter.Provider> registryLookup;
 
-  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterLookup) {
+  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterLookup,
+      Function<String, Filter.Provider> registryLookup) {
     this.filterLookup = filterLookup;
+    this.registryLookup = Preconditions.checkNotNull(registryLookup, "registryLookup");
   }
 
   static final class Provider implements Filter.Provider {
@@ -117,7 +120,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context.filterLookup());
+      return new CompositeFilter(context.filterLookup(), registryLookup);
     }
 
     @Override
@@ -319,7 +322,7 @@ final class CompositeFilter implements Filter {
           throw new IllegalArgumentException(
               "ExecuteFilterAction must specify either typed_config or filter_chain");
         }
-        List<DelegateEntry> delegates = new ArrayList<>();
+        List<NamedFilterConfig> delegates = new ArrayList<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
             : childConfigs) {
           String name = childFilterConfig.getName();
@@ -381,7 +384,7 @@ final class CompositeFilter implements Filter {
             throw new IllegalArgumentException(
                 "Nested filter cannot be a terminal filter: " + typeUrl);
           }
-          delegates.add(new DelegateEntry(provider, parsed.config, childFilterConfig.getName()));
+          delegates.add(new NamedFilterConfig(childFilterConfig.getName(), parsed.config));
         }
         return new FilterDelegate(delegates, samplePercent);
       } catch (InvalidProtocolBufferException e) {
@@ -427,9 +430,7 @@ final class CompositeFilter implements Filter {
     public List<NamedFilterConfig> nestedFilterConfigs() {
       List<NamedFilterConfig> nested = new ArrayList<>();
       for (FilterDelegate delegate : delegates.values()) {
-        for (DelegateEntry entry : delegate.delegates) {
-          nested.add(entry.namedConfig);
-        }
+        nested.addAll(delegate.delegates);
       }
       return nested;
     }
@@ -469,15 +470,15 @@ final class CompositeFilter implements Filter {
   }
 
   static final class FilterDelegate {
-    final List<DelegateEntry> delegates;
+    final List<NamedFilterConfig> delegates;
     private final int ratePerMillion;
     private final ThreadSafeRandom random;
 
-    FilterDelegate(List<DelegateEntry> delegates, @Nullable FractionalPercent samplePercent) {
+    FilterDelegate(List<NamedFilterConfig> delegates, @Nullable FractionalPercent samplePercent) {
       this(delegates, samplePercent, ThreadSafeRandom.ThreadSafeRandomImpl.instance);
     }
 
-    FilterDelegate(List<DelegateEntry> delegates, @Nullable FractionalPercent samplePercent,
+    FilterDelegate(List<NamedFilterConfig> delegates, @Nullable FractionalPercent samplePercent,
         ThreadSafeRandom random) {
       this.delegates = Collections.unmodifiableList(delegates);
       this.ratePerMillion = calculateRatePerMillion(samplePercent);
@@ -521,20 +522,6 @@ final class CompositeFilter implements Filter {
     }
   }
 
-  static final class DelegateEntry {
-    final Filter.Provider provider;
-    final FilterConfig config;
-    final String name;
-    final NamedFilterConfig namedConfig;
-
-    DelegateEntry(Filter.Provider provider, FilterConfig config, String name) {
-      this.provider = provider;
-      this.config = config;
-      this.name = name;
-      this.namedConfig = new NamedFilterConfig(name, config);
-    }
-  }
-
   /**
    * A {@link FilterDelegate} whose nested filter interceptors have already been built, at
    * configuration time.
@@ -550,19 +537,10 @@ final class CompositeFilter implements Filter {
     @Nullable
     final Status error;
 
-    private ResolvedDelegate(FilterDelegate delegate, List<I> interceptors,
-        @Nullable Status error) {
+    ResolvedDelegate(FilterDelegate delegate, List<I> interceptors, @Nullable Status error) {
       this.delegate = delegate;
       this.interceptors = Collections.unmodifiableList(interceptors);
       this.error = error;
-    }
-
-    static <I> ResolvedDelegate<I> of(FilterDelegate delegate, List<I> interceptors) {
-      return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
-    }
-
-    static <I> ResolvedDelegate<I> error(FilterDelegate delegate, Status error) {
-      return new ResolvedDelegate<>(delegate, Collections.<I>emptyList(), error);
     }
   }
 
@@ -683,51 +661,57 @@ final class CompositeFilter implements Filter {
 
   private ResolvedDelegate<ServerInterceptor> resolveServerDelegate(FilterDelegate delegate) {
     List<ServerInterceptor> interceptors = new ArrayList<>();
-    for (DelegateEntry entry : delegate.delegates) {
-      if (!entry.provider.isServerFilter()) {
-        return ResolvedDelegate.error(delegate,
+    for (NamedFilterConfig nested : delegate.delegates) {
+      if (!providerOf(nested).isServerFilter()) {
+        return new ResolvedDelegate<>(delegate, Collections.emptyList(),
             Status.UNAVAILABLE.withDescription(
-                "Filter " + entry.name + " is not supported on server side"));
+                "Filter " + nested.name + " is not supported on server side"));
       }
-      ServerInterceptor interceptor = nestedFilter(entry)
-          .buildServerInterceptor(entry.config, /* overrideConfig= */ null);
+      ServerInterceptor interceptor = nestedFilter(nested)
+          .buildServerInterceptor(nested.filterConfig, /* overrideConfig= */ null);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
     }
-    return ResolvedDelegate.of(delegate, interceptors);
+    return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
   }
 
   private ResolvedDelegate<ClientInterceptor> resolveClientDelegate(
       FilterDelegate delegate, ScheduledExecutorService scheduler) {
     List<ClientInterceptor> interceptors = new ArrayList<>();
-    for (DelegateEntry entry : delegate.delegates) {
-      if (!entry.provider.isClientFilter()) {
-        return ResolvedDelegate.error(delegate,
+    for (NamedFilterConfig nested : delegate.delegates) {
+      if (!providerOf(nested).isClientFilter()) {
+        return new ResolvedDelegate<>(delegate, Collections.emptyList(),
             Status.UNAVAILABLE.withDescription(
-                "Filter " + entry.name + " is not supported on client side"));
+                "Filter " + nested.name + " is not supported on client side"));
       }
-      ClientInterceptor interceptor = nestedFilter(entry)
-          .buildClientInterceptor(entry.config, /* overrideConfig= */ null, scheduler);
+      ClientInterceptor interceptor = nestedFilter(nested)
+          .buildClientInterceptor(nested.filterConfig, /* overrideConfig= */ null, scheduler);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
     }
-    return ResolvedDelegate.of(delegate, interceptors);
+    return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
+  }
+
+  /** The provider that parsed {@code nested}; the same registry is used at parse time. */
+  private Filter.Provider providerOf(NamedFilterConfig nested) {
+    return Preconditions.checkNotNull(registryLookup.apply(nested.filterConfig.typeUrl()),
+        "provider %s", nested.filterConfig.typeUrl());
   }
 
   /**
-   * The nested filter instance for {@code entry}, obtained from the registry that owns every
+   * The nested filter instance for {@code nested}, obtained from the registry that owns every
    * filter instance of this HCM. The registry creates it from {@link
    * CompositeFilterConfig#nestedFilterConfigs()}, reuses it across updates so that state such as
    * a cache or a side channel survives them, and closes it once no config declares it.
    */
-  private Filter nestedFilter(DelegateEntry entry) {
+  private Filter nestedFilter(NamedFilterConfig nested) {
     Function<NamedFilterConfig, Filter> lookup = Preconditions.checkNotNull(filterLookup,
         "CompositeFilter needs FilterContext.filterLookup() to build interceptors; instances "
             + "must be created by the xDS resolver/server (3-arg FilterContext.create)");
-    return Preconditions.checkNotNull(lookup.apply(entry.namedConfig),
-        "No filter instance for nested filter %s", entry.namedConfig.filterStateKey());
+    return Preconditions.checkNotNull(lookup.apply(nested),
+        "No filter instance for nested filter %s", nested.filterStateKey());
   }
 
   private static CompositeFilterConfig getEffectiveConfig(

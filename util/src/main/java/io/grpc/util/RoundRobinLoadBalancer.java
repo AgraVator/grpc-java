@@ -41,11 +41,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * EquivalentAddressGroup}s from the {@link NameResolver}.
  */
 final class RoundRobinLoadBalancer extends MultiChildLoadBalancer {
+  private static final PickResult CONNECTING_RESULT = PickResult.withNoResult("connecting",
+      "round_robin connecting: TCP/TLS handshake in progress to child balancers");
   private final AtomicInteger sequence = new AtomicInteger(new Random().nextInt());
-  // There are no children yet, so this degenerates to the endpoint-less form of the reason. It is
-  // only a seed for the picker comparison in updateBalancingState; it is never published as-is.
-  private SubchannelPicker currentPicker = new FixedResultPicker(
-      PickResult.withNoResult("connecting", aggregateConnectingDelayReason("round_robin")));
+  private SubchannelPicker currentPicker = new FixedResultPicker(CONNECTING_RESULT);
 
   public RoundRobinLoadBalancer(Helper helper) {
     super(helper);
@@ -71,8 +70,7 @@ final class RoundRobinLoadBalancer extends MultiChildLoadBalancer {
       }
 
       if (isConnecting) {
-        updateBalancingState(CONNECTING, new FixedResultPicker(
-            PickResult.withNoResult("connecting", aggregateConnectingDelayReason("round_robin"))));
+        updateBalancingState(CONNECTING, new FixedResultPicker(CONNECTING_RESULT));
       } else {
         updateBalancingState(TRANSIENT_FAILURE, createReadyPicker(getChildLbStates()));
       }
@@ -82,9 +80,7 @@ final class RoundRobinLoadBalancer extends MultiChildLoadBalancer {
   }
 
   private void updateBalancingState(ConnectivityState state, SubchannelPicker picker) {
-    // PickResult.equals ignores delayType and delayReason, so we use pickerChanged to ensure
-    // we propagate reason changes even if the state and picker type are equivalent.
-    if (state != currentConnectivityState || pickerChanged(currentPicker, picker)) {
+    if (state != currentConnectivityState || !picker.equals(currentPicker)) {
       getHelper().updateBalancingState(state, picker);
       currentConnectivityState = state;
       currentPicker = picker;

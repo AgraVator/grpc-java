@@ -207,18 +207,10 @@ final class OpenTelemetryMetricsModule {
     volatile String backendService;
     long attemptNanos;
     Code statusCode;
+    /** The stopwatch timing the open delay, or {@code null} if no delay is open. */
     @GuardedBy("this")
     @Nullable private Stopwatch activeDelayStopwatch;
-    /**
-     * Type of the delay currently being timed, or {@code null} if no delay is open.
-     *
-     * <p>The channel owns the delay type and supplies it on every call, so this is never used to
-     * label a normal {@link #recordDelayEnd}. It exists solely as the fallback label for the two
-     * cases where the delay has to be terminated without the channel naming it: automatic
-     * termination when the attempt finishes while a delay is still open (the cancellation and
-     * deadline paths of gRFC A121), and rollover when a delay of a different type is started
-     * before the current one was ended.
-     */
+    /** The type {@link #activeDelayStopwatch} was started for. */
     @GuardedBy("this")
     @Nullable private String activeDelayType;
     @GuardedBy("this")
@@ -239,84 +231,55 @@ final class OpenTelemetryMetricsModule {
     }
 
     @Override
-    public void streamCreated(io.grpc.Attributes transportAtts, Metadata headers) {
-      synchronized (this) {
-        streamCreated = true;
-      }
+    public synchronized void streamCreated(io.grpc.Attributes transportAtts, Metadata headers) {
+      streamCreated = true;
       // A delay can only be outstanding here if the channel did not end it itself; the wait is
       // over either way, so terminate it.
       terminateOpenDelay();
     }
 
     @Override
-    public void recordDelayStart(String delayType, String delayReason) {
+    public synchronized void recordDelayStart(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
-      if (module.resource.clientAttemptDelayCounter() == null) {
-        // Nothing to record, so do not pay for timing the delay.
+      if (streamClosed || streamCreated) {
         return;
       }
-      long rolledOverNanos = 0;
-      String rolledOverType = null;
-      synchronized (this) {
-        if (streamClosed || streamCreated) {
-          return;
-        }
-        if (activeDelayStopwatch != null) {
-          if (delayType.equals(activeDelayType)) {
-            // Redundant start: keep timing the delay from when it actually started.
-            return;
-          }
-          // The channel normally ends a delay before starting the next one. If it did not, close
-          // out the previous segment under its own type so the new one is timed separately.
-          rolledOverNanos = activeDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
-          rolledOverType = activeDelayType;
-        }
-        activeDelayStopwatch = module.stopwatchSupplier.get().start();
-        activeDelayType = delayType;
+      if (activeDelayStopwatch != null && delayType.equals(activeDelayType)) {
+        // Redundant start: keep timing the delay from when it actually started.
+        return;
       }
-      if (rolledOverType != null) {
-        recordDelay(rolledOverNanos, rolledOverType);
-      }
+      // The channel normally ends a delay before starting the next one. If it did not, close out
+      // the previous segment under its own type so the new one is timed separately.
+      terminateOpenDelay();
+      activeDelayType = delayType;
+      activeDelayStopwatch = module.stopwatchSupplier.get().start();
     }
 
     @Override
-    public void recordDelayEnd(String delayType) {
+    public synchronized void recordDelayEnd(String delayType) {
       checkNotNull(delayType, "delayType");
-      long delayNanos;
-      synchronized (this) {
-        if (activeDelayStopwatch == null) {
-          return;
-        }
-        delayNanos = activeDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
+      if (activeDelayStopwatch != null) {
+        // Labeled with the type the channel supplied, which owns it.
+        recordDelay(activeDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS), delayType);
         activeDelayStopwatch = null;
         activeDelayType = null;
       }
-      recordDelay(delayNanos, delayType);
     }
 
     /**
      * Ends a delay that is still open, labeled with the type the channel gave when it started.
      * No-op if no delay is open.
      */
+    @GuardedBy("this")
     private void terminateOpenDelay() {
-      long delayNanos;
-      String delayType;
-      synchronized (this) {
-        if (activeDelayStopwatch == null) {
-          return;
-        }
-        delayNanos = activeDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
-        delayType = activeDelayType;
+      if (activeDelayStopwatch != null) {
+        recordDelay(activeDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS), activeDelayType);
         activeDelayStopwatch = null;
         activeDelayType = null;
       }
-      recordDelay(delayNanos, delayType);
     }
 
-    /**
-     * Records a delay to {@code grpc.client.attempt.delay.duration}. Must be called without
-     * holding any lock, since it calls into user-supplied OpenTelemetry code.
-     */
+    /** Records a delay to {@code grpc.client.attempt.delay.duration}. */
     private void recordDelay(long delayNanos, String delayType) {
       DoubleHistogram delayHistogram = module.resource.clientAttemptDelayCounter();
       if (delayHistogram == null) {
@@ -327,7 +290,10 @@ final class OpenTelemetryMetricsModule {
       // because subchannel selection has not completed while an attempt delay is active.
       delayHistogram.record(
           delayNanos * SECONDS_PER_NANO,
-          attemptsState.callLevelBaseAttributes.toBuilder().put(DELAY_TYPE_KEY, delayType).build(),
+          Attributes.of(
+              METHOD_KEY, attemptsState.fullMethodName,
+              TARGET_KEY, attemptsState.target,
+              DELAY_TYPE_KEY, delayType),
           attemptsState.otelContext);
     }
 
@@ -379,11 +345,10 @@ final class OpenTelemetryMetricsModule {
     public void streamClosed(Status status) {
       synchronized (this) {
         streamClosed = true;
+        // If the attempt finishes while a delay is still open (e.g. the RPC was cancelled or its
+        // deadline expired while queued), gRFC A121 expects the partial duration to be recorded.
+        terminateOpenDelay();
       }
-      // If the attempt finishes while a delay is still open (e.g. the RPC was cancelled or its
-      // deadline expired while queued), gRFC A121 expects the partial duration to be recorded.
-      // Records outside the lock above, which also serialises the delay callbacks.
-      terminateOpenDelay();
       stopwatch.stop();
       attemptNanos = stopwatch.elapsed(TimeUnit.NANOSECONDS);
       Deadline deadline = info.getCallOptions().getDeadline();
@@ -451,18 +416,10 @@ final class OpenTelemetryMetricsModule {
     private final List<OpenTelemetryPlugin.ClientCallPlugin> callPlugins;
     private final Context otelContext;
     private Status status;
+    /** The stopwatch timing the open call-level delay, or {@code null} if none is open. */
     @GuardedBy("lock")
     @Nullable private Stopwatch activeCallDelayStopwatch;
-    /**
-     * Type of the call-level delay currently being timed, or {@code null} if no delay is open.
-     *
-     * <p>The channel owns the delay type and supplies it on every call, so this is never used to
-     * label a normal {@link #recordDelayEnd}. It exists solely as the fallback label for the two
-     * cases where the delay has to be terminated without the channel naming it: automatic
-     * termination when the call ends while a delay is still open (the cancellation and deadline
-     * paths of gRFC A121), and rollover when a delay of a different type is started before the
-     * current one was ended.
-     */
+    /** The type {@link #activeCallDelayStopwatch} was started for. */
     @GuardedBy("lock")
     @Nullable private String activeCallDelayType;
     private final Attributes callLevelBaseAttributes;
@@ -583,15 +540,15 @@ final class OpenTelemetryMetricsModule {
           return;
         }
         callEnded = true;
+        // If the call ends while a delay is still open (e.g. the RPC was cancelled or its deadline
+        // expired while waiting for name resolution), gRFC A121 expects the partial duration to be
+        // recorded.
+        terminateOpenDelay();
         if (activeStreams == 0 && !finishedCallToBeRecorded) {
           shouldRecordFinishedCall = true;
           finishedCallToBeRecorded = true;
         }
       }
-      // If the call ends while a delay is still open (e.g. the RPC was cancelled or its deadline
-      // expired while waiting for name resolution), gRFC A121 expects the partial duration to be
-      // recorded. Records outside the lock above, which also serialises the delay callbacks.
-      terminateOpenDelay();
       if (shouldRecordFinishedCall) {
         recordFinishedCall();
       }
@@ -657,72 +614,50 @@ final class OpenTelemetryMetricsModule {
     @Override
     public void recordDelayStart(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
-      if (module.resource.clientCallDelayCounter() == null) {
-        // Nothing to record, so do not pay for timing the delay.
-        return;
-      }
-      long rolledOverNanos = 0;
-      String rolledOverType = null;
       synchronized (lock) {
         if (callEnded) {
           return;
         }
-        if (activeCallDelayStopwatch != null) {
-          if (delayType.equals(activeCallDelayType)) {
-            // Redundant start: keep timing the delay from when it actually started.
-            return;
-          }
-          // The channel normally ends a delay before starting the next one. If it did not, close
-          // out the previous segment under its own type so the new one is timed separately.
-          rolledOverNanos = activeCallDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
-          rolledOverType = activeCallDelayType;
+        if (activeCallDelayStopwatch != null && delayType.equals(activeCallDelayType)) {
+          // Redundant start: keep timing the delay from when it actually started.
+          return;
         }
-        activeCallDelayStopwatch = module.stopwatchSupplier.get().start();
+        // The channel normally ends a delay before starting the next one. If it did not, close out
+        // the previous segment under its own type so the new one is timed separately.
+        terminateOpenDelay();
         activeCallDelayType = delayType;
-      }
-      if (rolledOverType != null) {
-        recordDelay(rolledOverNanos, rolledOverType);
+        activeCallDelayStopwatch = module.stopwatchSupplier.get().start();
       }
     }
 
     @Override
     public void recordDelayEnd(String delayType) {
       checkNotNull(delayType, "delayType");
-      long delayNanos;
       synchronized (lock) {
-        if (activeCallDelayStopwatch == null) {
-          return;
+        if (activeCallDelayStopwatch != null) {
+          // Labeled with the type the channel supplied, which owns it.
+          recordDelay(activeCallDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS), delayType);
+          activeCallDelayStopwatch = null;
+          activeCallDelayType = null;
         }
-        delayNanos = activeCallDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
-        activeCallDelayStopwatch = null;
-        activeCallDelayType = null;
       }
-      recordDelay(delayNanos, delayType);
     }
 
     /**
      * Ends a call-level delay that is still open, labeled with the type the channel gave when it
      * started. No-op if no delay is open.
      */
+    @GuardedBy("lock")
     private void terminateOpenDelay() {
-      long delayNanos;
-      String delayType;
-      synchronized (lock) {
-        if (activeCallDelayStopwatch == null) {
-          return;
-        }
-        delayNanos = activeCallDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS);
-        delayType = activeCallDelayType;
+      if (activeCallDelayStopwatch != null) {
+        recordDelay(
+            activeCallDelayStopwatch.stop().elapsed(TimeUnit.NANOSECONDS), activeCallDelayType);
         activeCallDelayStopwatch = null;
         activeCallDelayType = null;
       }
-      recordDelay(delayNanos, delayType);
     }
 
-    /**
-     * Records a delay to {@code grpc.client.call.delay.duration}. Must be called without holding
-     * {@code lock}, since it calls into user-supplied OpenTelemetry code.
-     */
+    /** Records a delay to {@code grpc.client.call.delay.duration}. */
     private void recordDelay(long delayNanos, String delayType) {
       DoubleHistogram delayHistogram = module.resource.clientCallDelayCounter();
       if (delayHistogram == null) {
@@ -730,7 +665,7 @@ final class OpenTelemetryMetricsModule {
       }
       delayHistogram.record(
           delayNanos * SECONDS_PER_NANO,
-          callLevelBaseAttributes.toBuilder().put(DELAY_TYPE_KEY, delayType).build(),
+          Attributes.of(METHOD_KEY, fullMethodName, TARGET_KEY, target, DELAY_TYPE_KEY, delayType),
           otelContext);
     }
   }

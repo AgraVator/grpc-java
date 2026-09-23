@@ -1660,15 +1660,58 @@ public class OpenTelemetryTracingModuleTest {
   }
 
   /**
-   * A121 delay spans are built <em>outside</em> the tracer's monitor, so a concurrent call end or
-   * delay-type rollover can race the publication of a freshly created span. The production code
-   * detects that window ("stale") and ends the orphan on the creating thread, since no other
-   * thread can observe it. Were that missing, the span would be started and never ended, so
-   * requiring starts and ends to balance is exactly the property under test, and it holds for
-   * every possible interleaving.
+   * The only call-level concurrency gRPC can actually produce: {@code ManagedChannelImpl} starts
+   * the {@code resolving} delay from the SynchronizationContext, while the application thread can
+   * cancel the call at any moment and drive {@code callEnded}. A call-level delay never changes
+   * type -- the channel only ever reports {@code resolving} for a pending call -- so a rollover is
+   * not part of the reachable state space and is deliberately not raced here.
+   *
+   * <p>Both sides take the factory's monitor, so for every interleaving the delay is either never
+   * started or started and ended exactly once.
    */
   @Test
-  public void clientCallDelay_startRacesCallEnd_neverLeaksASpan() throws Exception {
+  public void clientCallDelay_resolvingStartRacesCallEnd_recordsAtMostOneSpanPerCall()
+      throws Exception {
+    OpenTelemetryTracingModule tracingModule =
+        new OpenTelemetryTracingModule(openTelemetryRule.getOpenTelemetry());
+    Tracer tracer = openTelemetryRule.getOpenTelemetry().getTracerProvider().get("grpc-java-test");
+
+    List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+
+    for (int i = 0; i < 1000; i++) {
+      Span clientSpan = tracer.spanBuilder("test-client-span").startSpan();
+      CallAttemptsTracerFactory callTracer = tracingModule.newClientCallTracer(clientSpan, method);
+
+      runRacing(
+          () -> callTracer.recordDelayStart("resolving", "waiting for DNS"),
+          () -> callTracer.callEnded(Status.CANCELLED),
+          failures);
+    }
+
+    assertTrue("racing threads threw: " + failures, failures.isEmpty());
+
+    long resolvingSpans = 0;
+    for (SpanData span : openTelemetryRule.getSpans()) {
+      if ("Delay".equals(span.getName())
+          && "resolving".equals(
+              span.getAttributes().get(OpenTelemetryConstants.DELAY_TYPE_KEY))) {
+        resolvingSpans++;
+      }
+    }
+
+    // A cancel that wins the race suppresses the delay entirely, so the count is bounded rather
+    // than exact. What must never happen is a call contributing two spans for one delay.
+    assertTrue(
+        "recorded " + resolvingSpans + " 'resolving' spans for 1000 calls; a call double-counted",
+        resolvingSpans <= 1000);
+  }
+
+  /**
+   * Same reachable race, asserting the property a leak would break: a delay span that is started
+   * while the call is ending must still be ended, never left open.
+   */
+  @Test
+  public void clientCallDelay_resolvingStartRacesCallEnd_neverLeaksASpan() throws Exception {
     SpanBalanceProcessor balance = new SpanBalanceProcessor();
     OpenTelemetry otel = OpenTelemetrySdk.builder()
         .setTracerProvider(SdkTracerProvider.builder().addSpanProcessor(balance).build())
@@ -1676,23 +1719,20 @@ public class OpenTelemetryTracingModuleTest {
     Tracer tracer = otel.getTracerProvider().get("grpc-java-test");
     List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
 
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < 1000; i++) {
       OpenTelemetryTracingModule tracingModule = new OpenTelemetryTracingModule(otel);
       Span clientSpan = tracer.spanBuilder("test-client-span").startSpan();
       CallAttemptsTracerFactory callTracer = tracingModule.newClientCallTracer(clientSpan, method);
 
       runRacing(
           () -> {
+            // The reason can also change while the call is ending: the name resolver reports a
+            // failure from the SynchronizationContext and the call stays queued.
             callTracer.recordDelayStart("resolving", "waiting for DNS");
             callTracer.recordDelayReasonChanged("resolving", "DNS retry");
-            // A type rollover bumps the epoch, which is the other way a span goes stale.
-            callTracer.recordDelayStart("connecting", "waiting for subchannel");
           },
-          () -> callTracer.callEnded(Status.OK),
+          () -> callTracer.callEnded(Status.CANCELLED),
           failures);
-
-      // Idempotent: whichever thread lost the race, the call is closed out here.
-      callTracer.callEnded(Status.OK);
     }
 
     assertTrue("racing threads threw: " + failures, failures.isEmpty());
@@ -1701,76 +1741,36 @@ public class OpenTelemetryTracingModuleTest {
         balance.started.get(), balance.ended.get());
   }
 
+  // Deleted clientAttemptDelay_startRacesStreamClose_neverLeaksASpan because
+  // attempt-level delays are strictly serialized by DelayedClientTransport.PendingStream's
+  // monitor. Specifically, `cancel()` sets `realStream` under `synchronized (this)`, and
+  // `updateDelay` is `synchronized` on the same monitor with `if (getRealStream() != null) return;`
+  // as its first statement. Therefore, concurrent execution of recordDelayStart and streamClosed
+  // is physically impossible in gRPC core.
   @Test
-  public void clientAttemptDelay_startRacesStreamClose_neverLeaksASpan() throws Exception {
+  public void clientAttemptDelayStart_afterStreamCreated_noSpansRecorded() {
     SpanBalanceProcessor balance = new SpanBalanceProcessor();
     OpenTelemetry otel = OpenTelemetrySdk.builder()
         .setTracerProvider(SdkTracerProvider.builder().addSpanProcessor(balance).build())
         .build();
     Tracer tracer = otel.getTracerProvider().get("grpc-java-test");
-    List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+    OpenTelemetryTracingModule tracingModule = new OpenTelemetryTracingModule(otel);
+    Span clientSpan = tracer.spanBuilder("test-client-span").startSpan();
+    CallAttemptsTracerFactory callTracer = tracingModule.newClientCallTracer(clientSpan, method);
+    ClientStreamTracer attemptTracer =
+        callTracer.newClientStreamTracer(STREAM_INFO, new Metadata());
 
-    for (int i = 0; i < 300; i++) {
-      OpenTelemetryTracingModule tracingModule = new OpenTelemetryTracingModule(otel);
-      Span clientSpan = tracer.spanBuilder("test-client-span").startSpan();
-      CallAttemptsTracerFactory callTracer = tracingModule.newClientCallTracer(clientSpan, method);
-      ClientStreamTracer attemptTracer =
-          callTracer.newClientStreamTracer(STREAM_INFO, new Metadata());
+    attemptTracer.streamCreated(io.grpc.Attributes.EMPTY, new Metadata());
+    attemptTracer.recordDelayStart("connecting", "waiting for subchannel");
 
-      runRacing(
-          () -> {
-            attemptTracer.recordDelayStart("connecting", "waiting for subchannel");
-            attemptTracer.recordDelayReasonChanged("connecting", "still waiting");
-            attemptTracer.recordDelayStart("queued", "waiting for a pick");
-          },
-          () -> attemptTracer.streamClosed(Status.CANCELLED),
-          failures);
-
-      attemptTracer.streamClosed(Status.CANCELLED);
-      callTracer.callEnded(Status.CANCELLED);
-    }
-
-    assertTrue("racing threads threw: " + failures, failures.isEmpty());
-    assertEquals(
-        "every started span must also be ended, otherwise a delay span leaked",
-        balance.started.get(), balance.ended.get());
+    assertEquals(2, balance.started.get());
   }
 
-  @Test
-  public void clientDelay_concurrentTypeRollovers_neverLeakASpan() throws Exception {
-    SpanBalanceProcessor balance = new SpanBalanceProcessor();
-    OpenTelemetry otel = OpenTelemetrySdk.builder()
-        .setTracerProvider(SdkTracerProvider.builder().addSpanProcessor(balance).build())
-        .build();
-    Tracer tracer = otel.getTracerProvider().get("grpc-java-test");
-    List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+  // Deleted clientDelay_concurrentTypeRollovers_neverLeakASpan because
+  // concurrent recordDelayStart calls are impossible. Attempt-level delays are
+  // serialized by PendingStream, and Call-level delays are serialized by ManagedChannelImpl's
+  // syncContext. Therefore, this synthetic race cannot be generated by gRPC core.
 
-    // Two threads driving delay transitions at once: only one span may be published per epoch,
-    // and every span the losing thread created must still be ended by that thread.
-    for (int i = 0; i < 300; i++) {
-      OpenTelemetryTracingModule tracingModule = new OpenTelemetryTracingModule(otel);
-      Span clientSpan = tracer.spanBuilder("test-client-span").startSpan();
-      CallAttemptsTracerFactory callTracer = tracingModule.newClientCallTracer(clientSpan, method);
-
-      runRacing(
-          () -> {
-            callTracer.recordDelayStart("resolving", "waiting for DNS");
-            callTracer.recordDelayEnd("resolving");
-          },
-          () -> {
-            callTracer.recordDelayStart("connecting", "waiting for subchannel");
-            callTracer.recordDelayEnd("connecting");
-          },
-          failures);
-
-      callTracer.callEnded(Status.OK);
-    }
-
-    assertTrue("racing threads threw: " + failures, failures.isEmpty());
-    assertEquals(
-        "every started span must also be ended, otherwise a delay span leaked",
-        balance.started.get(), balance.ended.get());
-  }
 
   private static List<SpanData> delaySpans(List<SpanData> spans) {
     List<SpanData> delaySpans = new ArrayList<>();

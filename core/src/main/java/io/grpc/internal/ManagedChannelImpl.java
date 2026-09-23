@@ -1080,13 +1080,6 @@ final class ManagedChannelImpl extends ManagedChannel implements
        * Whether the call tracers have been told that a delay is open. The channel is the sole
        * owner of the delay type (gRFC A121), which is always {@code DELAY_TYPE_RESOLVING} for a
        * pending call and therefore doesn't need to be stored.
-       *
-       * <p>This and {@link #delayFinished} are guarded by this call's monitor, which is also the
-       * monitor {@link DelayedClientCall} uses for {@code start()}/{@code cancel()}. The tracer
-       * callbacks are user code that may be slow, so they are invoked after the monitor has been
-       * released; holding it across them would stall both this call and, since the delay is
-       * started from the SynchronizationContext, name resolution and load balancing updates for
-       * the whole channel.
        */
       @GuardedBy("this")
       private boolean delayOpen;
@@ -1096,6 +1089,20 @@ final class ManagedChannelImpl extends ManagedChannel implements
        */
       @GuardedBy("this")
       private boolean delayFinished;
+      /**
+       * Whether one of the notification methods below is part-way through its fan-out. A tracer is
+       * free to cancel the call from inside its own callback, and {@link #cancel} runs
+       * {@link #callCancelled} synchronously, so the end can re-enter on this very thread and this
+       * very monitor. Ending the delay right then would hand the tracers that have not been
+       * reached yet an end before their start, so the end waits for the fan-out to finish.
+       */
+      @GuardedBy("this")
+      private boolean notifyingTracers;
+      /**
+       * Whether an end arrived while {@link #notifyingTracers} was set and still owes a fan-out.
+       */
+      @GuardedBy("this")
+      private boolean endDeferred;
 
       PendingCall(Context context, MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
         super(
@@ -1120,13 +1127,11 @@ final class ManagedChannelImpl extends ManagedChannel implements
        *
        * <p>Must run in SynchronizationContext.
        */
-      void notifyQueuedForNameResolution(@Nullable Status initialError) {
-        synchronized (this) {
-          if (delayFinished || delayOpen) {
-            return;
-          }
-          delayOpen = true;
+      synchronized void notifyQueuedForNameResolution(@Nullable Status initialError) {
+        if (delayFinished || delayOpen) {
+          return;
         }
+        delayOpen = true;
         List<ClientStreamTracer.Factory> factories = callOptions.getStreamTracerFactories();
         if (factories.isEmpty()) {
           return;
@@ -1135,14 +1140,13 @@ final class ManagedChannelImpl extends ManagedChannel implements
         String delayReason = initialError == null
             ? "waiting for name resolution to complete for target " + target
             : "name resolution failed for target " + target + ": " + initialError;
-        for (ClientStreamTracer.Factory factory : factories) {
-          if (isDelayFinished()) {
-            // The call ended concurrently with this loop. The tracers that have already been
-            // notified terminate the delay themselves when the call ends, and the remaining ones
-            // are better off not seeing a delay that starts after the call is over.
-            break;
+        notifyingTracers = true;
+        try {
+          for (ClientStreamTracer.Factory factory : factories) {
+            factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
           }
-          factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
+        } finally {
+          finishTracerNotification();
         }
       }
 
@@ -1152,60 +1156,58 @@ final class ManagedChannelImpl extends ManagedChannel implements
        *
        * <p>Must run in SynchronizationContext.
        */
-      void notifyNameResolutionFailed(Status error) {
-        synchronized (this) {
-          if (delayFinished || !delayOpen) {
-            return;
-          }
-        }
-        List<ClientStreamTracer.Factory> factories = callOptions.getStreamTracerFactories();
-        if (factories.isEmpty()) {
+      synchronized void notifyNameResolutionFailed(Status error) {
+        if (delayFinished || !delayOpen) {
           return;
         }
         String delayReason = "name resolution failed for target " + target + ": " + error;
-        for (ClientStreamTracer.Factory factory : factories) {
-          if (isDelayFinished()) {
-            break;
+        notifyingTracers = true;
+        try {
+          for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+            factory.recordDelayReasonChanged(DELAY_TYPE_RESOLVING, delayReason);
           }
-          factory.recordDelayReasonChanged(DELAY_TYPE_RESOLVING, delayReason);
-        }
-      }
-
-      /** Ends the delay, if one is open, because the call is no longer waiting on resolution. */
-      private void endDelayIfNeeded() {
-        boolean notifyTracers;
-        synchronized (this) {
-          if (delayFinished) {
-            return;
-          }
-          delayFinished = true;
-          notifyTracers = delayOpen;
-        }
-        if (!notifyTracers) {
-          return;
-        }
-        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
-          factory.recordDelayEnd(DELAY_TYPE_RESOLVING);
+        } finally {
+          finishTracerNotification();
         }
       }
 
       /**
-       * Marks the delay as terminated without notifying the tracers, because the call itself has
-       * ended (cancellation, deadline exceeded or a forceful channel shutdown).
+       * Ends the delay, if one is open, because the call is no longer waiting on resolution.
        *
-       * <p>Per gRFC A121 the call tracer terminates an open delay by itself when the RPC is
-       * cancelled or reaches its deadline, so the channel must not end it here. It couldn't do so
-       * reliably anyway: the listener is closed on the call executor before {@code callCancelled()}
-       * runs, so the delay end would race with, and usually land after, the end of the call. The
-       * state is still updated so that a concurrent {@link #notifyQueuedForNameResolution} can't
-       * open a new delay after the call has ended.
+       * <p>Shares the call's monitor with the two notification methods above, so a delay end can
+       * never interleave with a start or a reason change that is part-way through its fan-out.
        */
-      private synchronized void abandonDelay() {
+      private synchronized void endDelayIfNeeded() {
+        if (delayFinished) {
+          return;
+        }
         delayFinished = true;
+        if (!delayOpen) {
+          return;
+        }
+        if (notifyingTracers) {
+          // Re-entered from inside a fan-out; see notifyingTracers.
+          endDeferred = true;
+          return;
+        }
+        fanOutDelayEnd();
       }
 
-      private synchronized boolean isDelayFinished() {
-        return delayFinished;
+      /** Closes a fan-out and emits the end that was deferred during it, if there was one. */
+      @GuardedBy("this")
+      private void finishTracerNotification() {
+        notifyingTracers = false;
+        if (endDeferred) {
+          endDeferred = false;
+          fanOutDelayEnd();
+        }
+      }
+
+      @GuardedBy("this")
+      private void fanOutDelayEnd() {
+        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+          factory.recordDelayEnd(DELAY_TYPE_RESOLVING);
+        }
       }
 
       /** Called when it's ready to create a real call and reprocess the pending call. */
@@ -1242,7 +1244,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
 
       @Override
       protected void callCancelled() {
-        abandonDelay();
+        endDelayIfNeeded();
         super.callCancelled();
         syncContext.execute(new PendingCallRemoval());
       }

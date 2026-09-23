@@ -190,22 +190,9 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * delay, and therefore the histogram it is recorded to, is determined by whether the channel
      * calls them on the factory (call-scoped) or on the stream tracer (attempt-scoped).
      *
-     * <p>The channel is the sole owner of the current delay type and supplies it on every call, so
-     * implementations do not need to store it.
+     * <p>For the full contract and threading semantics, see
+     * {@link ClientStreamTracer#recordDelayStart(String, String)}.
      *
-     * <p>This method may be invoked on channel-internal threads, including the channel's
-     * synchronization context. Implementations must return promptly, must not block, and must not
-     * re-enter gRPC.
-     *
-     * <p>A delay start may race with call termination: the channel's synchronization context and
-     * the call executor run concurrently, so this method can be invoked after the call has already
-     * ended. Implementations must treat that as a no-op rather than opening a span that is never
-     * closed.
-     *
-     * @param delayType canonical low-cardinality label categorizing the delay (e.g., "resolving").
-     *     Never {@code null}.
-     * @param delayReason high-cardinality diagnostic string describing granular runtime conditions.
-     *     Never {@code null}.
      * @since 1.84.0
      */
     public void recordDelayStart(String delayType, String delayReason) {
@@ -215,16 +202,9 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * Called when the reason for an ongoing call-scoped delay changes while its {@code delayType}
      * stays the same, for example when the name resolver reports a second consecutive failure.
      *
-     * <p>Implementations should record a structured event (such as {@code "Delay triggered"}) on
-     * the active delay span without recreating the span or resetting timers.
+     * <p>For the full contract and threading semantics, see
+     * {@link ClientStreamTracer#recordDelayReasonChanged(String, String)}.
      *
-     * <p>This method may be invoked on channel-internal threads, including the channel's
-     * synchronization context. Implementations must return promptly, must not block, and must not
-     * re-enter gRPC.
-     *
-     * @param delayType canonical low-cardinality label of the ongoing delay. Never {@code null}.
-     * @param delayReason updated high-cardinality diagnostic string describing the new conditions.
-     *     Never {@code null}.
      * @since 1.84.0
      */
     public void recordDelayReasonChanged(String delayType, String delayReason) {
@@ -234,16 +214,9 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * Called when a call-scoped delay resolves, for example when name resolution completes, or
      * when the RPC is cancelled or reaches its deadline while still waiting.
      *
-     * <p>Implementations should close the active delay span and record the elapsed duration to the
-     * {@code grpc.client.call.delay.duration} histogram, labeled with the supplied
-     * {@code delayType}.
+     * <p>For the full contract and threading semantics, see
+     * {@link ClientStreamTracer#recordDelayEnd(String)}.
      *
-     * <p>This method may be invoked on channel-internal threads, including the channel's
-     * synchronization context. Implementations must return promptly, must not block, and must not
-     * re-enter gRPC.
-     *
-     * @param delayType canonical low-cardinality label of the delay being ended. Never
-     *     {@code null}.
      * @since 1.84.0
      */
     public void recordDelayEnd(String delayType) {

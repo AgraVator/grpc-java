@@ -119,8 +119,8 @@ public final class GracefulSwitchLoadBalancer extends ForwardingLoadBalancer {
     pendingBalancerFactory = null;
     pendingState = ConnectivityState.CONNECTING;
     // This placeholder can reach the channel: swap() below publishes it as-is when the outgoing
-    // policy is not READY, before the incoming one has reported anything. Annotate it per gRFC
-    // A121 so an RPC queued during a policy switch says so, rather than falling back to the
+    // policy is not READY, before the incoming one has reported anything. We choose to annotate it
+    // so an RPC queued during a policy switch says so, rather than falling back to the
     // channel's generic "waiting for picker".
     pendingPicker = new FixedResultPicker(
         PickResult.withNoResult("connecting", DELAY_REASON_SWITCHING));

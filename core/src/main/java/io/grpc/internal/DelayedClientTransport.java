@@ -35,13 +35,11 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.ClientStreamListener.RpcProgress;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.concurrent.Executor;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -180,9 +178,6 @@ final class DelayedClientTransport implements ManagedClientTransport {
           state = newerState;
         }
       }
-      // 'lock' has been released. Must not call the tracers while it is held, to prevent
-      // deadlocks, so the delay that queued this stream is only delivered now.
-      pendingStream.deliverDelayEvents();
       return pendingStream;
     } finally {
       syncContext.drain();
@@ -191,8 +186,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
 
   /**
    * Caller must call {@code syncContext.drain()} outside of lock because this method may
-   * schedule tasks on syncContext. Caller must also call {@link PendingStream#deliverDelayEvents}
-   * outside of lock, to deliver the delay callback that this method queues.
+   * schedule tasks on syncContext.
    */
   @GuardedBy("lock")
   private PendingStream createPendingStream(
@@ -440,30 +434,26 @@ final class DelayedClientTransport implements ManagedClientTransport {
     private final Context context = Context.current();
     private final ClientStreamTracer[] tracers;
     private volatile Status lastPickStatus;
-    /**
-     * Guards the delay telemetry state below.
-     *
-     * <p>This is a leaf lock: no other lock is acquired while it is held, and, in particular, the
-     * tracers are never called while it is held. A transition is decided under this lock and the
-     * callbacks it implies are queued into {@code pendingDelayEvents}; {@link #deliverDelayEvents}
-     * then delivers them, in the order they were decided, with no lock held.
-     */
-    private final Object delayLock = new Object();
     /** Type of the delay in progress. Non-{@code null} until {@code delayEnded}. */
-    @GuardedBy("delayLock")
+    @GuardedBy("this")
     @Nullable private String activeDelayType;
-    @GuardedBy("delayLock")
+    @GuardedBy("this")
     @Nullable private String activeDelayReason;
     /** See {@link DelayedClientTransport#determineQueuingDelayReasonSource}. */
-    @GuardedBy("delayLock")
+    @GuardedBy("this")
     @Nullable private Object activeDelayReasonSource;
-    @GuardedBy("delayLock")
+    @GuardedBy("this")
     private boolean delayEnded;
-    /** Callbacks that have been decided, but not delivered yet, in the order decided. */
-    @GuardedBy("delayLock")
-    private final Queue<DelayEvent> pendingDelayEvents = new ArrayDeque<>(2);
-    @GuardedBy("delayLock")
-    private boolean deliveringDelayEvents;
+    /**
+     * Whether {@link #startDelay} or {@link #updateDelay} is part-way through its tracer fan-out.
+     * If a tracer cancels from inside its callback, {@link #cancel} re-enters {@link #endDelay} on
+     * this thread and monitor; deferring the end until the current fan-out completes ensures every
+     * tracer observes balanced start/reason/end callbacks in order.
+     */
+    @GuardedBy("this")
+    private boolean notifyingTracers;
+    @GuardedBy("this")
+    private boolean endDeferred;
 
     private PendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers) {
       super("connecting_and_lb");
@@ -473,23 +463,25 @@ final class DelayedClientTransport implements ManagedClientTransport {
 
     /**
      * Records the delay that this stream is queued by. Must be called exactly once, before the
-     * stream is visible to other threads. The callback is only queued, because the caller holds
-     * {@code lock}; the caller must call {@link #deliverDelayEvents} after releasing it.
+     * stream is visible to other threads.
      */
-    void startDelay(String delayType, Object delayReasonSource) {
+    synchronized void startDelay(String delayType, Object delayReasonSource) {
       checkNotNull(delayType, "delayType");
-      synchronized (delayLock) {
-        activeDelayType = delayType;
-        activeDelayReasonSource = delayReasonSource;
-        activeDelayReason = determineQueuingDelayReason(delayReasonSource);
-        pendingDelayEvents.add(DelayEvent.start(delayType, activeDelayReason));
+      activeDelayType = delayType;
+      activeDelayReasonSource = delayReasonSource;
+      activeDelayReason = determineQueuingDelayReason(delayReasonSource);
+      notifyingTracers = true;
+      try {
+        for (ClientStreamTracer tracer : tracers) {
+          tracer.recordDelayStart(delayType, activeDelayReason);
+        }
+      } finally {
+        finishTracerNotification();
       }
-      // Not delivered here: 'lock' is held by the caller.
     }
 
     /**
-     * Updates the delay telemetry state of a stream whose pick stayed queued, and delivers the
-     * resulting callbacks.
+     * Updates the delay telemetry state of a stream whose pick stayed queued.
      *
      * <p>If {@code newType} differs from the type of the delay in progress, that delay is ended
      * and a new one is started. If only the reason changed, the delay in progress is kept and the
@@ -498,115 +490,101 @@ final class DelayedClientTransport implements ManagedClientTransport {
      * <p>The reason is derived from {@code pickResult} lazily: {@link #reprocess} calls this for
      * every pending stream on every picker update, and in the common case nothing changed.
      */
-    void updateDelay(String newType, @Nullable PickResult pickResult) {
+    synchronized void updateDelay(String newType, @Nullable PickResult pickResult) {
       checkNotNull(newType, "newType");
-      synchronized (delayLock) {
-        if (delayEnded) {
-          // The stream is no longer queued: it has been cancelled, or it has been handed a real
-          // stream. Both end the delay before the stream changes hands, so there is nothing left
-          // to update.
-          return;
-        }
-        Object newReasonSource = determineQueuingDelayReasonSource(pickResult);
-        boolean typeChanged = !newType.equals(activeDelayType);
-        if (!typeChanged && Objects.equals(activeDelayReasonSource, newReasonSource)) {
-          // Nothing changed since the last picker update; don't materialize the reason.
-          return;
-        }
-        String newReason = determineQueuingDelayReason(newReasonSource);
-        activeDelayReasonSource = newReasonSource;
-        if (typeChanged) {
-          // Delay type changed (e.g., from RLS lookup to connecting). End the previous delay.
-          pendingDelayEvents.add(DelayEvent.end(activeDelayType));
-          pendingDelayEvents.add(DelayEvent.start(newType, newReason));
+      if (delayEnded) {
+        // The stream is no longer queued: it has been cancelled, or it has been handed a real
+        // stream. Both end the delay before the stream changes hands, so there is nothing left
+        // to update.
+        return;
+      }
+      Object newReasonSource = determineQueuingDelayReasonSource(pickResult);
+      boolean typeChanged = !newType.equals(activeDelayType);
+      if (!typeChanged && Objects.equals(activeDelayReasonSource, newReasonSource)) {
+        // Nothing changed since the last picker update; don't materialize the reason.
+        return;
+      }
+      String newReason = determineQueuingDelayReason(newReasonSource);
+      activeDelayReasonSource = newReasonSource;
+      if (typeChanged) {
+        // Delay type changed (e.g., from RLS lookup to connecting). Per gRFC A121 the delay in
+        // progress must be ended before the new one is started.
+        notifyingTracers = true;
+        try {
+          for (ClientStreamTracer tracer : tracers) {
+            tracer.recordDelayEnd(activeDelayType);
+          }
+          if (endDeferred) {
+            // A tracer cancelled during the end fan-out above; the previous delay has now been
+            // ended on every tracer, so do not open a new delay segment.
+            endDeferred = false;
+            activeDelayType = null;
+            activeDelayReason = null;
+            activeDelayReasonSource = null;
+            return;
+          }
           activeDelayType = newType;
           activeDelayReason = newReason;
-        } else if (newReason.equals(activeDelayReason)) {
-          // Different source, same reason (e.g., an equal but distinct pick failure Status).
-          return;
-        } else {
-          // Delay type is unchanged, but the reason changed (e.g., connection status detail
-          // updated).
-          activeDelayReason = newReason;
-          pendingDelayEvents.add(DelayEvent.reasonChanged(newType, newReason));
-        }
-      }
-      deliverDelayEvents();
-    }
-
-    /**
-     * Ends the delay in progress, if it has not ended already, and delivers the callback. This
-     * must happen before the stream is handed a real stream or is cancelled, so that the delay is
-     * reported before any terminal callback.
-     */
-    void endDelay() {
-      synchronized (delayLock) {
-        if (delayEnded) {
-          return;
-        }
-        delayEnded = true;
-        // activeDelayType is set when the stream is created and only cleared here, so it is
-        // non-null.
-        pendingDelayEvents.add(DelayEvent.end(activeDelayType));
-        activeDelayType = null;
-        activeDelayReason = null;
-        activeDelayReasonSource = null;
-      }
-      deliverDelayEvents();
-      synchronized (delayLock) {
-        boolean interrupted = false;
-        while (deliveringDelayEvents) {
-          try {
-            delayLock.wait();
-          } catch (InterruptedException e) {
-            interrupted = true;
+          for (ClientStreamTracer tracer : tracers) {
+            tracer.recordDelayStart(newType, newReason);
           }
+        } finally {
+          finishTracerNotification();
         }
-        if (interrupted) {
-          Thread.currentThread().interrupt();
+      } else if (newReason.equals(activeDelayReason)) {
+        // Different source, same reason (e.g., an equal but distinct pick failure Status).
+        return;
+      } else {
+        // Delay type is unchanged, but the reason changed (e.g., connection status detail
+        // updated).
+        activeDelayReason = newReason;
+        notifyingTracers = true;
+        try {
+          for (ClientStreamTracer tracer : tracers) {
+            tracer.recordDelayReasonChanged(newType, newReason);
+          }
+        } finally {
+          finishTracerNotification();
         }
       }
     }
 
     /**
-     * Delivers the delay callbacks that have been decided but not delivered yet, in the order they
-     * were decided, without holding any lock. If another thread is already delivering, this
-     * returns immediately and that thread delivers what has just been queued.
+     * Ends the delay in progress, if it has not ended already. This must happen before the stream
+     * is handed a real stream or is cancelled, so that the delay is reported before any terminal
+     * callback.
      */
-    void deliverDelayEvents() {
-      synchronized (delayLock) {
-        if (deliveringDelayEvents) {
-          return;
-        }
-        deliveringDelayEvents = true;
+    synchronized void endDelay() {
+      if (delayEnded) {
+        return;
       }
-      boolean stillDelivering = true;
-      try {
-        while (true) {
-          DelayEvent event;
-          synchronized (delayLock) {
-            event = pendingDelayEvents.poll();
-            if (event == null) {
-              // The flag must be cleared in the same critical section that found the queue empty,
-              // otherwise an event queued by another thread could be left undelivered.
-              deliveringDelayEvents = false;
-              delayLock.notifyAll();
-              stillDelivering = false;
-              return;
-            }
-          }
-          // Must not call the tracers while a lock is held, to prevent deadlocks.
-          event.deliver(tracers);
-        }
-      } finally {
-        if (stillDelivering) {
-          // A tracer threw. Let a later transition deliver the rest instead of never delivering.
-          synchronized (delayLock) {
-            deliveringDelayEvents = false;
-            delayLock.notifyAll();
-          }
-        }
+      delayEnded = true;
+      if (notifyingTracers) {
+        endDeferred = true;
+        return;
       }
+      fanOutDelayEnd();
+    }
+
+    @GuardedBy("this")
+    private void finishTracerNotification() {
+      notifyingTracers = false;
+      if (endDeferred) {
+        endDeferred = false;
+        fanOutDelayEnd();
+      }
+    }
+
+    @GuardedBy("this")
+    private void fanOutDelayEnd() {
+      // activeDelayType is set when the stream is created and only cleared here, so it is
+      // non-null.
+      for (ClientStreamTracer tracer : tracers) {
+        tracer.recordDelayEnd(activeDelayType);
+      }
+      activeDelayType = null;
+      activeDelayReason = null;
+      activeDelayReasonSource = null;
     }
 
     /**
@@ -687,53 +665,6 @@ final class DelayedClientTransport implements ManagedClientTransport {
         }
       }
       super.appendTimeoutInsight(insight);
-    }
-  }
-
-  /**
-   * A delay callback that has been decided by a {@link PendingStream}, but has not been delivered
-   * to the stream tracers yet. Callbacks are queued while the delay state lock is held and
-   * delivered once it has been released, so that the tracers are never called under a lock.
-   */
-  private static final class DelayEvent {
-    private enum Kind {
-      START,
-      REASON_CHANGED,
-      END,
-    }
-
-    private final Kind kind;
-    private final String delayType;
-    @Nullable private final String delayReason;
-
-    static DelayEvent start(String delayType, String delayReason) {
-      return new DelayEvent(Kind.START, delayType, delayReason);
-    }
-
-    static DelayEvent reasonChanged(String delayType, String delayReason) {
-      return new DelayEvent(Kind.REASON_CHANGED, delayType, delayReason);
-    }
-
-    static DelayEvent end(String delayType) {
-      return new DelayEvent(Kind.END, delayType, null);
-    }
-
-    private DelayEvent(Kind kind, String delayType, @Nullable String delayReason) {
-      this.kind = kind;
-      this.delayType = delayType;
-      this.delayReason = delayReason;
-    }
-
-    void deliver(ClientStreamTracer[] tracers) {
-      for (ClientStreamTracer tracer : tracers) {
-        if (kind == Kind.START) {
-          tracer.recordDelayStart(delayType, delayReason);
-        } else if (kind == Kind.REASON_CHANGED) {
-          tracer.recordDelayReasonChanged(delayType, delayReason);
-        } else {
-          tracer.recordDelayEnd(delayType);
-        }
-      }
     }
   }
 

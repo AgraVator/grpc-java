@@ -5006,9 +5006,8 @@ public class ManagedChannelImplTest {
 
     call.cancel("Cancelled while queued", null);
 
-    // Per gRFC A121 the call tracer terminates the open delay itself when the call ends, so the
-    // channel must not record the end here: it would land after the call has already ended.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // Per gRFC A121 the channel owns the call-level delay, so cancelling the call ends it.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
     verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
     assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
@@ -5031,9 +5030,9 @@ public class ManagedChannelImplTest {
     call.cancel("Cancelled while queued", null);
     nsFactory.allResolved();
 
-    // The cancelled call is still released from the queue, but its delay was already terminated by
-    // the tracer, so the channel must not emit an end or a reason change afterwards.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // The cancelled call is still released from the queue, but the channel already ended its
+    // delay when the call was cancelled, so no second end or reason change may follow.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 
@@ -5055,9 +5054,9 @@ public class ManagedChannelImplTest {
 
     timer.forwardTime(101, TimeUnit.MILLISECONDS);
 
-    // A121 line 123: the tracer terminates the open delay on the deadline path, so the channel
-    // must not emit an end of its own.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // The deadline cancels the call, and per gRFC A121 the channel ends the open delay on that
+    // path. Exactly one end is emitted.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
     verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
     assertEquals(Status.Code.DEADLINE_EXCEEDED, statusCaptor.getValue().getCode());
@@ -5172,8 +5171,8 @@ public class ManagedChannelImplTest {
 
     channel.shutdownNow();
 
-    // shutdownNow() cancels the queued call, and cancellation is a tracer-terminated path.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // shutdownNow() cancels the queued call, which ends its open delay.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 
@@ -5198,7 +5197,7 @@ public class ManagedChannelImplTest {
   }
 
   @Test
-  public void callDelay_callCancelledDuringTracerIteration_abortsLoop() {
+  public void callDelay_callCancelledDuringTracerIteration_stillBalancesEveryFactory() {
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
         .setResolvedAtStart(false).build();
     channelBuilder.nameResolverFactory(nsFactory);
@@ -5229,10 +5228,11 @@ public class ManagedChannelImplTest {
       callRef.set(call);
     });
 
-    // The first tracer saw the start and cancelled the call from inside the callback; the channel
-    // must then abandon the fan-out rather than open a delay on a call that has already ended.
+    // The first tracer cancelled the call from inside its own recordDelayStart(). The fan-out
+    // still runs to completion, and only then is the end emitted, so the second tracer sees a
+    // start/end pair rather than an end it has no start for.
     assertThat(firstTracerEvents).containsExactly("start:resolving");
-    assertThat(tracer2.events()).isEmpty();
+    assertThat(tracer2.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 
@@ -5334,9 +5334,9 @@ public class ManagedChannelImplTest {
       call.cancel("Cancelled while queued", null);
     });
 
-    // Per A121 the tracer ends the delay itself when the call is cancelled, so the channel must
-    // not report the resolution failure as a reason change on a delay that is already over.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // Cancelling ends the delay, so the resolution failure that follows must not be reported as
+    // a reason change on a delay that is already over.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
     verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
     assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
@@ -5364,10 +5364,9 @@ public class ManagedChannelImplTest {
       channel.syncContext.execute(() -> call.cancel("Cancelled while queued", null));
     });
 
-    // The release pass reprocesses the cancelled call and tries to end its delay, but the tracer
-    // already terminated that delay when the call was cancelled, so the channel must not emit a
-    // second end event for it.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    // The release pass reprocesses the cancelled call and tries to end its delay again, but the
+    // delay already ended when the call was cancelled, so no second end event is emitted.
+    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
     verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
     assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
@@ -5402,7 +5401,7 @@ public class ManagedChannelImplTest {
   }
 
   @Test
-  public void callDelay_callCancelledDuringReasonChange_abortsLoop() {
+  public void callDelay_callCancelledDuringReasonChange_stillBalancesEveryFactory() {
     Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
         .setResolvedAtStart(false)
@@ -5445,10 +5444,13 @@ public class ManagedChannelImplTest {
 
     nsFactory.allResolved();
 
-    // The first tracer cancelled the call from inside the reason-change callback, so the channel
-    // must abandon the fan-out instead of updating a delay that has already terminated.
+    // The first tracer cancelled the call from inside its own recordDelayReasonChanged(). The
+    // fan-out still runs to completion and the end follows it, so the second tracer sees the whole
+    // sequence in order rather than a reason change after the delay had already ended.
     assertThat(firstTracerEvents).containsExactly("start:resolving", "reason:resolving").inOrder();
-    assertThat(tracer2.events()).containsExactly(START_RESOLVING);
+    assertThat(tracer2.events())
+        .containsExactly(START_RESOLVING, reasonResolvingFailed(resolutionError), END_RESOLVING)
+        .inOrder();
     executor.runDueTasks();
   }
 

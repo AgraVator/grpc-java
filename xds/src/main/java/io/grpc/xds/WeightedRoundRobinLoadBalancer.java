@@ -108,8 +108,7 @@ final class WeightedRoundRobinLoadBalancer extends MultiChildLoadBalancer {
   private String locality = "";
   private String backendService = "";
   private SubchannelPicker currentPicker = new FixedResultPicker(
-      PickResult.withNoResult(
-          "connecting", aggregateConnectingDelayReason("weighted_round_robin")));
+      PickResult.withNoResult("connecting", "weighted_round_robin: initializing"));
 
   // The metric instruments are only registered once and shared by all instances of this LB.
   static {
@@ -231,8 +230,7 @@ final class WeightedRoundRobinLoadBalancer extends MultiChildLoadBalancer {
         updateBalancingState(
             ConnectivityState.CONNECTING,
             new FixedResultPicker(
-                PickResult.withNoResult(
-                    "connecting", aggregateConnectingDelayReason("weighted_round_robin"))));
+                PickResult.withNoResult("connecting", "weighted_round_robin: connecting")));
       } else {
         updateBalancingState(
             ConnectivityState.TRANSIENT_FAILURE, createReadyPicker(getChildLbStates()));
@@ -286,11 +284,7 @@ final class WeightedRoundRobinLoadBalancer extends MultiChildLoadBalancer {
   }
 
   private void updateBalancingState(ConnectivityState state, SubchannelPicker picker) {
-    // We use pickerChanged() instead of picker.equals() because FixedResultPicker.equals delegates
-    // to PickResult.equals which deliberately ignores delay fields (A121). If we didn't do this,
-    // a change only in the delay reason would be silently swallowed here and the channel would keep
-    // reporting a stale reason for the whole delay.
-    if (state != currentConnectivityState || pickerChanged(currentPicker, picker)) {
+    if (state != currentConnectivityState || !picker.equals(currentPicker)) {
       getHelper().updateBalancingState(state, picker);
       currentConnectivityState = state;
       currentPicker = picker;

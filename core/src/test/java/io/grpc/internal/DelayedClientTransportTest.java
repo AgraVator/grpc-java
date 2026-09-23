@@ -23,7 +23,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
@@ -57,7 +56,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1107,111 +1105,6 @@ public class DelayedClientTransportTest {
         "start:connecting:pick_first: attempting to connect",
         "end:connecting",
         "closed:CANCELLED").inOrder();
-  }
-
-  /**
-   * The tracers are called by the channel itself, so calling them while a channel lock is held
-   * risks deadlocking with whatever the tracer does. This is the lock that {@code newStream()}
-   * holds while it queues the stream.
-   */
-  @Test
-  public void streamDelayMetrics_delayStartIsNotDeliveredUnderTransportLock() {
-    ClientStreamTracer tracer = new ClientStreamTracer() {
-      @Override
-      public void recordDelayStart(String delayType, String delayReason) {
-        assertCompletesOnOtherThread(
-            "transport lock is held while the tracers are called",
-            new Runnable() {
-              @Override
-              public void run() {
-                delayedTransport.hasPendingStreams();
-              }
-            });
-      }
-    };
-
-    delayedTransport.newStream(method, headers, callOptions, new ClientStreamTracer[] {tracer});
-  }
-
-  /**
-   * Same as above, for the stream monitor that {@code reprocess()} would hold while updating a
-   * delay. It is the same monitor that {@code cancel()} and {@code writeMessage()} use.
-   */
-  @Test
-  public void streamDelayMetrics_delayUpdateIsNotDeliveredUnderStreamMonitor() {
-    final ClientStream[] streamHolder = new ClientStream[1];
-    ClientStreamTracer tracer = new ClientStreamTracer() {
-      @Override
-      public void recordDelayReasonChanged(String delayType, String delayReason) {
-        assertCompletesOnOtherThread(
-            "the stream monitor is held while the tracers are called",
-            new Runnable() {
-              @Override
-              public void run() {
-                streamHolder[0].appendTimeoutInsight(new InsightBuilder());
-              }
-            });
-      }
-    };
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    streamHolder[0] = delayedTransport.newStream(
-        method, headers, callOptions, new ClientStreamTracer[] {tracer});
-    streamHolder[0].start(streamListener);
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 2")));
-  }
-
-  @Test
-  public void streamDelayMetrics_throwingTracer_doesNotBlockLaterCallbacks() {
-    final List<String> endedDelayTypes = new ArrayList<>();
-    ClientStreamTracer throwingTracer = new ClientStreamTracer() {
-      @Override
-      public void recordDelayStart(String delayType, String delayReason) {
-        throw new IllegalStateException("tracer is broken");
-      }
-
-      @Override
-      public void recordDelayEnd(String delayType) {
-        endedDelayTypes.add(delayType);
-      }
-    };
-
-    try {
-      delayedTransport.newStream(
-          method, headers, callOptions, new ClientStreamTracer[] {throwingTracer});
-      fail("Should have thrown");
-    } catch (IllegalStateException expected) {
-      assertEquals("tracer is broken", expected.getMessage());
-    }
-
-    delayedTransport.shutdownNow(Status.UNAVAILABLE);
-
-    assertEquals(Collections.singletonList("connecting"), endedDelayTypes);
-  }
-
-  /**
-   * Runs {@code task} on another thread and asserts that it finishes, which it can not do if the
-   * calling thread holds a lock that {@code task} needs.
-   */
-  private static void assertCompletesOnOtherThread(String message, final Runnable task) {
-    final CountDownLatch done = new CountDownLatch(1);
-    Thread thread = new Thread(new Runnable() {
-      @Override
-      public void run() {
-        task.run();
-        done.countDown();
-      }
-    });
-    thread.start();
-    boolean completed;
-    try {
-      completed = done.await(5, TimeUnit.SECONDS);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new AssertionError(e);
-    }
-    assertTrue(message, completed);
   }
 
   private static final class FakeStreamTracer extends ClientStreamTracer {

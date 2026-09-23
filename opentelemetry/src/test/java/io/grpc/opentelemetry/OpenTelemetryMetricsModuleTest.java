@@ -18,6 +18,7 @@ package io.grpc.opentelemetry;
 
 import static io.grpc.ClientStreamTracer.NAME_RESOLUTION_DELAYED;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.BACKEND_SERVICE_KEY;
+import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.CUSTOM_LABEL_KEY;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.DELAY_TYPE_KEY;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.LOCALITY_KEY;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.METHOD_KEY;
@@ -92,12 +93,14 @@ import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.common.InstrumentationScopeInfo;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.junit4.OpenTelemetryRule;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -125,6 +128,31 @@ import org.mockito.junit.MockitoRule;
  */
 @RunWith(JUnit4.class)
 public class OpenTelemetryMetricsModuleTest {
+  private static void runRacing(Runnable a, Runnable b, List<Throwable> failures)
+      throws InterruptedException {
+    java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
+    Thread ta = new Thread(() -> {
+      try {
+        barrier.await();
+        a.run();
+      } catch (Throwable t) {
+        failures.add(t);
+      }
+    }, "racer-a");
+    Thread tb = new Thread(() -> {
+      try {
+        barrier.await();
+        b.run();
+      } catch (Throwable t) {
+        failures.add(t);
+      }
+    }, "racer-b");
+    ta.start();
+    tb.start();
+    ta.join();
+    tb.join();
+  }
+
 
   private static final CallOptions.Key<String> CUSTOM_OPTION =
       CallOptions.Key.createWithDefault("option1", "default");
@@ -307,7 +335,9 @@ public class OpenTelemetryMetricsModuleTest {
         enabledMetricsMap, disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     Metadata headers = new Metadata();
     ClientStreamTracer tracer =
@@ -475,7 +505,9 @@ public class OpenTelemetryMetricsModuleTest {
         enabledMetrics, disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
              emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -1279,7 +1311,9 @@ public class OpenTelemetryMetricsModuleTest {
         fakeClock.getStopwatchSupplier(), resource, Arrays.asList("grpc.lb.locality"),
         emptyList());
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     ClientStreamTracer tracer =
@@ -1349,7 +1383,9 @@ public class OpenTelemetryMetricsModuleTest {
         fakeClock.getStopwatchSupplier(), resource, Arrays.asList("grpc.lb.locality"),
         emptyList());
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     ClientStreamTracer tracer =
@@ -1415,7 +1451,9 @@ public class OpenTelemetryMetricsModuleTest {
         fakeClock.getStopwatchSupplier(), resource, Arrays.asList("grpc.lb.backend_service"),
         emptyList());
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     ClientStreamTracer tracer =
@@ -1485,7 +1523,9 @@ public class OpenTelemetryMetricsModuleTest {
         fakeClock.getStopwatchSupplier(), resource, Arrays.asList("grpc.lb.backend_service"),
         emptyList());
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     ClientStreamTracer tracer =
@@ -2461,7 +2501,9 @@ public class OpenTelemetryMetricsModuleTest {
         enabledMetricsMap, disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     OpenTelemetryMetricsModule.CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     fakeClock.forwardTime(50, TimeUnit.MILLISECONDS);
@@ -2671,7 +2713,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     callAttemptsTracerFactory.recordDelayStart("resolving", "reason1");
@@ -2699,7 +2743,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     // How the channel drives a delay type change: it ends the current delay and starts a new one.
@@ -2731,7 +2777,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     // The channel normally ends a delay before starting the next one. If it does not, the
@@ -2763,7 +2811,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     // Reasons are high-cardinality diagnostics for tracing spans only; they neither record a
@@ -2792,7 +2842,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     // The channel always supplies the delay type; a null one is a caller bug, not a silent drop.
@@ -2812,7 +2864,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     callAttemptsTracerFactory.recordDelayStart("resolving", "waiting for name resolution");
@@ -2852,7 +2906,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_ATTEMPT_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -2880,7 +2936,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_ATTEMPT_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -2908,6 +2966,60 @@ public class OpenTelemetryMetricsModuleTest {
                     .hasAttributes(delayAttributes(target, "1:connecting")))));
   }
 
+
+  /**
+   * The only call-level concurrency gRPC can actually produce: {@code ManagedChannelImpl} starts
+   * the {@code resolving} delay from the SynchronizationContext, while the application thread can
+   * cancel the call at any moment and drive {@code callEnded}. A call-level delay never changes
+   * type, so a rollover is not part of the reachable state space and is not raced here.
+   *
+   * <p>Both sides take the factory's {@code lock}, so a call either records no delay at all (the
+   * cancel got there first) or records it exactly once. Recording twice for one delay -- which is
+   * what an unsynchronised stopwatch would allow -- pushes the total above the call count.
+   */
+  @Test
+  public void clientCallDelay_resolvingStartRacesCallEnd_neverDoubleCounts() throws Exception {
+    String target = "target:///";
+    OpenTelemetryMetricsResource resource = GrpcOpenTelemetry.createMetricInstruments(testMeter,
+        ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
+
+    OpenTelemetryMetricsModule module = new OpenTelemetryMetricsModule(
+        fakeClock.getStopwatchSupplier(),
+        resource,
+        java.util.Collections.emptyList(),
+        java.util.Collections.emptyList());
+
+    List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+    for (int i = 0; i < 1000; i++) {
+      CallAttemptsTracerFactory callAttemptsTracerFactory =
+          new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+              java.util.Collections.emptyList(), Context.root());
+
+      runRacing(
+          () -> callAttemptsTracerFactory.recordDelayStart("resolving", "waiting for DNS"),
+          () -> callAttemptsTracerFactory.callEnded(Status.CANCELLED),
+          failures);
+    }
+
+    assertTrue("racing threads threw: " + failures, failures.isEmpty());
+
+    long resolvingSamples = 0;
+    for (MetricData metric : openTelemetryTesting.getMetrics()) {
+      if (metric.getName().equals(CLIENT_CALL_DELAY_DURATION)) {
+        for (HistogramPointData point : metric.getHistogramData().getPoints()) {
+          if ("resolving".equals(point.getAttributes().get(DELAY_TYPE_KEY))) {
+            resolvingSamples += point.getCount();
+          }
+        }
+      }
+    }
+
+    assertTrue(
+        "recorded " + resolvingSamples + " 'resolving' samples for 1000 calls; a call was counted"
+            + " twice for a single delay",
+        resolvingSamples <= 1000);
+  }
+
   @Test
   public void clientAttemptDelayDuration_recordsOnlyTheSpecifiedLabels() {
     String target = "target:///";
@@ -2916,10 +3028,15 @@ public class OpenTelemetryMetricsModuleTest {
     OpenTelemetryMetricsModule module = new OpenTelemetryMetricsModule(
         fakeClock.getStopwatchSupplier(),
         resource,
-        Arrays.asList(LOCALITY_KEY.getKey(), BACKEND_SERVICE_KEY.getKey()),
+        Arrays.asList(
+            LOCALITY_KEY.getKey(),
+            BACKEND_SERVICE_KEY.getKey(),
+            CUSTOM_LABEL_KEY.getKey()),
         emptyList());
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -2949,7 +3066,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_ATTEMPT_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -2969,7 +3088,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_ATTEMPT_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -2996,7 +3117,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_ATTEMPT_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -3019,7 +3142,9 @@ public class OpenTelemetryMetricsModuleTest {
         ImmutableMap.of(CLIENT_CALL_DELAY_DURATION, true), disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
 
     callAttemptsTracerFactory.callEnded(Status.OK);
@@ -3041,7 +3166,9 @@ public class OpenTelemetryMetricsModuleTest {
         enabledMetricsMap, disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     ClientStreamTracer tracer =
         callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
@@ -3068,7 +3195,9 @@ public class OpenTelemetryMetricsModuleTest {
         enabledMetricsMap, disableDefaultMetrics);
     OpenTelemetryMetricsModule module = newOpenTelemetryMetricsModule(resource);
     CallAttemptsTracerFactory callAttemptsTracerFactory =
-        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS, method.getFullMethodName(),
+        new CallAttemptsTracerFactory(module, target, CALL_OPTIONS.withOption(
+                Grpc.CALL_OPTION_CUSTOM_LABEL, "my-custom-label"),
+            method.getFullMethodName(),
             emptyList(), Context.root());
     callAttemptsTracerFactory.newClientStreamTracer(STREAM_INFO, new Metadata());
 

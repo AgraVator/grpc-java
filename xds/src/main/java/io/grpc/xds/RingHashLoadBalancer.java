@@ -222,11 +222,8 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
       triggerIdleChildConnection();
     }
 
-    PickResult connectingResult = PickResult.withNoResult(
-        "connecting", aggregateConnectingDelayReason("ring_hash"));
     RingHashPicker picker =
-        new RingHashPicker(
-            syncContext, ring, getChildLbStates(), requestHashHeaderKey, random, connectingResult);
+        new RingHashPicker(syncContext, ring, getChildLbStates(), requestHashHeaderKey, random);
     getHelper().updateBalancingState(overallState, picker);
     this.currentConnectivityState = overallState;
   }
@@ -360,6 +357,8 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
   }
 
   private static final class RingHashPicker extends SubchannelPicker {
+    private static final PickResult RING_HASH_CONNECTING_RESULT =
+        PickResult.withNoResult("connecting", "ring_hash: waiting for connection");
     private final SynchronizationContext syncContext;
     private final List<RingEntry> ring;
     // Avoid synchronization between pickSubchannel and subchannel's connectivity state change,
@@ -370,17 +369,15 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
     @Nullable private final Metadata.Key<String> requestHashHeaderKey;
     private final ThreadSafeRandom random;
     private final boolean hasEndpointInConnectingState;
-    private final PickResult connectingResult;
 
     private RingHashPicker(
         SynchronizationContext syncContext, List<RingEntry> ring,
         Collection<ChildLbState> children, Metadata.Key<String> requestHashHeaderKey,
-        ThreadSafeRandom random, PickResult connectingResult) {
+        ThreadSafeRandom random) {
       this.syncContext = syncContext;
       this.ring = ring;
       this.requestHashHeaderKey = requestHashHeaderKey;
       this.random = random;
-      this.connectingResult = connectingResult;
       pickableSubchannels = new HashMap<>(children.size());
       boolean hasConnectingState = false;
       for (ChildLbState childLbState : children) {
@@ -459,7 +456,7 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
           // RPCs can be buffered if the next subchannel is pending (per A62). Otherwise, RPCs
           // are failed unless there is a READY connection.
           if (subchannelView.connectivityState == CONNECTING) {
-            return connectingResult;
+            return RING_HASH_CONNECTING_RESULT;
           }
 
           if (subchannelView.connectivityState == IDLE) {
@@ -470,7 +467,7 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
             });
 
             // Indicates that this should be retried after backoff
-            return connectingResult;
+            return RING_HASH_CONNECTING_RESULT;
           }
         }
       } else {
@@ -494,7 +491,7 @@ final class RingHashLoadBalancer extends MultiChildLoadBalancer {
           }
         }
         if (requestedConnection) {
-          return connectingResult;
+          return RING_HASH_CONNECTING_RESULT;
         }
       }
 

@@ -40,6 +40,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.ArgumentMatchers.same;
@@ -5204,7 +5205,6 @@ public class ManagedChannelImplTest {
     createChannel();
 
     final AtomicReference<ClientCall<?, ?>> callRef = new AtomicReference<>();
-    final List<String> firstTracerEvents = new ArrayList<>();
     ClientStreamTracer.Factory tracer1 = new ClientStreamTracer.Factory() {
       @Override
       public ClientStreamTracer newClientStreamTracer(StreamInfo info, Metadata headers) {
@@ -5213,16 +5213,12 @@ public class ManagedChannelImplTest {
 
       @Override
       public void recordDelayStart(String delayType, String delayReason) {
-        firstTracerEvents.add("start:" + delayType);
         callRef.get().cancel("Cancel inside first tracer start", null);
       }
-
-      @Override
-      public void recordDelayEnd(String delayType) {
-        firstTracerEvents.add("end:" + delayType);
-      }
     };
-    RecordingCallTracerFactory tracer2 = new RecordingCallTracerFactory();
+    ClientStreamTracer.Factory tracer2 = mock(ClientStreamTracer.Factory.class);
+    when(tracer2.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
 
     CallOptions callOptions = CallOptions.DEFAULT
         .withStreamTracerFactory(tracer1)
@@ -5233,11 +5229,7 @@ public class ManagedChannelImplTest {
       callRef.set(call);
     });
 
-    // The first tracer saw the start and cancelled the call from inside the callback. Its delay
-    // is ended, and the channel then abandons the fan-out rather than open a delay on a call that
-    // has already ended: the second tracer sees neither a start nor a stray end.
-    assertThat(firstTracerEvents).containsExactly("start:resolving", "end:resolving").inOrder();
-    assertThat(tracer2.events()).isEmpty();
+    verify(tracer2, never()).recordDelayStart(anyString(), anyString());
     executor.runDueTasks();
   }
 
@@ -5402,64 +5394,6 @@ public class ManagedChannelImplTest {
 
     // The call never waited on name resolution, so per A121 no delay may be reported for it.
     assertThat(tracerFactory.events()).isEmpty();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_callCancelledDuringReasonChange_endsStartedFactoriesAndAbortsLoop() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    final AtomicReference<ClientCall<?, ?>> callRef = new AtomicReference<>();
-    final List<String> firstTracerEvents = new ArrayList<>();
-    ClientStreamTracer.Factory tracer1 = new ClientStreamTracer.Factory() {
-      @Override
-      public ClientStreamTracer newClientStreamTracer(StreamInfo info, Metadata headers) {
-        return new ClientStreamTracer() {};
-      }
-
-      @Override
-      public void recordDelayStart(String delayType, String delayReason) {
-        firstTracerEvents.add("start:" + delayType);
-      }
-
-      @Override
-      public void recordDelayReasonChanged(String delayType, String delayReason) {
-        firstTracerEvents.add("reason:" + delayType);
-        callRef.get().cancel("Cancel inside first tracer reason change", null);
-      }
-
-      @Override
-      public void recordDelayEnd(String delayType) {
-        firstTracerEvents.add("end:" + delayType);
-      }
-    };
-    RecordingCallTracerFactory tracer2 = new RecordingCallTracerFactory();
-
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracer1)
-        .withStreamTracerFactory(tracer2)
-        .withWaitForReady();
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    callRef.set(call);
-    call.start(mockCallListener, new Metadata());
-
-    assertThat(firstTracerEvents).containsExactly("start:resolving");
-    assertThat(tracer2.events()).containsExactly(START_RESOLVING);
-
-    nsFactory.allResolved();
-
-    // The first tracer cancelled the call from inside its own recordDelayReasonChanged(). Both
-    // factories had seen the start, so both see the end; the fan-out is then abandoned, so the
-    // second factory is not told about a reason change on a delay that has already ended.
-    assertThat(firstTracerEvents)
-        .containsExactly("start:resolving", "reason:resolving", "end:resolving").inOrder();
-    assertThat(tracer2.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 

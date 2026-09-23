@@ -851,10 +851,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
     // Reference must be set() from syncContext
     private final AtomicReference<InternalConfigSelector> configSelector =
         new AtomicReference<>(INITIAL_PENDING_SELECTOR);
-    // Whether the channel has received its first valid resolution result or fallen back to
-    // defaultServiceConfig. Only accessed from syncContext.
-    private boolean initialConfigResolved;
-    // Non-null when initial name resolution has failed and initialConfigResolved is still false.
+    // Non-null while initial name resolution has failed and no valid config has arrived yet.
     // Must be written from syncContext.
     @Nullable
     private volatile Status lastResolutionError;
@@ -956,37 +953,25 @@ final class ManagedChannelImpl extends ManagedChannel implements
 
     // Must run in SynchronizationContext.
     void updateConfigSelector(@Nullable InternalConfigSelector config) {
-      if (config == INITIAL_PENDING_SELECTOR) {
-        // The channel is entering IDLE and discarding the config it had resolved, rather than
-        // reporting a new one. Nothing may be released here: the next RPC exits IDLE and starts a
-        // fresh name resolution, so the channel goes back to the state it was in before its first
-        // resolution completed and a call queued from now on waits for that new resolution.
-        configSelector.set(config);
-        initialConfigResolved = false;
-        lastResolutionError = null;
-        return;
-      }
-      initialConfigResolved = true;
       configSelector.set(config);
       lastResolutionError = null;
-      // A resolution result has arrived, so every queued call can proceed. This includes the
-      // wait-for-ready calls that releasePendingCalls() retained across earlier resolution
-      // failures, which is why this is not limited to the transition out of
-      // INITIAL_PENDING_SELECTOR.
+      if (config == INITIAL_PENDING_SELECTOR) {
+        // Entering IDLE. The next RPC starts a fresh name resolution, which releases the calls.
+        return;
+      }
+      // Also releases the wait-for-ready calls retained across earlier resolution failures.
       releasePendingCalls(/* resolutionError= */ null);
     }
 
     // Must run in SynchronizationContext.
     void onConfigError(Status error) {
-      if (!initialConfigResolved) {
+      if (configSelector.get() == INITIAL_PENDING_SELECTOR || lastResolutionError != null) {
+        // Apply Default Service Config if initial name resolution fails.
         if (defaultServiceConfig != null) {
-          initialConfigResolved = true;
-          lastResolutionError = null;
-          configSelector.set(defaultServiceConfig.getDefaultConfigSelector());
+          updateConfigSelector(defaultServiceConfig.getDefaultConfigSelector());
           lastServiceConfig = defaultServiceConfig;
           channelLogger.log(ChannelLogLevel.ERROR,
               "Initial Name Resolution error, using default service config");
-          releasePendingCalls(/* resolutionError= */ null);
           return;
         }
         lastResolutionError = error;
@@ -998,13 +983,9 @@ final class ManagedChannelImpl extends ManagedChannel implements
     }
 
     /**
-     * Lets the calls that are queued waiting for the initial name resolution proceed.
-     *
-     * <p>If {@code resolutionError} is non-{@code null} the name resolver reported a failure
-     * instead of a result. Per gRFC A121 only the wait-for-ready calls stay blocked in that case
-     * (the channel still has no addresses for them), so they remain queued and their open
-     * {@code resolving} delay merely gets a new reason, while all the other calls are released and
-     * fail fast with the resolver's error.
+     * Releases the calls queued for the initial name resolution. If {@code resolutionError} is
+     * non-{@code null} the resolver failed; per gRFC A121 wait-for-ready calls then stay queued
+     * with the failure as their delay reason, while the other calls fail fast with it.
      *
      * <p>Must run in SynchronizationContext.
      */
@@ -1012,9 +993,6 @@ final class ManagedChannelImpl extends ManagedChannel implements
       if (pendingCalls == null) {
         return;
       }
-      // PendingCall.reprocess() removes the call from pendingCalls through a runnable scheduled on
-      // the SynchronizationContext, which can't run before this method returns, so the collection
-      // is not modified while it is iterated.
       for (RealChannel.PendingCall<?, ?> pendingCall : pendingCalls) {
         if (resolutionError != null && pendingCall.callOptions.isWaitForReady()) {
           pendingCall.notifyNameResolutionFailed(resolutionError);
@@ -1071,33 +1049,10 @@ final class ManagedChannelImpl extends ManagedChannel implements
       final MethodDescriptor<ReqT, RespT> method;
       final CallOptions callOptions;
       private final long callCreationTime;
-      /**
-       * Whether the call has already been handed off to a real call. Only accessed from the
-       * SynchronizationContext, which is also where the pending call queue is manipulated.
-       */
-      private boolean reprocessed;
-      /**
-       * Whether the call tracers have been told that a delay is open. The channel is the sole
-       * owner of the delay type (gRFC A121), which is always {@code DELAY_TYPE_RESOLVING} for a
-       * pending call and therefore doesn't need to be stored.
-       */
       @GuardedBy("this")
-      private boolean delayOpen;
-      /**
-       * Whether the delay reached its terminal state, either because it ended or because the call
-       * itself ended. No further delay callback may be made to the tracers. A tracer may cancel
-       * the call from inside its own callback, so the fan-outs below check it after every factory
-       * and stop.
-       */
+      private boolean queuedForResolution;
       @GuardedBy("this")
-      private boolean delayFinished;
-      /**
-       * Number of factories, counted from the start of the list, that have been told the delay
-       * started. Only these are told it ended: a factory that never saw a start (because an
-       * earlier one cancelled the call from inside its own start) must not see an end either.
-       */
-      @GuardedBy("this")
-      private int startedFactories;
+      private boolean delayEnded;
 
       PendingCall(Context context, MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
         super(
@@ -1112,84 +1067,57 @@ final class ManagedChannelImpl extends ManagedChannel implements
       }
 
       /**
-       * Starts the call-level {@code resolving} delay, because the call is queued waiting for the
-       * initial name resolution.
-       *
-       * <p>If {@code initialError} is non-{@code null}, initial name resolution has already failed
-       * at least once and this {@code wait_for_ready} call is being queued while the channel waits
-       * for a valid resolution result; the delay starts directly with the failure reason per
-       * gRFC A121.
-       *
-       * <p>Must run in SynchronizationContext.
+       * Starts the {@code resolving} delay. A non-{@code null} {@code initialError} means initial
+       * name resolution has already failed and this wait-for-ready call queues behind the retry.
        */
-      synchronized void notifyQueuedForNameResolution(@Nullable Status initialError) {
-        if (delayFinished || delayOpen) {
+      private synchronized void notifyQueuedForNameResolution(@Nullable Status initialError) {
+        if (delayEnded || queuedForResolution) {
           return;
         }
-        delayOpen = true;
-        List<ClientStreamTracer.Factory> factories = callOptions.getStreamTracerFactories();
-        if (factories.isEmpty()) {
-          return;
-        }
-        // Only built when a tracer will actually consume it.
+        queuedForResolution = true;
         String delayReason = initialError == null
             ? "waiting for name resolution to complete for target " + target
             : "name resolution failed for target " + target + ": " + initialError;
-        for (ClientStreamTracer.Factory factory : factories) {
-          startedFactories++;
-          factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
-          if (delayFinished) {
-            // The factory cancelled the call from inside its callback; see delayFinished.
-            return;
+        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+          if (delayEnded) {
+            break;
           }
+          factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
         }
       }
 
-      /**
-       * Updates the reason of the open {@code resolving} delay, because the name resolver reported
-       * a failure and this call stays queued waiting for a resolution result.
-       *
-       * <p>Must run in SynchronizationContext.
-       */
-      synchronized void notifyNameResolutionFailed(Status error) {
-        if (delayFinished || !delayOpen) {
+      /** Reports the resolver failure this queued wait-for-ready call now waits behind. */
+      private synchronized void notifyNameResolutionFailed(Status error) {
+        if (delayEnded || !queuedForResolution) {
           return;
         }
         String delayReason = "name resolution failed for target " + target + ": " + error;
         for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
           factory.recordDelayReasonChanged(DELAY_TYPE_RESOLVING, delayReason);
-          if (delayFinished) {
-            return;
-          }
         }
       }
 
-      /**
-       * Ends the delay, if one is open, because the call is no longer waiting on resolution.
-       *
-       * <p>Shares the call's monitor with the two notification methods above, so a delay end can
-       * never interleave with a start or a reason change that is part-way through its fan-out.
-       */
-      private synchronized void endDelayIfNeeded() {
-        if (delayFinished) {
-          return;
+      /** Returns {@code false} if the delay had already ended, i.e. the call was handed off. */
+      private synchronized boolean endDelayIfNeeded() {
+        if (delayEnded) {
+          return false;
         }
-        delayFinished = true;
-        List<ClientStreamTracer.Factory> factories = callOptions.getStreamTracerFactories();
-        while (startedFactories > 0) {
-          factories.get(--startedFactories).recordDelayEnd(DELAY_TYPE_RESOLVING);
+        delayEnded = true;
+        if (queuedForResolution) {
+          for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+            factory.recordDelayEnd(DELAY_TYPE_RESOLVING);
+          }
         }
+        return true;
       }
 
       /** Called when it's ready to create a real call and reprocess the pending call. */
       void reprocess() {
-        if (reprocessed) {
-          // Already handed off; the call is only removed from pendingCalls asynchronously, so it
-          // can still be seen by a later pass over the queue.
+        if (!endDelayIfNeeded()) {
+          // Already handed off or cancelled; removal from pendingCalls is asynchronous, so a later
+          // pass over the queue can still see this call.
           return;
         }
-        reprocessed = true;
-        endDelayIfNeeded();
         ClientCall<ReqT, RespT> realCall;
         Context previous = context.attach();
         try {

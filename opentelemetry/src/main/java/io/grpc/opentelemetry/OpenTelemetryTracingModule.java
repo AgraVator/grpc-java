@@ -277,8 +277,6 @@ final class OpenTelemetryTracingModule {
     @GuardedBy("this")
     @Nullable private String activeDelayType;
     @GuardedBy("this")
-    private boolean streamCreated;
-    @GuardedBy("this")
     private boolean streamClosed;
 
     ClientTracer(Span span, Span parentSpan) {
@@ -289,7 +287,6 @@ final class OpenTelemetryTracingModule {
     @Override
     public void streamCreated(io.grpc.Attributes transportAtts, Metadata headers) {
       synchronized (this) {
-        streamCreated = true;
         endActiveDelaySpan();
       }
       contextPropagators.getTextMapPropagator().inject(Context.current().with(span), headers,
@@ -308,7 +305,7 @@ final class OpenTelemetryTracingModule {
     public synchronized void recordDelayStart(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
       checkNotNull(delayReason, "delayReason");
-      if (streamClosed || streamCreated) {
+      if (streamClosed) {
         return;
       }
       if (activeDelaySpan != null && delayType.equals(activeDelayType)) {
@@ -331,7 +328,7 @@ final class OpenTelemetryTracingModule {
     public synchronized void recordDelayReasonChanged(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
       checkNotNull(delayReason, "delayReason");
-      if (streamClosed || streamCreated || activeDelaySpan == null) {
+      if (streamClosed || activeDelaySpan == null) {
         return;
       }
       // A121 records only the reason on the event; the type is an attribute of the span itself.

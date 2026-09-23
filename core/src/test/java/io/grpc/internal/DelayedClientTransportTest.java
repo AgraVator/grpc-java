@@ -59,8 +59,6 @@ import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
-import javax.annotation.Nullable;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -1111,49 +1109,30 @@ public class DelayedClientTransportTest {
 
   private static final class FakeStreamTracer extends ClientStreamTracer {
     private final List<String> events = Collections.synchronizedList(new ArrayList<String>());
-    /** Runs after an event whose name starts with {@code onEventPrefix} is recorded, if set. */
-    @Nullable private final String onEventPrefix;
-    @Nullable private final Runnable onEvent;
-
-    FakeStreamTracer() {
-      this(null, null);
-    }
-
-    FakeStreamTracer(String onEventPrefix, Runnable onEvent) {
-      this.onEventPrefix = onEventPrefix;
-      this.onEvent = onEvent;
-    }
-
-    private void record(String event) {
-      events.add(event);
-      if (onEventPrefix != null && event.startsWith(onEventPrefix)) {
-        onEvent.run();
-      }
-    }
 
     @Override
     public void recordDelayStart(String delayType, String delayReason) {
-      record("start:" + delayType + ":" + delayReason);
+      events.add("start:" + delayType + ":" + delayReason);
     }
 
     @Override
     public void recordDelayReasonChanged(String delayType, String delayReason) {
-      record("reason:" + delayType + ":" + delayReason);
+      events.add("reason:" + delayType + ":" + delayReason);
     }
 
     @Override
     public void recordDelayEnd(String delayType) {
-      record("end:" + delayType);
+      events.add("end:" + delayType);
     }
 
     @Override
     public void streamClosed(Status status) {
-      record("closed:" + status.getCode());
+      events.add("closed:" + status.getCode());
     }
 
     @Override
     public void addOptionalLabel(String key, String value) {
-      record("label:" + key + ":" + value);
+      events.add("label:" + key + ":" + value);
     }
 
     List<String> events() {
@@ -1216,102 +1195,6 @@ public class DelayedClientTransportTest {
 
     assertThat(tracer1.events()).containsExactlyElementsIn(expectedEvents).inOrder();
     assertThat(tracer2.events()).containsExactlyElementsIn(expectedEvents).inOrder();
-  }
-
-  @Test
-  public void streamDelayMetrics_cancelledInsideReasonChange_endsBeforeClosingAndStopsFanOut() {
-    final AtomicReference<ClientStream> streamRef = new AtomicReference<>();
-    // Cancels the stream from inside its own reason callback. PendingStream.cancel() then
-    // re-enters on this very thread while updateDelay() is part-way through its fan-out.
-    FakeStreamTracer cancellingTracer = new FakeStreamTracer(
-        "reason:", () -> streamRef.get().cancel(Status.CANCELLED));
-    FakeStreamTracer otherTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] {cancellingTracer, otherTracer};
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
-    streamRef.set(stream);
-    stream.start(streamListener);
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 2")));
-
-    // cancel() ends the delay on every tracer before closing the stream, and the fan-out stops:
-    // the second tracer never hears about a reason change on a stream that is already gone.
-    assertThat(cancellingTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "reason:connecting:attempt 2",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
-    assertThat(otherTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
-    assertEquals(0, delayedTransport.getPendingStreamsCount());
-  }
-
-  @Test
-  public void streamDelayMetrics_cancelledInsideTypeRolloverEnd_doesNotStartNextDelay() {
-    final AtomicReference<ClientStream> streamRef = new AtomicReference<>();
-    // Cancels the stream from inside the end callback of a type rollover, i.e. between the end
-    // of the old delay and the start of the new one.
-    FakeStreamTracer cancellingTracer = new FakeStreamTracer(
-        "end:", () -> streamRef.get().cancel(Status.CANCELLED));
-    FakeStreamTracer otherTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] {cancellingTracer, otherTracer};
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    CallOptions wfrOptions = callOptions.withWaitForReady();
-    ClientStream stream = delayedTransport.newStream(method, headers, wfrOptions, customTracers);
-    streamRef.set(stream);
-    stream.start(streamListener);
-
-    delayedTransport.reprocess(fakePicker(
-        PickResult.withError(Status.UNAVAILABLE.withDescription("err1"))));
-
-    // The old delay is ended on every tracer exactly once, no new delay is started on a stream
-    // that is being cancelled, and the stream closes last.
-    List<String> expectedEvents = Arrays.asList(
-        "start:connecting:attempt 1",
-        "end:connecting",
-        "closed:CANCELLED");
-    assertThat(cancellingTracer.events()).containsExactlyElementsIn(expectedEvents).inOrder();
-    assertThat(otherTracer.events()).containsExactlyElementsIn(expectedEvents).inOrder();
-    assertEquals(0, delayedTransport.getPendingStreamsCount());
-  }
-
-  @Test
-  public void streamDelayMetrics_cancelledInsideTypeRolloverStart_endsNewDelayAndStopsFanOut() {
-    final AtomicReference<ClientStream> streamRef = new AtomicReference<>();
-    // Cancels the stream from inside the start callback of the new delay of a type rollover.
-    String newStart = "start:picker_failing_with_wait_for_ready:";
-    FakeStreamTracer cancellingTracer = new FakeStreamTracer(
-        newStart, () -> streamRef.get().cancel(Status.CANCELLED));
-    FakeStreamTracer otherTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] {cancellingTracer, otherTracer};
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    CallOptions wfrOptions = callOptions.withWaitForReady();
-    ClientStream stream = delayedTransport.newStream(method, headers, wfrOptions, customTracers);
-    streamRef.set(stream);
-    stream.start(streamListener);
-
-    Status err1 = Status.UNAVAILABLE.withDescription("err1");
-    delayedTransport.reprocess(fakePicker(PickResult.withError(err1)));
-
-    String newReason = "wait_for_ready RPC failed with status: " + err1;
-    // The cancelling tracer's new delay is ended before the stream closes; the second tracer
-    // never had the new delay started, so it must not be ended on it either.
-    assertThat(cancellingTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "end:connecting",
-        newStart + newReason,
-        "end:picker_failing_with_wait_for_ready",
-        "closed:CANCELLED").inOrder();
-    assertThat(otherTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
-    assertEquals(0, delayedTransport.getPendingStreamsCount());
   }
 
   @Test

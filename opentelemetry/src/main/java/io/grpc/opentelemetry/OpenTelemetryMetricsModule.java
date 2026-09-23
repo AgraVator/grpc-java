@@ -214,8 +214,6 @@ final class OpenTelemetryMetricsModule {
     @GuardedBy("this")
     @Nullable private String activeDelayType;
     @GuardedBy("this")
-    private boolean streamCreated;
-    @GuardedBy("this")
     private boolean streamClosed;
 
     ClientTracer(CallAttemptsTracerFactory attemptsState, OpenTelemetryMetricsModule module,
@@ -232,7 +230,6 @@ final class OpenTelemetryMetricsModule {
 
     @Override
     public synchronized void streamCreated(io.grpc.Attributes transportAtts, Metadata headers) {
-      streamCreated = true;
       // A delay can only be outstanding here if the channel did not end it itself; the wait is
       // over either way, so terminate it.
       terminateOpenDelay();
@@ -241,7 +238,7 @@ final class OpenTelemetryMetricsModule {
     @Override
     public synchronized void recordDelayStart(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
-      if (streamClosed || streamCreated) {
+      if (streamClosed) {
         return;
       }
       if (activeDelayStopwatch != null && delayType.equals(activeDelayType)) {

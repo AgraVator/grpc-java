@@ -3291,6 +3291,7 @@ public class CompositeFilterTest {
           () -> callWithoutHeaders());
 
       assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(e.getStatus().getDescription()).contains("no match found in composite filter");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3416,6 +3417,8 @@ public class CompositeFilterTest {
           () -> callWithMatchHeader());
 
       assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(e.getStatus().getDescription())
+          .contains("Filter rbac is not supported on client side");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3643,6 +3646,7 @@ public class CompositeFilterTest {
           () -> stub().unaryRpc(SimpleRequest.getDefaultInstance()));
 
       assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(e.getStatus().getDescription()).contains("no match found in composite filter");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3708,20 +3712,22 @@ public class CompositeFilterTest {
      * <p>Unlike the client tests, the xDS server is already running and serving the default
      * by the time a test body starts, so an assertion made too early can pass against the *old*
      * config. Every matcher in this class keys off {@link #MATCH_HEADER} and declares no
-     * {@code on_no_match}, so a header-less RPC returns UNAVAILABLE exactly when the composite
-     * filter is live. That makes it a reliable barrier.
+     * {@code on_no_match}, so a header-less RPC fails with the composite's no-match status exactly
+     * when the composite filter is live. That makes it a reliable barrier.
      */
     private void awaitCompositeFilterActive() {
       long deadline = System.nanoTime()
           + TimeUnit.SECONDS.toNanos(CONFIG_PROPAGATION_TIMEOUT_SECONDS);
-      Status.Code lastCode = null;
+      Status lastStatus = null;
       while (System.nanoTime() < deadline) {
         try {
           stub().unaryRpc(SimpleRequest.getDefaultInstance());
-          lastCode = Status.Code.OK;
+          lastStatus = Status.OK;
         } catch (StatusRuntimeException e) {
-          lastCode = e.getStatus().getCode();
-          if (lastCode == Status.Code.UNAVAILABLE) {
+          lastStatus = e.getStatus();
+          if (lastStatus.getCode() == Status.Code.UNAVAILABLE
+              && lastStatus.getDescription() != null
+              && lastStatus.getDescription().contains("no match found in composite filter")) {
             return;
           }
         }
@@ -3733,7 +3739,7 @@ public class CompositeFilterTest {
         }
       }
       throw new AssertionError(
-          "composite filter never became active; last RPC status was " + lastCode);
+          "composite filter never became active; last RPC status was " + lastStatus);
     }
 
     private SimpleResponse callWithMatchHeader() {

@@ -3622,6 +3622,9 @@ public class CompositeFilterTest {
     @Rule(order = 1)
     public DataPlaneRule dataPlane = new DataPlaneRule(controlPlane);
 
+    /** Created on first use by {@link #stub()}; {@link DataPlaneRule} shuts it down. */
+    private ManagedChannel channel;
+
     @BeforeClass
     public static void enableCompositeFilter() {
       System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
@@ -3749,8 +3752,11 @@ public class CompositeFilterTest {
           .unaryRpc(SimpleRequest.getDefaultInstance());
     }
 
+    /** One channel per test: {@link #awaitCompositeFilterActive()} calls this in a loop. */
     private SimpleServiceGrpc.SimpleServiceBlockingStub stub() {
-      ManagedChannel channel = dataPlane.getManagedChannel();
+      if (channel == null) {
+        channel = dataPlane.getManagedChannel();
+      }
       return SimpleServiceGrpc.newBlockingStub(channel).withDeadlineAfter(10, TimeUnit.SECONDS);
     }
 

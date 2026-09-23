@@ -53,12 +53,6 @@ import javax.annotation.Nullable;
  * cluster for load balancing purposes.
  */
 final class PriorityLoadBalancer extends LoadBalancer {
-  // Reported by a child before its policy has produced a picker. It is composed with the numeric
-  // priority like any other child picker, so that the delay type does not change (and therefore
-  // does not end one delay and start another) once the child reports for the first time.
-  private static final SubchannelPicker UNINITIALIZED_CHILD_PICKER = new FixedResultPicker(
-      PickResult.withNoResult("connecting", "priority child state uninitialized"));
-
   private final Helper helper;
   private final SynchronizationContext syncContext;
   private final ScheduledExecutorService executor;
@@ -118,13 +112,9 @@ final class PriorityLoadBalancer extends LoadBalancer {
       }
     }
     handlingResolvedAddresses = true;
-    for (int i = 0; i < priorityNames.size(); i++) {
-      String priority = priorityNames.get(i);
+    for (String priority : priorityNames) {
       ChildLbState childLbState = children.get(priority);
       if (childLbState != null) {
-        // The position of a priority within the list can change between config updates; keep the
-        // numeric priority used for delay reporting in sync before the child can report a picker.
-        childLbState.updatePriorityIndex(i);
         Status newStatus = childLbState.updateResolvedAddresses();
         if (!newStatus.isOk()) {
           status = newStatus;
@@ -171,7 +161,7 @@ final class PriorityLoadBalancer extends LoadBalancer {
       String priority = priorityNames.get(i);
       if (!children.containsKey(priority)) {
         ChildLbState child =
-            new ChildLbState(priority, i, priorityConfigs.get(priority).ignoreReresolution);
+            new ChildLbState(priority, priorityConfigs.get(priority).ignoreReresolution);
         children.put(priority, child);
         // Child is created in CONNECTING with pending failOverTimer
         updateOverallState(priority, child.connectivityState, child.picker);
@@ -215,6 +205,9 @@ final class PriorityLoadBalancer extends LoadBalancer {
 
   private void updateOverallState(
       @Nullable String priority, ConnectivityState state, SubchannelPicker picker) {
+    if (priority != null && (state == CONNECTING || state == IDLE)) {
+      picker = new PriorityPicker(picker, priorityNames.indexOf(priority), priority);
+    }
     if (!Objects.equals(priority, currentPriority) || !state.equals(currentConnectivityState)
         || !picker.equals(currentPicker)) {
       currentPriority = priority;
@@ -236,45 +229,15 @@ final class PriorityLoadBalancer extends LoadBalancer {
     // deactivated.
     @Nullable ScheduledHandle deletionTimer;
     ConnectivityState connectivityState = CONNECTING;
-    // Zero-based position of this priority within the ordered priority list of the most recent
-    // config. This is the numeric priority that gRFC A121 requires to be prepended to the delay
-    // type; the priority name cannot be used because it is derived from the (unbounded) xDS
-    // cluster name, while the delay type is used as a metric label. If the priority is dropped
-    // from the config while the child is cached for reuse, the last known index is retained.
-    private int priorityIndex;
-    // The picker most recently reported by the child policy, before delay type composition.
-    private SubchannelPicker childPicker = UNINITIALIZED_CHILD_PICKER;
-    // The picker exposed to the parent. Derived from childPicker, connectivityState and
-    // priorityIndex; always updated through buildPicker().
-    SubchannelPicker picker;
+    SubchannelPicker picker = new FixedResultPicker(
+        PickResult.withNoResult("connecting", "priority child state uninitialized"));
 
-    ChildLbState(final String priority, int priorityIndex, boolean ignoreReresolution) {
+    ChildLbState(final String priority, boolean ignoreReresolution) {
       this.priority = priority;
-      this.priorityIndex = priorityIndex;
-      picker = buildPicker();
       childHelper = new ChildHelper(ignoreReresolution);
       lb = new GracefulSwitchLoadBalancer(childHelper);
       failOverTimer = syncContext.schedule(new FailOverTask(), 10, TimeUnit.SECONDS, executor);
       logger.log(XdsLogLevel.DEBUG, "Priority created: {0}", priority);
-    }
-
-    /** Updates the numeric priority of this child after a config update. */
-    void updatePriorityIndex(int newPriorityIndex) {
-      if (priorityIndex == newPriorityIndex) {
-        return;
-      }
-      priorityIndex = newPriorityIndex;
-      // The numeric priority is part of the delay type, so the exposed picker is stale. The
-      // rebuilt picker is not equal to the previous one, so updateOverallState() propagates it.
-      picker = buildPicker();
-    }
-
-    /** Composes the picker exposed to the parent from the child's most recent picker. */
-    private SubchannelPicker buildPicker() {
-      if (connectivityState == CONNECTING || connectivityState == IDLE) {
-        return new PriorityPicker(childPicker, priorityIndex, priority);
-      }
-      return childPicker;
     }
 
     final class FailOverTask implements Runnable {
@@ -372,8 +335,7 @@ final class PriorityLoadBalancer extends LoadBalancer {
         }
         ConnectivityState oldState = connectivityState;
         connectivityState = newState;
-        childPicker = newPicker;
-        picker = buildPicker();
+        picker = newPicker;
 
         if (deletionTimer != null && deletionTimer.isPending()) {
           return;

@@ -1085,24 +1085,19 @@ final class ManagedChannelImpl extends ManagedChannel implements
       private boolean delayOpen;
       /**
        * Whether the delay reached its terminal state, either because it ended or because the call
-       * itself ended. No further delay callback may be made to the tracers.
+       * itself ended. No further delay callback may be made to the tracers. A tracer may cancel
+       * the call from inside its own callback, so the fan-outs below check it after every factory
+       * and stop.
        */
       @GuardedBy("this")
       private boolean delayFinished;
       /**
-       * Whether one of the notification methods below is part-way through its fan-out. A tracer is
-       * free to cancel the call from inside its own callback, and {@link #cancel} runs
-       * {@link #callCancelled} synchronously, so the end can re-enter on this very thread and this
-       * very monitor. Ending the delay right then would hand the tracers that have not been
-       * reached yet an end before their start, so the end waits for the fan-out to finish.
+       * Number of factories, counted from the start of the list, that have been told the delay
+       * started. Only these are told it ended: a factory that never saw a start (because an
+       * earlier one cancelled the call from inside its own start) must not see an end either.
        */
       @GuardedBy("this")
-      private boolean notifyingTracers;
-      /**
-       * Whether an end arrived while {@link #notifyingTracers} was set and still owes a fan-out.
-       */
-      @GuardedBy("this")
-      private boolean endDeferred;
+      private int startedFactories;
 
       PendingCall(Context context, MethodDescriptor<ReqT, RespT> method, CallOptions callOptions) {
         super(
@@ -1140,13 +1135,13 @@ final class ManagedChannelImpl extends ManagedChannel implements
         String delayReason = initialError == null
             ? "waiting for name resolution to complete for target " + target
             : "name resolution failed for target " + target + ": " + initialError;
-        notifyingTracers = true;
-        try {
-          for (ClientStreamTracer.Factory factory : factories) {
-            factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
+        for (ClientStreamTracer.Factory factory : factories) {
+          startedFactories++;
+          factory.recordDelayStart(DELAY_TYPE_RESOLVING, delayReason);
+          if (delayFinished) {
+            // The factory cancelled the call from inside its callback; see delayFinished.
+            return;
           }
-        } finally {
-          finishTracerNotification();
         }
       }
 
@@ -1161,13 +1156,11 @@ final class ManagedChannelImpl extends ManagedChannel implements
           return;
         }
         String delayReason = "name resolution failed for target " + target + ": " + error;
-        notifyingTracers = true;
-        try {
-          for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
-            factory.recordDelayReasonChanged(DELAY_TYPE_RESOLVING, delayReason);
+        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
+          factory.recordDelayReasonChanged(DELAY_TYPE_RESOLVING, delayReason);
+          if (delayFinished) {
+            return;
           }
-        } finally {
-          finishTracerNotification();
         }
       }
 
@@ -1182,31 +1175,9 @@ final class ManagedChannelImpl extends ManagedChannel implements
           return;
         }
         delayFinished = true;
-        if (!delayOpen) {
-          return;
-        }
-        if (notifyingTracers) {
-          // Re-entered from inside a fan-out; see notifyingTracers.
-          endDeferred = true;
-          return;
-        }
-        fanOutDelayEnd();
-      }
-
-      /** Closes a fan-out and emits the end that was deferred during it, if there was one. */
-      @GuardedBy("this")
-      private void finishTracerNotification() {
-        notifyingTracers = false;
-        if (endDeferred) {
-          endDeferred = false;
-          fanOutDelayEnd();
-        }
-      }
-
-      @GuardedBy("this")
-      private void fanOutDelayEnd() {
-        for (ClientStreamTracer.Factory factory : callOptions.getStreamTracerFactories()) {
-          factory.recordDelayEnd(DELAY_TYPE_RESOLVING);
+        List<ClientStreamTracer.Factory> factories = callOptions.getStreamTracerFactories();
+        while (startedFactories > 0) {
+          factories.get(--startedFactories).recordDelayEnd(DELAY_TYPE_RESOLVING);
         }
       }
 

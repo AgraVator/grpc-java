@@ -1291,7 +1291,7 @@ public class PriorityLoadBalancerTest {
 
     // And the usual identity guards.
     assertThat(picker1.equals(null)).isFalse();
-    assertThat(picker1).isNotEqualTo("not a picker");
+    assertThat(picker1.equals(new Object())).isFalse();
     assertThat(picker1.equals(picker1)).isTrue();
   }
 

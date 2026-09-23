@@ -5197,7 +5197,7 @@ public class ManagedChannelImplTest {
   }
 
   @Test
-  public void callDelay_callCancelledDuringTracerIteration_stillBalancesEveryFactory() {
+  public void callDelay_callCancelledDuringTracerIteration_abortsLoop() {
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
         .setResolvedAtStart(false).build();
     channelBuilder.nameResolverFactory(nsFactory);
@@ -5216,6 +5216,11 @@ public class ManagedChannelImplTest {
         firstTracerEvents.add("start:" + delayType);
         callRef.get().cancel("Cancel inside first tracer start", null);
       }
+
+      @Override
+      public void recordDelayEnd(String delayType) {
+        firstTracerEvents.add("end:" + delayType);
+      }
     };
     RecordingCallTracerFactory tracer2 = new RecordingCallTracerFactory();
 
@@ -5228,11 +5233,11 @@ public class ManagedChannelImplTest {
       callRef.set(call);
     });
 
-    // The first tracer cancelled the call from inside its own recordDelayStart(). The fan-out
-    // still runs to completion, and only then is the end emitted, so the second tracer sees a
-    // start/end pair rather than an end it has no start for.
-    assertThat(firstTracerEvents).containsExactly("start:resolving");
-    assertThat(tracer2.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
+    // The first tracer saw the start and cancelled the call from inside the callback. Its delay
+    // is ended, and the channel then abandons the fan-out rather than open a delay on a call that
+    // has already ended: the second tracer sees neither a start nor a stray end.
+    assertThat(firstTracerEvents).containsExactly("start:resolving", "end:resolving").inOrder();
+    assertThat(tracer2.events()).isEmpty();
     executor.runDueTasks();
   }
 
@@ -5401,7 +5406,7 @@ public class ManagedChannelImplTest {
   }
 
   @Test
-  public void callDelay_callCancelledDuringReasonChange_stillBalancesEveryFactory() {
+  public void callDelay_callCancelledDuringReasonChange_endsStartedFactoriesAndAbortsLoop() {
     Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
         .setResolvedAtStart(false)
@@ -5428,6 +5433,11 @@ public class ManagedChannelImplTest {
         firstTracerEvents.add("reason:" + delayType);
         callRef.get().cancel("Cancel inside first tracer reason change", null);
       }
+
+      @Override
+      public void recordDelayEnd(String delayType) {
+        firstTracerEvents.add("end:" + delayType);
+      }
     };
     RecordingCallTracerFactory tracer2 = new RecordingCallTracerFactory();
 
@@ -5444,13 +5454,12 @@ public class ManagedChannelImplTest {
 
     nsFactory.allResolved();
 
-    // The first tracer cancelled the call from inside its own recordDelayReasonChanged(). The
-    // fan-out still runs to completion and the end follows it, so the second tracer sees the whole
-    // sequence in order rather than a reason change after the delay had already ended.
-    assertThat(firstTracerEvents).containsExactly("start:resolving", "reason:resolving").inOrder();
-    assertThat(tracer2.events())
-        .containsExactly(START_RESOLVING, reasonResolvingFailed(resolutionError), END_RESOLVING)
-        .inOrder();
+    // The first tracer cancelled the call from inside its own recordDelayReasonChanged(). Both
+    // factories had seen the start, so both see the end; the fan-out is then abandoned, so the
+    // second factory is not told about a reason change on a delay that has already ended.
+    assertThat(firstTracerEvents)
+        .containsExactly("start:resolving", "reason:resolving", "end:resolving").inOrder();
+    assertThat(tracer2.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 

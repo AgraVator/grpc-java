@@ -39,7 +39,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashSet;
-import java.util.Objects;
 import java.util.concurrent.Executor;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -196,7 +195,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
       pendingStream.lastPickStatus = pickResult.getStatus();
     }
     pendingStream.startDelay(
-        determineQueuingDelayType(pickResult), determineQueuingDelayReasonSource(pickResult));
+        determineQueuingDelayType(pickResult), determineQueuingDelayReason(pickResult));
     pendingStreams.add(pendingStream);
     if (getPendingStreamsCount() == 1) {
       syncContext.executeLater(reportTransportInUse);
@@ -338,7 +337,8 @@ final class DelayedClientTransport implements ManagedClientTransport {
         }
         toRemove.add(stream);
       } else { // stay pending
-        stream.updateDelay(determineQueuingDelayType(pickResult), pickResult);
+        stream.updateDelay(
+            determineQueuingDelayType(pickResult), determineQueuingDelayReason(pickResult));
       }
     }
 
@@ -396,15 +396,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
     return DELAY_TYPE_CONNECTING;
   }
 
-  /**
-   * Returns the value that the delay reason of a queued pick is derived from, without
-   * materializing the reason itself.
-   *
-   * <p>{@link #reprocess} re-evaluates every pending stream on every picker update, but the reason
-   * is only delivered to the tracers when it changed. Since the reason is a pure function of this
-   * source, comparing sources lets the common case skip building a reason string.
-   */
-  private static Object determineQueuingDelayReasonSource(@Nullable PickResult pickResult) {
+  private static String determineQueuingDelayReason(@Nullable PickResult pickResult) {
     if (pickResult == null) {
       return DELAY_REASON_WAITING_FOR_PICKER;
     }
@@ -412,21 +404,12 @@ final class DelayedClientTransport implements ManagedClientTransport {
       return DELAY_REASON_SUBCHANNEL_STATE_MISMATCH;
     }
     if (!pickResult.getStatus().isOk()) {
-      // Materializing the reason would call Status.toString(), so keep the Status itself.
-      return pickResult.getStatus();
+      return DELAY_REASON_WAIT_FOR_READY_FAILED_PREFIX + pickResult.getStatus();
     }
     if (pickResult.getDelayReason() != null) {
       return pickResult.getDelayReason();
     }
     return DELAY_REASON_WAITING_FOR_PICKER;
-  }
-
-  /** Materializes a source returned by {@link #determineQueuingDelayReasonSource}. */
-  private static String determineQueuingDelayReason(Object delayReasonSource) {
-    if (delayReasonSource instanceof Status) {
-      return DELAY_REASON_WAIT_FOR_READY_FAILED_PREFIX + delayReasonSource;
-    }
-    return (String) delayReasonSource;
   }
 
   private class PendingStream extends DelayedStream {
@@ -439,21 +422,21 @@ final class DelayedClientTransport implements ManagedClientTransport {
     @Nullable private String activeDelayType;
     @GuardedBy("this")
     @Nullable private String activeDelayReason;
-    /** See {@link DelayedClientTransport#determineQueuingDelayReasonSource}. */
-    @GuardedBy("this")
-    @Nullable private Object activeDelayReasonSource;
+    /**
+     * Set by {@link #endDelay}, which runs before the stream is cancelled or handed a real stream.
+     * A tracer may cancel the stream from inside its own delay callback, so the fan-outs in
+     * {@link #updateDelay} check it after every tracer and stop: nothing may follow the end.
+     */
     @GuardedBy("this")
     private boolean delayEnded;
     /**
-     * Whether {@link #startDelay} or {@link #updateDelay} is part-way through its tracer fan-out.
-     * If a tracer cancels from inside its callback, {@link #cancel} re-enters {@link #endDelay} on
-     * this thread and monitor; deferring the end until the current fan-out completes ensures every
-     * tracer observes balanced start/reason/end callbacks in order.
+     * Number of tracers, counted from the start of {@code tracers}, that currently have a delay
+     * open. Delays are started first-to-last and ended last-to-first, so this alone identifies
+     * them: an {@link #endDelay} that re-enters from inside a tracer's callback ends exactly the
+     * tracers that still owe an end, and none that were never started.
      */
     @GuardedBy("this")
-    private boolean notifyingTracers;
-    @GuardedBy("this")
-    private boolean endDeferred;
+    private int startedTracers;
 
     private PendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers) {
       super("connecting_and_lb");
@@ -465,19 +448,12 @@ final class DelayedClientTransport implements ManagedClientTransport {
      * Records the delay that this stream is queued by. Must be called exactly once, before the
      * stream is visible to other threads.
      */
-    synchronized void startDelay(String delayType, Object delayReasonSource) {
+    synchronized void startDelay(String delayType, String delayReason) {
       checkNotNull(delayType, "delayType");
+      checkNotNull(delayReason, "delayReason");
       activeDelayType = delayType;
-      activeDelayReasonSource = delayReasonSource;
-      activeDelayReason = determineQueuingDelayReason(delayReasonSource);
-      notifyingTracers = true;
-      try {
-        for (ClientStreamTracer tracer : tracers) {
-          tracer.recordDelayStart(delayType, activeDelayReason);
-        }
-      } finally {
-        finishTracerNotification();
-      }
+      activeDelayReason = delayReason;
+      startTracers();
     }
 
     /**
@@ -486,65 +462,40 @@ final class DelayedClientTransport implements ManagedClientTransport {
      * <p>If {@code newType} differs from the type of the delay in progress, that delay is ended
      * and a new one is started. If only the reason changed, the delay in progress is kept and the
      * new reason is reported on it.
-     *
-     * <p>The reason is derived from {@code pickResult} lazily: {@link #reprocess} calls this for
-     * every pending stream on every picker update, and in the common case nothing changed.
      */
-    synchronized void updateDelay(String newType, @Nullable PickResult pickResult) {
+    synchronized void updateDelay(String newType, String newReason) {
       checkNotNull(newType, "newType");
+      checkNotNull(newReason, "newReason");
       if (delayEnded) {
         // The stream is no longer queued: it has been cancelled, or it has been handed a real
         // stream. Both end the delay before the stream changes hands, so there is nothing left
         // to update.
         return;
       }
-      Object newReasonSource = determineQueuingDelayReasonSource(pickResult);
       boolean typeChanged = !newType.equals(activeDelayType);
-      if (!typeChanged && Objects.equals(activeDelayReasonSource, newReasonSource)) {
-        // Nothing changed since the last picker update; don't materialize the reason.
+      if (!typeChanged && newReason.equals(activeDelayReason)) {
         return;
       }
-      String newReason = determineQueuingDelayReason(newReasonSource);
-      activeDelayReasonSource = newReasonSource;
       if (typeChanged) {
         // Delay type changed (e.g., from RLS lookup to connecting). Per gRFC A121 the delay in
         // progress must be ended before the new one is started.
-        notifyingTracers = true;
-        try {
-          for (ClientStreamTracer tracer : tracers) {
-            tracer.recordDelayEnd(activeDelayType);
-          }
-          if (endDeferred) {
-            // A tracer cancelled during the end fan-out above; the previous delay has now been
-            // ended on every tracer, so do not open a new delay segment.
-            endDeferred = false;
-            activeDelayType = null;
-            activeDelayReason = null;
-            activeDelayReasonSource = null;
-            return;
-          }
-          activeDelayType = newType;
-          activeDelayReason = newReason;
-          for (ClientStreamTracer tracer : tracers) {
-            tracer.recordDelayStart(newType, newReason);
-          }
-        } finally {
-          finishTracerNotification();
+        endTracers();
+        if (delayEnded) {
+          // A tracer cancelled the stream from inside its callback; see delayEnded.
+          return;
         }
-      } else if (newReason.equals(activeDelayReason)) {
-        // Different source, same reason (e.g., an equal but distinct pick failure Status).
-        return;
+        activeDelayType = newType;
+        activeDelayReason = newReason;
+        startTracers();
       } else {
         // Delay type is unchanged, but the reason changed (e.g., connection status detail
         // updated).
         activeDelayReason = newReason;
-        notifyingTracers = true;
-        try {
-          for (ClientStreamTracer tracer : tracers) {
-            tracer.recordDelayReasonChanged(newType, newReason);
+        for (ClientStreamTracer tracer : tracers) {
+          tracer.recordDelayReasonChanged(newType, newReason);
+          if (delayEnded) {
+            return;
           }
-        } finally {
-          finishTracerNotification();
         }
       }
     }
@@ -559,32 +510,29 @@ final class DelayedClientTransport implements ManagedClientTransport {
         return;
       }
       delayEnded = true;
-      if (notifyingTracers) {
-        endDeferred = true;
-        return;
-      }
-      fanOutDelayEnd();
-    }
-
-    @GuardedBy("this")
-    private void finishTracerNotification() {
-      notifyingTracers = false;
-      if (endDeferred) {
-        endDeferred = false;
-        fanOutDelayEnd();
-      }
-    }
-
-    @GuardedBy("this")
-    private void fanOutDelayEnd() {
-      // activeDelayType is set when the stream is created and only cleared here, so it is
-      // non-null.
-      for (ClientStreamTracer tracer : tracers) {
-        tracer.recordDelayEnd(activeDelayType);
-      }
+      endTracers();
       activeDelayType = null;
       activeDelayReason = null;
-      activeDelayReasonSource = null;
+    }
+
+    /** Starts the delay in progress on every tracer, first to last; see {@link #startedTracers}. */
+    @GuardedBy("this")
+    private void startTracers() {
+      while (startedTracers < tracers.length) {
+        ClientStreamTracer tracer = tracers[startedTracers++];
+        tracer.recordDelayStart(activeDelayType, activeDelayReason);
+        if (delayEnded) {
+          return;
+        }
+      }
+    }
+
+    /** Ends the delay in progress on every tracer it is open on, last to first. */
+    @GuardedBy("this")
+    private void endTracers() {
+      while (startedTracers > 0) {
+        tracers[--startedTracers].recordDelayEnd(activeDelayType);
+      }
     }
 
     /**

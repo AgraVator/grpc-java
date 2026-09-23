@@ -1101,6 +1101,55 @@ public class CompositeFilterTest {
     }
 
     @Test
+    public void clientInterceptor_matcherThrows_failsWithUnavailable() {
+      CompositeFilter filter = newFilter("composite");
+      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+      RuntimeException boom = new IllegalStateException("boom");
+      when(mockMatcher.match(any())).thenThrow(boom);
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
+          mock(ScheduledExecutorService.class));
+
+      Channel next = mock(Channel.class);
+      ClientCall<Void, Void> call =
+          interceptor.interceptCall(createMockMethod(), CallOptions.DEFAULT, next);
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      call.start(listener, new Metadata());
+
+      verify(next, never()).newCall(any(), any());
+      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(statusCaptor.getValue().getDescription())
+          .isEqualTo("composite filter matcher evaluation failed");
+      assertThat(statusCaptor.getValue().getCause()).isSameInstanceAs(boom);
+    }
+
+    @Test
+    public void serverInterceptor_matcherThrows_failsWithUnavailable() {
+      CompositeFilter filter = newFilter("composite");
+      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
+      RuntimeException boom = new IllegalStateException("boom");
+      when(mockMatcher.match(any())).thenThrow(boom);
+      ServerInterceptor interceptor = filter.buildServerInterceptor(
+          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null);
+
+      ServerCall call = mock(ServerCall.class);
+      when(call.getMethodDescriptor()).thenReturn(createMockMethod());
+      ServerCallHandler next = mock(ServerCallHandler.class);
+
+      assertThat(interceptor.interceptCall(call, new Metadata(), next)).isNotNull();
+
+      verify(next, never()).startCall(any(), any());
+      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+      verify(call).close(statusCaptor.capture(), any(Metadata.class));
+      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(statusCaptor.getValue().getDescription())
+          .isEqualTo("composite filter matcher evaluation failed");
+      assertThat(statusCaptor.getValue().getCause()).isSameInstanceAs(boom);
+    }
+
+    @Test
     public void clientInterceptor_callMethodsThrowBeforeStart() {
       CompositeFilter filter = newFilter("composite");
       UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);

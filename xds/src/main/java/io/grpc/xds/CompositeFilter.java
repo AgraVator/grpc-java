@@ -642,7 +642,14 @@ final class CompositeFilter implements Filter {
             .setHost(call.getAuthority())
             .build();
 
-        MatchResult matchResult = effective.matcher.match(context);
+        MatchResult matchResult;
+        try {
+          matchResult = effective.matcher.match(context);
+        } catch (RuntimeException e) {
+          call.close(Status.UNAVAILABLE.withDescription(
+              "composite filter matcher evaluation failed").withCause(e), new Metadata());
+          return new ServerCall.Listener<ReqT>() {};
+        }
         if (matchResult == null || !matchResult.matched) {
           logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
               call.getMethodDescriptor().getFullMethodName());
@@ -884,7 +891,14 @@ final class CompositeFilter implements Filter {
           .setHost(host)
           .build();
 
-      MatchResult matchResult = matcher.match(context);
+      MatchResult matchResult;
+      try {
+        matchResult = matcher.match(context);
+      } catch (RuntimeException e) {
+        failCall(responseListener, Status.UNAVAILABLE.withDescription(
+            "composite filter matcher evaluation failed").withCause(e));
+        return;
+      }
       if (matchResult == null || !matchResult.matched) {
         logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
             method.getFullMethodName());

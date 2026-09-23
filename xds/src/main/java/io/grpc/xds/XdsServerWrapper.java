@@ -887,8 +887,8 @@ final class XdsServerWrapper extends Server {
         }
       }
 
-      // Only now that every interceptor is built: if building one threw, the routes still
-      // serving would otherwise be left holding closed instances.
+      // Only now that every interceptor of this chain is built: if building one threw, the routes
+      // still serving would otherwise be left holding closed instances.
       closeFilters(chainFilters, filtersToShutdown);
       return perRouteInterceptors.buildOrThrow();
     }

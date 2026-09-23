@@ -79,12 +79,9 @@ final class CompositeFilter implements Filter {
 
   @Nullable
   private final Function<NamedFilterConfig, Filter> filterLookup;
-  private final Function<String, Filter.Provider> registryLookup;
 
-  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterLookup,
-      Function<String, Filter.Provider> registryLookup) {
+  CompositeFilter(@Nullable Function<NamedFilterConfig, Filter> filterLookup) {
     this.filterLookup = filterLookup;
-    this.registryLookup = Preconditions.checkNotNull(registryLookup, "registryLookup");
   }
 
   static final class Provider implements Filter.Provider {
@@ -120,7 +117,7 @@ final class CompositeFilter implements Filter {
 
     @Override
     public Filter newInstance(FilterContext context) {
-      return new CompositeFilter(context.filterLookup(), registryLookup);
+      return new CompositeFilter(context.filterLookup());
     }
 
     @Override
@@ -322,7 +319,7 @@ final class CompositeFilter implements Filter {
           throw new IllegalArgumentException(
               "ExecuteFilterAction must specify either typed_config or filter_chain");
         }
-        List<NamedFilterConfig> delegates = new ArrayList<>();
+        List<NestedFilter> delegates = new ArrayList<>();
         for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
             : childConfigs) {
           // The name is not validated, not even for emptiness. Nested instances live in the same
@@ -374,7 +371,8 @@ final class CompositeFilter implements Filter {
             throw new IllegalArgumentException(
                 "Nested filter cannot be a terminal filter: " + typeUrl);
           }
-          delegates.add(new NamedFilterConfig(childFilterConfig.getName(), parsed.config));
+          delegates.add(new NestedFilter(
+              new NamedFilterConfig(childFilterConfig.getName(), parsed.config), provider));
         }
         return new FilterDelegate(delegates, samplePercent);
       } catch (InvalidProtocolBufferException e) {
@@ -420,7 +418,9 @@ final class CompositeFilter implements Filter {
     public List<NamedFilterConfig> nestedFilterConfigs() {
       List<NamedFilterConfig> nested = new ArrayList<>();
       for (FilterDelegate delegate : delegates.values()) {
-        nested.addAll(delegate.delegates);
+        for (NestedFilter nestedFilter : delegate.delegates) {
+          nested.add(nestedFilter.config);
+        }
       }
       return nested;
     }
@@ -460,15 +460,15 @@ final class CompositeFilter implements Filter {
   }
 
   static final class FilterDelegate {
-    final List<NamedFilterConfig> delegates;
+    final List<NestedFilter> delegates;
     private final int ratePerMillion;
     private final ThreadSafeRandom random;
 
-    FilterDelegate(List<NamedFilterConfig> delegates, @Nullable FractionalPercent samplePercent) {
+    FilterDelegate(List<NestedFilter> delegates, @Nullable FractionalPercent samplePercent) {
       this(delegates, samplePercent, ThreadSafeRandom.ThreadSafeRandomImpl.instance);
     }
 
-    FilterDelegate(List<NamedFilterConfig> delegates, @Nullable FractionalPercent samplePercent,
+    FilterDelegate(List<NestedFilter> delegates, @Nullable FractionalPercent samplePercent,
         ThreadSafeRandom random) {
       this.delegates = Collections.unmodifiableList(delegates);
       this.ratePerMillion = calculateRatePerMillion(samplePercent);
@@ -509,6 +509,17 @@ final class CompositeFilter implements Filter {
         return false;
       }
       return random.nextInt(1_000_000) < ratePerMillion;
+    }
+  }
+
+  /** A nested filter config and the provider that parsed it. */
+  static final class NestedFilter {
+    final NamedFilterConfig config;
+    final Filter.Provider provider;
+
+    NestedFilter(NamedFilterConfig config, Filter.Provider provider) {
+      this.config = config;
+      this.provider = provider;
     }
   }
 
@@ -648,14 +659,14 @@ final class CompositeFilter implements Filter {
 
   private ResolvedDelegate<ServerInterceptor> resolveServerDelegate(FilterDelegate delegate) {
     List<ServerInterceptor> interceptors = new ArrayList<>();
-    for (NamedFilterConfig nested : delegate.delegates) {
-      if (!providerOf(nested).isServerFilter()) {
+    for (NestedFilter nested : delegate.delegates) {
+      if (!nested.provider.isServerFilter()) {
         return new ResolvedDelegate<>(delegate, Collections.emptyList(),
             Status.UNAVAILABLE.withDescription(
-                "Filter " + nested.name + " is not supported on server side"));
+                "Filter " + nested.config.name + " is not supported on server side"));
       }
-      ServerInterceptor interceptor = nestedFilter(nested)
-          .buildServerInterceptor(nested.filterConfig, /* overrideConfig= */ null);
+      ServerInterceptor interceptor = nestedFilter(nested.config)
+          .buildServerInterceptor(nested.config.filterConfig, /* overrideConfig= */ null);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
@@ -666,25 +677,20 @@ final class CompositeFilter implements Filter {
   private ResolvedDelegate<ClientInterceptor> resolveClientDelegate(
       FilterDelegate delegate, ScheduledExecutorService scheduler) {
     List<ClientInterceptor> interceptors = new ArrayList<>();
-    for (NamedFilterConfig nested : delegate.delegates) {
-      if (!providerOf(nested).isClientFilter()) {
+    for (NestedFilter nested : delegate.delegates) {
+      if (!nested.provider.isClientFilter()) {
         return new ResolvedDelegate<>(delegate, Collections.emptyList(),
             Status.UNAVAILABLE.withDescription(
-                "Filter " + nested.name + " is not supported on client side"));
+                "Filter " + nested.config.name + " is not supported on client side"));
       }
-      ClientInterceptor interceptor = nestedFilter(nested)
-          .buildClientInterceptor(nested.filterConfig, /* overrideConfig= */ null, scheduler);
+      ClientInterceptor interceptor = nestedFilter(nested.config)
+          .buildClientInterceptor(nested.config.filterConfig, /* overrideConfig= */ null,
+              scheduler);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
     }
     return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
-  }
-
-  /** The provider that parsed {@code nested}; the same registry is used at parse time. */
-  private Filter.Provider providerOf(NamedFilterConfig nested) {
-    return Preconditions.checkNotNull(registryLookup.apply(nested.filterConfig.typeUrl()),
-        "provider %s", nested.filterConfig.typeUrl());
   }
 
   /**

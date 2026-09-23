@@ -1518,8 +1518,8 @@ public class CompositeFilterTest {
       // Every nested config is resolved through the lookup...
       for (CompositeFilter.FilterDelegate delegate
           : Iterables.concat(topLevel.delegates.values(), routeOverride.delegates.values())) {
-        for (NamedFilterConfig nested : delegate.delegates) {
-          verify(lookup, atLeastOnce()).apply(nested);
+        for (CompositeFilter.NestedFilter nested : delegate.delegates) {
+          verify(lookup, atLeastOnce()).apply(nested.config);
         }
       }
       // ...and only through it: the composite neither creates nor retires nested instances, not
@@ -3906,7 +3906,7 @@ public class CompositeFilterTest {
       UnifiedMatcher matchAll = mock(UnifiedMatcher.class);
       when(matchAll.match(any())).thenReturn(MatchResult.create(Collections.emptyList()));
       ClientInterceptor interceptor =
-          new CompositeFilter(/* filterLookup= */ null, typeUrl -> null).buildClientInterceptor(
+          new CompositeFilter(/* filterLookup= */ null).buildClientInterceptor(
               new CompositeFilter.CompositeFilterConfig(matchAll, Collections.emptyMap()), null,
               mock(ScheduledExecutorService.class));
       ManagedChannel channel = grpcCleanup.register(InProcessChannelBuilder.forName(serverName)

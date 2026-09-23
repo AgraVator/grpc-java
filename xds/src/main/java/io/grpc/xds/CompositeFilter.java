@@ -49,7 +49,7 @@ import io.grpc.xds.internal.matcher.MatchResult;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -190,7 +190,7 @@ final class CompositeFilter implements Filter {
             new CompositeFilterConfig(null, Collections.emptyMap(), /* matcherProto= */ null));
       }
       try {
-        Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
+        Map<TypedExtensionConfig, FilterDelegate> delegates = new LinkedHashMap<>();
         collectDelegates(matcherProto, delegates, context);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
@@ -652,7 +652,7 @@ final class CompositeFilter implements Filter {
    */
   private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> resolveAll(
       CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {
-    Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new HashMap<>();
+    Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new LinkedHashMap<>();
     for (Map.Entry<TypedExtensionConfig, FilterDelegate> entry : effective.delegates.entrySet()) {
       resolved.put(entry.getKey(), resolver.apply(entry.getValue()));
     }

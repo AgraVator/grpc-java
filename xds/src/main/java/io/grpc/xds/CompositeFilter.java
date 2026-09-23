@@ -186,10 +186,6 @@ final class CompositeFilter implements Filter {
         return ConfigOrError.fromConfig(
             new CompositeFilterConfig(null, Collections.emptyMap(), /* matcherProto= */ null));
       }
-      if (hasKeepMatching(matcherProto)) {
-        return ConfigOrError.fromError(
-            "keep_matching is not permitted anywhere in the composite filter matcher tree");
-      }
       try {
         Map<TypedExtensionConfig, FilterDelegate> delegates = new HashMap<>();
         collectDelegates(matcherProto, delegates, context);
@@ -200,45 +196,6 @@ final class CompositeFilter implements Filter {
       } catch (Exception e) {
         return ConfigOrError.fromError("Failed to create matcher: " + e.getMessage());
       }
-    }
-
-    private static boolean hasKeepMatching(Matcher matcher) {
-      if (matcher.hasMatcherList()) {
-        for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
-          if (fm.hasOnMatch() && hasKeepMatching(fm.getOnMatch())) {
-            return true;
-          }
-        }
-      } else if (matcher.hasMatcherTree()) {
-        Matcher.MatcherTree tree = matcher.getMatcherTree();
-        if (tree.hasExactMatchMap()) {
-          for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            if (hasKeepMatching(om)) {
-              return true;
-            }
-          }
-        } else if (tree.hasPrefixMatchMap()) {
-          for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            if (hasKeepMatching(om)) {
-              return true;
-            }
-          }
-        }
-      }
-      if (matcher.hasOnNoMatch() && hasKeepMatching(matcher.getOnNoMatch())) {
-        return true;
-      }
-      return false;
-    }
-
-    private static boolean hasKeepMatching(Matcher.OnMatch onMatch) {
-      if (onMatch.getKeepMatching()) {
-        return true;
-      }
-      if (onMatch.hasMatcher()) {
-        return hasKeepMatching(onMatch.getMatcher());
-      }
-      return false;
     }
 
     private boolean validateActionTypeUrl(String typeUrl) {
@@ -286,6 +243,10 @@ final class CompositeFilter implements Filter {
     private void collectOnMatch(Matcher.OnMatch onMatch,
         Map<TypedExtensionConfig, FilterDelegate> map,
         FilterConfigParseContext context) {
+      if (onMatch.getKeepMatching()) {
+        throw new IllegalArgumentException(
+            "keep_matching is not permitted anywhere in the composite filter matcher tree");
+      }
       if (onMatch.hasMatcher()) {
         collectDelegates(onMatch.getMatcher(), map, context);
       } else if (onMatch.hasAction()) {

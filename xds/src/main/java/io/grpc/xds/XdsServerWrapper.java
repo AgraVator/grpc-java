@@ -1024,9 +1024,9 @@ final class XdsServerWrapper extends Server {
             continue;
           }
 
-          // The chain is one the current selector serves, possibly from an LDS an update with
-          // pending RDS has replaced, so resolve its map from the selector: the default chain
-          // is the only served chain that is not in its routing config map.
+          // The chain is one the current selector serves, and may come from an LDS that a newer
+          // one with pending RDS has since replaced, so resolve its map through the selector: the
+          // default chain is the only served chain absent from its routing config map.
           FilterChainSelector selector = filterChainSelectorManager.getSelectorToUpdateSelector();
           Map<String, Filter> chainFilters =
               (selector != null && selector.getRoutingConfigs().containsKey(filterChain))

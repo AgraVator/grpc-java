@@ -633,12 +633,9 @@ final class CompositeFilter implements Filter {
   }
 
   /**
-   * Builds the nested filters and their interceptors for every action in the matcher tree. This
-   * runs once per configuration update, not per RPC.
-   *
-   * <p>Creating nested filters per RPC would defeat the caches and shared connections that
-   * {@link Filter} implementations are documented to own, and would violate
-   * {@link Filter.Provider#newInstance}'s lifecycle contract.
+   * Builds the nested filters' interceptors for every action in the matcher tree. This runs once
+   * per configuration update, not per RPC, so that the state a nested filter keeps across RPCs,
+   * such as a cache or a shared connection, is kept as the filter's contract promises.
    */
   private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> resolveAll(
       CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {

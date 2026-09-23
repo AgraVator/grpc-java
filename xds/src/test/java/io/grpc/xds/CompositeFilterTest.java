@@ -221,12 +221,12 @@ public class CompositeFilterTest {
      * Stands in for the resolver's filter registry: one instance per nested name and type,
      * created on first use and handed to the composite through {@link FilterContext}.
      */
-    private Filter acquireNestedFilter(NamedFilterConfig config) {
+    private Filter lookupNestedFilter(NamedFilterConfig config) {
       String key = config.filterStateKey();
       Filter filter = nestedFilters.get(key);
       if (filter == null) {
         filter = registryLookup.apply(config.filterConfig.typeUrl()).newInstance(
-            FilterContext.create(config.name, metricRecorder, this::acquireNestedFilter));
+            FilterContext.create(config.name, metricRecorder, this::lookupNestedFilter));
         nestedFilters.put(key, filter);
       }
       return filter;
@@ -234,7 +234,7 @@ public class CompositeFilterTest {
 
     private CompositeFilter newFilter(String name) {
       return (CompositeFilter) provider.newInstance(
-          FilterContext.create(name, metricRecorder, this::acquireNestedFilter));
+          FilterContext.create(name, metricRecorder, this::lookupNestedFilter));
     }
 
     private static ExtensionWithMatcher createExtensionWithMatcher(Matcher matcher) {
@@ -1500,12 +1500,12 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void nestedFilter_acquiredThroughFilterContext_neverClosedByComposite() {
+    public void nestedFilter_lookedUpThroughFilterContext_neverClosedByComposite() {
       @SuppressWarnings("unchecked")
-      Function<NamedFilterConfig, Filter> acquirer = mock(Function.class);
-      when(acquirer.apply(any())).thenReturn(fakeFilter);
+      Function<NamedFilterConfig, Filter> lookup = mock(Function.class);
+      when(lookup.apply(any())).thenReturn(fakeFilter);
       CompositeFilter filter = (CompositeFilter) provider.newInstance(
-          FilterContext.create("composite", metricRecorder, acquirer));
+          FilterContext.create("composite", metricRecorder, lookup));
       ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
 
       // The top-level config and an ExtensionWithMatcherPerRoute override selecting another child.
@@ -1515,11 +1515,11 @@ public class CompositeFilterTest {
       filter.buildClientInterceptor(topLevel, routeOverride, scheduler);
       filter.buildServerInterceptor(topLevel, routeOverride);
 
-      // Every delegate entry is resolved through the acquirer with its own NamedFilterConfig...
+      // Every nested config is resolved through the lookup...
       for (CompositeFilter.FilterDelegate delegate
           : Iterables.concat(topLevel.delegates.values(), routeOverride.delegates.values())) {
         for (NamedFilterConfig nested : delegate.delegates) {
-          verify(acquirer, atLeastOnce()).apply(nested);
+          verify(lookup, atLeastOnce()).apply(nested);
         }
       }
       // ...and only through it: the composite neither creates nor retires nested instances, not
@@ -3117,8 +3117,7 @@ public class CompositeFilterTest {
 
     /**
      * A repeated nested name is not an error: nested instances are keyed HCM-wide by name and
-     * type, so a repeat simply selects the same instance, which is how A83 shares state between
-     * match arms. C-core accepts this too.
+     * type, so a repeat simply selects the same instance. C-core accepts this too.
      */
     @Test
     public void parseFilterConfig_duplicateNameWithinFilterChain_accepted() {

@@ -146,7 +146,7 @@ interface Filter extends Closeable {
      * </ol>
      *
      * <p>"Anywhere" covers the HCM's http_filters as well as the filters nested in them (see
-     * {@link FilterContext#filterAcquirer()}), including ones reachable only through per-route
+     * {@link FilterConfig#nestedFilterConfigs()}), including ones declared only by per-route
      * typed_per_filter_config overrides delivered via RDS.
      */
     Filter newInstance(FilterContext context);

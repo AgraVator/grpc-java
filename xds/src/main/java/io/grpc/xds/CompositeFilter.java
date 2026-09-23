@@ -171,13 +171,10 @@ final class CompositeFilter implements Filter {
               "Expected ExtensionWithMatcherPerRoute but got: " + any.getTypeUrl());
         }
         ExtensionWithMatcherPerRoute proto = any.unpack(ExtensionWithMatcherPerRoute.class);
-        // A103 requires xds_matcher to be "validated the same way as the corresponding field in
-        // the top-level config", and there an absent matcher is permitted and makes the filter a
-        // no-op. Since the override replaces the top-level matcher outright, an absent one
-        // replaces it with nothing: the filter stops matching on this route. Rejecting it here
-        // would NACK a config the spec calls valid. A present one is validated like the top-level
-        // one, so it must carry a matcher_list or matcher_tree.
-        return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
+        if (!proto.hasXdsMatcher()) {
+          return ConfigOrError.fromError("ExtensionWithMatcherPerRoute.xds_matcher must be set");
+        }
+        return parseMatcherConfig(proto.getXdsMatcher(), context);
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
       }
@@ -754,10 +751,8 @@ final class CompositeFilter implements Filter {
 
   private static CompositeFilterConfig getEffectiveConfig(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    // A per-route override replaces the top-level config outright, per A103, including its
-    // matcher, which may legitimately be absent on either path. Callers guard for that: both
-    // buildClientInterceptor and buildServerInterceptor return no interceptor when the effective
-    // matcher is null, which is the no-op passthrough A103 asks for.
+    // A per-route override replaces the top-level config outright, per A103. Only the top-level
+    // matcher may be absent; callers then build no interceptor, the no-op passthrough.
     return (CompositeFilterConfig) (overrideConfig != null ? overrideConfig : config);
   }
 

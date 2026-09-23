@@ -754,7 +754,7 @@ public class CompositeFilterTest {
 
     @Test
     public void parseFilterConfig_missingXdsMatcherIsAllowedAndActsAsNoOp() {
-      // Unlike the override, a top-level config without a matcher is valid; the filter becomes a
+      // Unlike in the override, an absent top-level matcher is valid; the filter becomes a
       // passthrough and a per-route override may still supply a matcher.
       ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
           .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
@@ -2993,26 +2993,13 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void envelopeOverride_missingXdsMatcherIsAllowedAndActsAsNoOp() {
-      // A103 requires xds_matcher to be validated the same way as the corresponding top-level
-      // field, and parseFilterConfig_missingXdsMatcherIsAllowedAndActsAsNoOp pins that an absent
-      // one is permitted there. The override replaces the top-level matcher, so an absent one
-      // replaces it with nothing and the filter stops matching on this route.
+    public void envelopeOverride_missingXdsMatcher_rejected() {
+      // Unlike the top-level config, a per-route override must set xds_matcher, as in C-core.
       ExtensionWithMatcherPerRoute proto = ExtensionWithMatcherPerRoute.newBuilder().build();
       ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
           provider.parseFilterConfigOverride(Any.pack(proto), getFilterContext());
-      assertThat(result.errorDetail).isNull();
-      assertThat(result.config).isNotNull();
-      assertThat(result.config.matcher).isNull();
-
-      // A null matcher yields no interceptor on either side: a passthrough, not a crash.
-      CompositeFilter filter = newFilter("composite");
-      CompositeFilter.CompositeFilterConfig base =
-          new CompositeFilter.CompositeFilterConfig(mock(UnifiedMatcher.class),
-              Collections.emptyMap());
-      assertThat(filter.buildClientInterceptor(
-          base, result.config, mock(ScheduledExecutorService.class))).isNull();
-      assertThat(filter.buildServerInterceptor(base, result.config)).isNull();
+      assertThat(result.errorDetail)
+          .contains("ExtensionWithMatcherPerRoute.xds_matcher must be set");
     }
 
     // =========================================================================

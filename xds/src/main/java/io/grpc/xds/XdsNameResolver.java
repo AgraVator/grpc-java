@@ -699,7 +699,7 @@ final class XdsNameResolver extends NameResolver {
 
       stopped = true;
       xdsDependencyManager.shutdown();
-      updateActiveFilters(null, null);
+      closeFilters(updateActiveFilters(null, null));
     }
 
     @Override
@@ -711,7 +711,7 @@ final class XdsNameResolver extends NameResolver {
 
       lastConfigOrStatus = updateOrStatus;
       if (!updateOrStatus.hasValue()) {
-        updateActiveFilters(null, null);
+        closeFilters(updateActiveFilters(null, null));
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -721,7 +721,7 @@ final class XdsNameResolver extends NameResolver {
       HttpConnectionManager httpConnectionManager = update.getListener().httpConnectionManager();
       if (httpConnectionManager == null) {
         logger.log(XdsLogLevel.INFO, "API Listener: httpConnectionManager does not exist.");
-        updateActiveFilters(null, null);
+        closeFilters(updateActiveFilters(null, null));
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -730,17 +730,21 @@ final class XdsNameResolver extends NameResolver {
       ImmutableList<NamedFilterConfig> filterConfigs = httpConnectionManager.httpFilterConfigs();
       long streamDurationNano = httpConnectionManager.httpMaxStreamDurationNano();
 
-      updateActiveFilters(
+      Set<String> filtersToShutdown = updateActiveFilters(
           filterConfigs, virtualHost == null ? null : Collections.singletonList(virtualHost));
       updateRoutes(update, virtualHost, streamDurationNano, filterConfigs);
+      // Only now that the new routes are in place: if building them threw, the routes still
+      // serving would otherwise be left holding closed instances.
+      closeFilters(filtersToShutdown);
     }
 
     /**
      * Creates the instances declared by the HCM filters and the per-route overrides, top-level and
-     * nested alike, and closes the instances nothing declares anymore.
+     * nested alike, and returns the keys of the instances nothing declares anymore, for
+     * {@link #closeFilters}.
      */
     // called in syncContext
-    private void updateActiveFilters(
+    private Set<String> updateActiveFilters(
         @Nullable List<NamedFilterConfig> filterConfigs, @Nullable List<VirtualHost> vhosts) {
       Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
       for (NamedFilterConfig namedFilter : Filter.collectAllFilterConfigs(filterConfigs, vhosts)) {
@@ -756,9 +760,12 @@ final class XdsNameResolver extends NameResolver {
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
       }
+      return filtersToShutdown;
+    }
 
-      // Shutdown filters not present in current HCM.
-      for (String filterKey : filtersToShutdown) {
+    // called in syncContext
+    private void closeFilters(Set<String> filterKeys) {
+      for (String filterKey : filterKeys) {
         Filter filterToShutdown = activeFilters.remove(filterKey);
         checkNotNull(filterToShutdown, "filterToShutdown %s", filterKey);
         filterToShutdown.close();

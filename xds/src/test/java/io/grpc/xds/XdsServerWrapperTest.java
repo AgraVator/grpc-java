@@ -2378,6 +2378,56 @@ public class XdsServerWrapperTest {
     }
   }
 
+  /** If building the interceptors throws, the dropped filters are not closed: they are serving. */
+  @Test
+  public void filterState_noShutdownWhenBuildingInterceptorsThrows() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      String throwingTypeUrl = "type.googleapis.com/grpc.test.ThrowingFilter";
+      Filter throwingFilter = mock(Filter.class);
+      when(throwingFilter.buildServerInterceptor(any(), any()))
+          .thenThrow(new IllegalStateException("cannot build"));
+      Filter.Provider throwingProvider = mock(Filter.Provider.class);
+      when(throwingProvider.typeUrls()).thenReturn(new String[] {throwingTypeUrl});
+      when(throwingProvider.isServerFilter()).thenReturn(true);
+      when(throwingProvider.newInstance(any())).thenReturn(throwingFilter);
+      FilterConfig throwingConfig = mock(FilterConfig.class);
+      when(throwingConfig.typeUrl()).thenReturn(throwingTypeUrl);
+
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      FilterRegistry filterRegistry = FilterRegistry.newRegistry();
+      compositeProvider = new CompositeFilter.Provider(filterRegistry::get);
+      filterRegistry.register(
+          statefulProvider, compositeProvider, throwingProvider, ROUTER_FILTER_PROVIDER);
+      SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+      VirtualHost vhost = filterStateTestVhost();
+      CompositeFilter.CompositeFilterConfig nestingA =
+          parseComposite(compositeAnyWrapping(executeStatefulChain("a")));
+
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcm(vhost, ImmutableList.of(
+          new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+          new NamedFilterConfig("c", nestingA),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> lds1Snapshot = statefulProvider.getAllInstances();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a");
+
+      // LDS 2 drops "c" and adds a filter whose interceptor cannot be built. The sync context
+      // logs the failure; the chain's registry must be left as it was.
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcm(vhost, ImmutableList.of(
+          new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+          new NamedFilterConfig("throwing", throwingConfig),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+      assertThat(severeLogs).hasSize(1);
+      assertThat(severeLogs.get(0).getMessage()).contains("cannot build");
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+      assertThat(lds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(lds1Snapshot.get(1).isShutdown()).isFalse();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
   /**
    * Starts the server with a registry holding StatefulFilter, the composite filter and the router.
    * The composite resolves nested filter types through that same registry.

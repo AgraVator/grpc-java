@@ -2084,9 +2084,9 @@ public class XdsNameResolverTest {
     }
   }
 
-  /** The registry is reconciled before the routes are built, even if building them then throws. */
+  /** If building the routes throws, the dropped filters are not closed: they are still serving. */
   @Test
-  public void filterState_droppedFiltersClosedEvenWhenBuildingRoutesThrows() {
+  public void filterState_noShutdownWhenBuildingRoutesThrows() {
     System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     try {
       String throwingTypeUrl = "type.googleapis.com/grpc.test.ThrowingFilter";
@@ -2116,7 +2116,7 @@ public class XdsNameResolverTest {
       assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a");
 
       // LDS 2 drops "c" and adds a filter whose interceptor cannot be built. The sync context
-      // rethrows the failure; "c"'s nested "a" was already closed by then.
+      // rethrows the failure; the registry must be left as it was.
       AssertionError thrown = assertThrows(AssertionError.class, () ->
           xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
               new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
@@ -2125,7 +2125,7 @@ public class XdsNameResolverTest {
       assertThat(thrown).hasCauseThat().hasMessageThat().isEqualTo("cannot build");
       assertThat(statefulProvider.getAllInstances()).isEqualTo(lds1Snapshot);
       assertThat(lds1Snapshot.get(0).isShutdown()).isFalse();
-      assertThat(lds1Snapshot.get(1).isShutdown()).isTrue();
+      assertThat(lds1Snapshot.get(1).isShutdown()).isFalse();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }

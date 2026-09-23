@@ -788,6 +788,7 @@ final class CompositeFilter implements Filter {
     private final Object lock = new Object();
     private ClientCall<ReqT, RespT> delegate;
     private boolean started;
+    private boolean realCallStarted;
     private Status cancelStatus;
     private int pendingRequests;
 
@@ -837,8 +838,8 @@ final class CompositeFilter implements Filter {
       ClientCall<ReqT, RespT> callToRequest;
       synchronized (lock) {
         Preconditions.checkState(started, "Not started");
-        if (delegate == null) {
-          // start() is still resolving the matcher tree and building the real call. request() is
+        if (!realCallStarted) {
+          // start() is still resolving the matcher tree or starting the real call. request() is
           // the one ClientCall method that may be called from another thread, so the demand has
           // to be remembered and replayed once the real call has been started; dropping it on the
           // no-op call would stall the RPC forever.
@@ -857,7 +858,7 @@ final class CompositeFilter implements Filter {
         if (cancelStatus == null) {
           cancelStatus = Status.CANCELLED.withDescription(message).withCause(cause);
         }
-        if (delegate != null) {
+        if (realCallStarted) {
           callToCancel = delegate;
         }
       }
@@ -939,9 +940,7 @@ final class CompositeFilter implements Filter {
       Status cancelledMidStart;
       synchronized (lock) {
         cancelledMidStart = cancelStatus;
-        if (cancelledMidStart != null) {
-          delegate = noopCall();
-        }
+        delegate = cancelledMidStart != null ? noopCall() : realCall;
       }
       if (cancelledMidStart != null) {
         // Deliberately do not start realCall. ClientCallImpl.startInternal rejects a call that was
@@ -952,15 +951,16 @@ final class CompositeFilter implements Filter {
         return;
       }
 
-      // Start before publishing. While delegate is still null a concurrent cancel() only records
-      // cancelStatus, so it cannot reach a call that has not been started yet, and a concurrent
-      // request() buffers its demand instead of dropping it.
+      // The delegate is published before it is started: with direct executors the transport may
+      // deliver onReady inside start(), and whatever the listener then sends must reach realCall.
+      // Until realCallStarted is set, cancel() only records cancelStatus and request() buffers
+      // its demand, so neither reaches a call that has not finished starting.
       realCall.start(responseListener, headers);
 
       int bufferedRequests;
       Status cancelledDuringStart;
       synchronized (lock) {
-        delegate = realCall;
+        realCallStarted = true;
         bufferedRequests = pendingRequests;
         pendingRequests = 0;
         cancelledDuringStart = cancelStatus;
@@ -969,8 +969,8 @@ final class CompositeFilter implements Filter {
         realCall.request(bufferedRequests);
       }
       if (cancelledDuringStart != null) {
-        // A cancel raced with start() and found delegate still null, so it never reached realCall.
-        // Any cancel arriving after this block sees the published delegate and cancels it itself.
+        // A cancel raced with start() and found realCallStarted unset, so it never reached
+        // realCall. Any cancel arriving after this block cancels the delegate itself.
         realCall.cancel(cancelledDuringStart.getDescription(), cancelledDuringStart.getCause());
       }
     }

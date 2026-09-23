@@ -32,6 +32,7 @@ import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.github.xds.type.matcher.v3.Matcher;
 import com.github.xds.type.matcher.v3.StringMatcher;
 import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.Any;
 import com.google.protobuf.BoolValue;
 import com.google.protobuf.ByteString;
@@ -80,7 +81,14 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientCalls;
+import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
+import io.grpc.stub.StreamObserver;
+import io.grpc.testing.GrpcCleanupRule;
 import io.grpc.testing.protobuf.SimpleRequest;
 import io.grpc.testing.protobuf.SimpleResponse;
 import io.grpc.testing.protobuf.SimpleServiceGrpc;
@@ -90,6 +98,7 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.Filter.NamedFilterConfig;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData;
+import io.grpc.xds.internal.matcher.MatchResult;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
 import java.util.Collections;
 import java.util.HashMap;
@@ -4019,6 +4028,90 @@ public class CompositeFilterTest {
           .setRules(io.envoyproxy.envoy.config.rbac.v3.RBAC.newBuilder()
               .setAction(io.envoyproxy.envoy.config.rbac.v3.RBAC.Action.ALLOW))
           .build());
+    }
+  }
+
+  /**
+   * With the in-process transport and direct executors on both sides, the whole RPC start runs on
+   * the caller's stack, including the response listener's onReady, which is where streaming stubs
+   * send from. Whatever the stub sends re-entrantly must reach the real call.
+   */
+  @RunWith(JUnit4.class)
+  public static class ReentrantStartTest {
+    @Rule
+    public final GrpcCleanupRule grpcCleanup = new GrpcCleanupRule();
+
+    @Test
+    public void sendFromOnReadyDuringStart_reachesRealCall() throws Exception {
+      String serverName = InProcessServerBuilder.generateName();
+      grpcCleanup.register(InProcessServerBuilder.forName(serverName)
+          .directExecutor()
+          .addService(new SimpleServiceGrpc.SimpleServiceImplBase() {
+            @Override
+            public StreamObserver<SimpleRequest> clientStreamingRpc(
+                StreamObserver<SimpleResponse> responseObserver) {
+              return new StreamObserver<SimpleRequest>() {
+                @Override
+                public void onNext(SimpleRequest value) {}
+
+                @Override
+                public void onError(Throwable t) {}
+
+                @Override
+                public void onCompleted() {
+                  responseObserver.onNext(SimpleResponse.getDefaultInstance());
+                  responseObserver.onCompleted();
+                }
+              };
+            }
+          })
+          .build().start());
+
+      // Matches every RPC with no nested filters, so only the composite's own call wrapping runs.
+      UnifiedMatcher matchAll = mock(UnifiedMatcher.class);
+      when(matchAll.match(any())).thenReturn(MatchResult.create(Collections.emptyList()));
+      ClientInterceptor interceptor = new CompositeFilter(/* filterAcquirer= */ null)
+          .buildClientInterceptor(
+              new CompositeFilter.CompositeFilterConfig(matchAll, Collections.emptyMap()), null,
+              mock(ScheduledExecutorService.class));
+      ManagedChannel channel = grpcCleanup.register(InProcessChannelBuilder.forName(serverName)
+          .directExecutor()
+          .intercept(interceptor)
+          .build());
+
+      SettableFuture<SimpleResponse> response = SettableFuture.create();
+      ClientCalls.asyncClientStreamingCall(
+          channel.newCall(SimpleServiceGrpc.getClientStreamingRpcMethod(),
+              CallOptions.DEFAULT.withDeadlineAfter(5, TimeUnit.SECONDS)),
+          new ClientResponseObserver<SimpleRequest, SimpleResponse>() {
+            private boolean sent;
+
+            @Override
+            public void beforeStart(ClientCallStreamObserver<SimpleRequest> requestStream) {
+              requestStream.setOnReadyHandler(() -> {
+                if (!sent) {
+                  sent = true;
+                  requestStream.onNext(SimpleRequest.getDefaultInstance());
+                  requestStream.onCompleted();
+                }
+              });
+            }
+
+            @Override
+            public void onNext(SimpleResponse value) {
+              response.set(value);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+              response.setException(t);
+            }
+
+            @Override
+            public void onCompleted() {}
+          });
+
+      assertThat(response.get(10, TimeUnit.SECONDS)).isEqualTo(SimpleResponse.getDefaultInstance());
     }
   }
 }

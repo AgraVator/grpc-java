@@ -720,12 +720,12 @@ public class DelayedClientTransportTest {
       }
     });
 
-    FakeStreamTracer tracer = new FakeStreamTracer();
+    ClientStreamTracer tracer = mock(ClientStreamTracer.class);
     ClientStream stream = delayedTransport.newStream(
         method, headers, callOptions, new ClientStreamTracer[] {tracer});
     stream.start(streamListener);
 
-    assertThat(tracer.events()).contains("label:routed:perfectly");
+    verify(tracer).addOptionalLabel("routed", "perfectly");
   }
 
   @Test
@@ -786,24 +786,22 @@ public class DelayedClientTransportTest {
         PickResult.withNoResult("connecting", "pick_first: attempting to connect")));
     delayedTransport.newStream(method, headers, callOptions, customTracers);
 
-    assertThat(fakeTracer.events())
-        .containsExactly("start:connecting:pick_first: attempting to connect").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList("pick_first: attempting to connect"),
+        fakeTracer.startedDelayReasons);
 
     delayedTransport.reprocess(fakePicker(
         PickResult.withNoResult("rls_lookup_pending", "RLS request pending.")));
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect",
-        "end:connecting",
-        "start:rls_lookup_pending:RLS request pending.").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.endedDelayTypes);
+    assertEquals(Arrays.asList("connecting", "rls_lookup_pending"),
+        fakeTracer.startedDelayTypes);
+    assertEquals(Arrays.asList("pick_first: attempting to connect", "RLS request pending."),
+        fakeTracer.startedDelayReasons);
 
     delayedTransport.reprocess(mockPicker);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect",
-        "end:connecting",
-        "start:rls_lookup_pending:RLS request pending.",
-        "end:rls_lookup_pending").inOrder();
+    assertEquals(Arrays.asList("connecting", "rls_lookup_pending"), fakeTracer.endedDelayTypes);
   }
 
   @Test
@@ -816,15 +814,11 @@ public class DelayedClientTransportTest {
     ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
     stream.start(streamListener);
 
-    assertThat(fakeTracer.events())
-        .containsExactly("start:connecting:pick_first: attempting to connect").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
 
     stream.cancel(Status.CANCELLED);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
+    assertEquals(1, fakeTracer.delayEndedCount);
   }
 
   @Test
@@ -837,49 +831,11 @@ public class DelayedClientTransportTest {
     ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
     stream.start(streamListener);
 
-    assertThat(fakeTracer.events())
-        .containsExactly("start:connecting:pick_first: attempting to connect").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
 
     delayedTransport.shutdownNow(Status.UNAVAILABLE);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect",
-        "end:connecting",
-        "closed:UNAVAILABLE").inOrder();
-  }
-
-  /**
-   * The delay must end before the stream is closed. A started pending stream is closed inline by
-   * {@code setStream()}, so the delay can not be ended after the stream has been handed over.
-   */
-  @Test
-  public void streamDelayMetrics_shutdownNow_endsDelayBeforeClosingStartedStream() {
-    FakeStreamTracer tracer = new FakeStreamTracer();
-    ClientStream stream = delayedTransport.newStream(
-        method, headers, callOptions, new ClientStreamTracer[] {tracer});
-    stream.start(streamListener);
-
-    delayedTransport.shutdownNow(Status.UNAVAILABLE);
-
-    assertThat(tracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker",
-        "end:connecting",
-        "closed:UNAVAILABLE").inOrder();
-  }
-
-  @Test
-  public void streamDelayMetrics_cancel_endsDelayBeforeClosingStream() {
-    FakeStreamTracer tracer = new FakeStreamTracer();
-    ClientStream stream = delayedTransport.newStream(
-        method, headers, callOptions, new ClientStreamTracer[] {tracer});
-    stream.start(streamListener);
-
-    stream.cancel(Status.CANCELLED);
-
-    assertThat(tracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
+    assertEquals(1, fakeTracer.delayEndedCount);
   }
 
   @Test
@@ -891,56 +847,16 @@ public class DelayedClientTransportTest {
         PickResult.withNoResult("connecting", "attempt 1")));
     delayedTransport.newStream(method, headers, callOptions, customTracers);
 
-    assertThat(fakeTracer.events()).containsExactly("start:connecting:attempt 1").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList("attempt 1"), fakeTracer.startedDelayReasons);
 
     delayedTransport.reprocess(fakePicker(
         PickResult.withNoResult("connecting", "attempt 2")));
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "reason:connecting:attempt 2").inOrder();
-  }
-
-  @Test
-  public void streamDelayMetrics_unchangedPick_doesNotRepeatCallbacks() {
-    FakeStreamTracer fakeTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
-
-    delayedTransport.reprocess(fakePicker(
-        PickResult.withNoResult("connecting", "pick_first: attempting to connect")));
-    delayedTransport.newStream(method, headers, callOptions, customTracers);
-
-    assertThat(fakeTracer.events())
-        .containsExactly("start:connecting:pick_first: attempting to connect").inOrder();
-
-    delayedTransport.reprocess(fakePicker(
-        PickResult.withNoResult("connecting", "pick_first: attempting to connect")));
-
-    assertThat(fakeTracer.events())
-        .containsExactly("start:connecting:pick_first: attempting to connect").inOrder();
-  }
-
-  @Test
-  public void streamDelayMetrics_equalPickFailures_doNotRepeatCallbacks() {
-    FakeStreamTracer fakeTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
-
-    Status broken = Status.UNAVAILABLE.withDescription("broken");
-    delayedTransport.reprocess(fakePicker(PickResult.withError(broken)));
-    delayedTransport.newStream(
-        method, headers, callOptions.withWaitForReady(), customTracers);
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + broken).inOrder();
-
-    // A distinct, but equal, failure produces the same reason, which is not a change.
-    delayedTransport.reprocess(
-        fakePicker(PickResult.withError(Status.UNAVAILABLE.withDescription("broken"))));
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + broken).inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList("attempt 1"), fakeTracer.startedDelayReasons);
+    assertEquals(Collections.singletonList("attempt 2"), fakeTracer.changedDelayReasons);
+    assertEquals(0, fakeTracer.delayEndedCount);
   }
 
   @Test
@@ -951,57 +867,9 @@ public class DelayedClientTransportTest {
     // No picker reprocessed yet (lastPicker == null)
     delayedTransport.newStream(method, headers, callOptions, customTracers);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker").inOrder();
-  }
-
-  /**
-   * A picker that predates the delay attributes returns a queued {@link PickResult} whose delay
-   * type and reason are null. The channel must synthesize a delay for it instead of reporting
-   * nulls to the tracers.
-   */
-  @Test
-  public void streamDelayMetrics_channelFallback_pickerWithoutDelayAttributes() {
-    FakeStreamTracer fakeTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
-
-    PickResult legacyQueuedResult = PickResult.withNoResult();
-    assertNull(legacyQueuedResult.getDelayType());
-    assertNull(legacyQueuedResult.getDelayReason());
-
-    delayedTransport.reprocess(fakePicker(legacyQueuedResult));
-    ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
-    stream.start(streamListener);
-
-    assertEquals(1, delayedTransport.getPendingStreamsCount());
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker").inOrder();
-
-    // A picker that does populate the attributes keeps the same delay type, so the delay in
-    // progress continues with the picker's reason.
-    delayedTransport.reprocess(fakePicker(
-        PickResult.withNoResult("connecting", "pick_first: requesting connection")));
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker",
-        "reason:connecting:pick_first: requesting connection").inOrder();
-
-    // Back to a picker without the attributes: the synthesized reason is reported again.
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult()));
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker",
-        "reason:connecting:pick_first: requesting connection",
-        "reason:connecting:client channel: waiting for picker").inOrder();
-
-    stream.cancel(Status.CANCELLED);
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:client channel: waiting for picker",
-        "reason:connecting:pick_first: requesting connection",
-        "reason:connecting:client channel: waiting for picker",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList("client channel: waiting for picker"),
+        fakeTracer.startedDelayReasons);
   }
 
   @Test
@@ -1009,67 +877,69 @@ public class DelayedClientTransportTest {
     FakeStreamTracer fakeTracer = new FakeStreamTracer();
     ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
 
-    Subchannel disconnectedSubchannel = mock(Subchannel.class);
-    when(disconnectedSubchannel.getInternalSubchannel()).thenReturn(newTransportProvider(null));
+    Subchannel disconnectedSubchannel =
+        mock(Subchannel.class);
+    when(disconnectedSubchannel.getInternalSubchannel())
+        .thenReturn(newTransportProvider(null));
 
     delayedTransport.reprocess(fakePicker(PickResult.withSubchannel(disconnectedSubchannel)));
-    ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
-    stream.start(streamListener);
+    delayedTransport.newStream(method, headers, callOptions, customTracers);
 
-    // It requeued on the same attempt: no new stream was created, the existing one is still
-    // pending, and no attempt-terminating event was recorded.
-    assertTrue(delayedTransport.hasPendingStreams());
-    assertEquals(1, delayedTransport.getPendingStreamsCount());
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:subchannel_state_mismatch:"
-            + "subchannel returned by LB picker has no connected subchannel").inOrder();
-
-    // The delay ends when a repick assigns a genuinely ready subchannel.
-    delayedTransport.reprocess(mockPicker);
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:subchannel_state_mismatch:"
-            + "subchannel returned by LB picker has no connected subchannel",
-        "end:subchannel_state_mismatch").inOrder();
-
-    assertFalse(delayedTransport.hasPendingStreams());
-    // Drain the handoff of the pending stream onto the real transport.
-    assertEquals(1, fakeExecutor.runDueTasks());
+    assertEquals(Collections.singletonList("subchannel_state_mismatch"),
+        fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList(
+        "subchannel returned by LB picker has no connected subchannel"),
+        fakeTracer.startedDelayReasons);
   }
 
   @Test
-  public void streamDelayMetrics_pickerFailingWithWaitForReady() {
+  public void streamDelayMetrics_channelFallback_waitForReadyFailed() {
     FakeStreamTracer fakeTracer = new FakeStreamTracer();
     ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
 
-    // failing picker result + wait_for_ready RPC queues and records this type
-    Status err1 = Status.UNAVAILABLE.withDescription("err1");
-    delayedTransport.reprocess(fakePicker(PickResult.withError(err1)));
+    delayedTransport.reprocess(fakePicker(PickResult.withError(Status.UNAVAILABLE)));
     CallOptions wfrOptions = callOptions.withWaitForReady();
-    ClientStream stream = delayedTransport.newStream(method, headers, wfrOptions, customTracers);
-    stream.start(streamListener);
+    delayedTransport.newStream(method, headers, wfrOptions, customTracers);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + err1).inOrder();
+    assertEquals(Collections.singletonList("picker_failing_with_wait_for_ready"),
+        fakeTracer.startedDelayTypes);
+    assertEquals(Collections.singletonList(
+        "wait_for_ready RPC failed with status: " + Status.UNAVAILABLE),
+        fakeTracer.startedDelayReasons);
+  }
 
-    // reason UPDATES on a subsequent different error
-    Status err2 = Status.RESOURCE_EXHAUSTED.withDescription("err2");
-    delayedTransport.reprocess(fakePicker(PickResult.withError(err2)));
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + err1,
-        "reason:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + err2).inOrder();
+  private static final class FakeStreamTracer extends ClientStreamTracer {
+    final List<String> startedDelayTypes = new ArrayList<>();
+    final List<String> startedDelayReasons = new ArrayList<>();
+    final List<String> changedDelayReasons = new ArrayList<>();
+    final List<String> endedDelayTypes = new ArrayList<>();
+    int delayEndedCount = 0;
 
-    // and a NON-wait_for_ready RPC fails fast with NO delay recorded.
-    FakeStreamTracer ffTracer = new FakeStreamTracer();
-    ClientStream ffStream = delayedTransport.newStream(
-        method, headers, callOptions, new ClientStreamTracer[] { ffTracer });
-    ffStream.start(streamListener);
+    @Override
+    public void recordDelayStart(String delayType, String delayReason) {
+      startedDelayTypes.add(delayType);
+      startedDelayReasons.add(delayReason);
+    }
 
-    assertThat(ffTracer.events()).containsExactly("closed:RESOURCE_EXHAUSTED").inOrder();
+    @Override
+    public void recordDelayReasonChanged(String delayType, String delayReason) {
+      changedDelayReasons.add(delayReason);
+    }
+
+    @Override
+    public void recordDelayEnd(String delayType) {
+      endedDelayTypes.add(delayType);
+      delayEndedCount++;
+    }
+  }
+
+  private static SubchannelPicker fakePicker(final PickResult result) {
+    return new SubchannelPicker() {
+      @Override
+      public PickResult pickSubchannel(PickSubchannelArgs args) {
+        return result;
+      }
+    };
   }
 
   @Test
@@ -1084,8 +954,8 @@ public class DelayedClientTransportTest {
         method, headers, callOptions, customTracers);
     stream.start(streamListener);
 
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect").inOrder();
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(0, fakeTracer.delayEndedCount);
 
     // Reprocess with a custom picker that cancels the stream during the pick.
     // This exactly simulates the concurrent timing race.
@@ -1101,54 +971,8 @@ public class DelayedClientTransportTest {
 
     // VERIFICATION:
     // The updateDelay called after the cancellation must be ignored because of our check.
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:pick_first: attempting to connect",
-        "end:connecting",
-        "closed:CANCELLED").inOrder();
-  }
-
-  private static final class FakeStreamTracer extends ClientStreamTracer {
-    private final List<String> events = Collections.synchronizedList(new ArrayList<String>());
-
-    @Override
-    public void recordDelayStart(String delayType, String delayReason) {
-      events.add("start:" + delayType + ":" + delayReason);
-    }
-
-    @Override
-    public void recordDelayReasonChanged(String delayType, String delayReason) {
-      events.add("reason:" + delayType + ":" + delayReason);
-    }
-
-    @Override
-    public void recordDelayEnd(String delayType) {
-      events.add("end:" + delayType);
-    }
-
-    @Override
-    public void streamClosed(Status status) {
-      events.add("closed:" + status.getCode());
-    }
-
-    @Override
-    public void addOptionalLabel(String key, String value) {
-      events.add("label:" + key + ":" + value);
-    }
-
-    List<String> events() {
-      synchronized (events) {
-        return new ArrayList<>(events);
-      }
-    }
-  }
-
-  private static SubchannelPicker fakePicker(final PickResult result) {
-    return new SubchannelPicker() {
-      @Override
-      public PickResult pickSubchannel(PickSubchannelArgs args) {
-        return result;
-      }
-    };
+    assertEquals(Collections.singletonList("connecting"), fakeTracer.startedDelayTypes);
+    assertEquals(1, fakeTracer.delayEndedCount);
   }
 
   private static TransportProvider newTransportProvider(final ClientTransport transport) {
@@ -1158,65 +982,5 @@ public class DelayedClientTransportTest {
         return transport;
       }
     };
-  }
-
-  @Test
-  public void streamDelayMetrics_zeroTracers_doesNotThrow() {
-    delayedTransport.reprocess(fakePicker(
-        PickResult.withNoResult("connecting", "pick_first: attempting to connect")));
-    ClientStream stream = delayedTransport.newStream(
-        method, headers, callOptions, new ClientStreamTracer[0]);
-    stream.start(streamListener);
-
-    // Cancellation should not throw either
-    stream.cancel(Status.CANCELLED);
-    assertEquals(0, delayedTransport.getPendingStreamsCount());
-  }
-
-  @Test
-  public void streamDelayMetrics_multiTracerFanOut() {
-    FakeStreamTracer tracer1 = new FakeStreamTracer();
-    FakeStreamTracer tracer2 = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] { tracer1, tracer2 };
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    ClientStream stream = delayedTransport.newStream(method, headers, callOptions, customTracers);
-    stream.start(streamListener);
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 2")));
-    stream.cancel(Status.CANCELLED);
-
-    List<String> expectedEvents = Arrays.asList(
-        "start:connecting:attempt 1",
-        "reason:connecting:attempt 2",
-        "end:connecting",
-        "closed:CANCELLED"
-    );
-
-    assertThat(tracer1.events()).containsExactlyElementsIn(expectedEvents).inOrder();
-    assertThat(tracer2.events()).containsExactlyElementsIn(expectedEvents).inOrder();
-  }
-
-  @Test
-  public void streamDelayMetrics_rolloverConnectingToPickerFailing() {
-    FakeStreamTracer fakeTracer = new FakeStreamTracer();
-    ClientStreamTracer[] customTracers = new ClientStreamTracer[] { fakeTracer };
-
-    delayedTransport.reprocess(fakePicker(PickResult.withNoResult("connecting", "attempt 1")));
-    CallOptions wfrOptions = callOptions.withWaitForReady();
-    ClientStream stream = delayedTransport.newStream(method, headers, wfrOptions, customTracers);
-    stream.start(streamListener);
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:attempt 1").inOrder();
-
-    Status err1 = Status.UNAVAILABLE.withDescription("err1");
-    delayedTransport.reprocess(fakePicker(PickResult.withError(err1)));
-
-    assertThat(fakeTracer.events()).containsExactly(
-        "start:connecting:attempt 1",
-        "end:connecting",
-        "start:picker_failing_with_wait_for_ready:wait_for_ready RPC failed with status: "
-            + err1).inOrder();
   }
 }

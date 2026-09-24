@@ -16,8 +16,6 @@
 
 package io.grpc.internal;
 
-import static com.google.common.base.Preconditions.checkNotNull;
-
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
@@ -53,17 +51,6 @@ import javax.annotation.Nullable;
  * thus the delayed transport stops owning the stream.
  */
 final class DelayedClientTransport implements ManagedClientTransport {
-  private static final String DELAY_TYPE_CONNECTING = "connecting";
-  private static final String DELAY_TYPE_SUBCHANNEL_STATE_MISMATCH = "subchannel_state_mismatch";
-  private static final String DELAY_TYPE_PICKER_FAILING_WITH_WAIT_FOR_READY =
-      "picker_failing_with_wait_for_ready";
-  private static final String DELAY_REASON_WAITING_FOR_PICKER =
-      "client channel: waiting for picker";
-  private static final String DELAY_REASON_SUBCHANNEL_STATE_MISMATCH =
-      "subchannel returned by LB picker has no connected subchannel";
-  private static final String DELAY_REASON_WAIT_FOR_READY_FAILED_PREFIX =
-      "wait_for_ready RPC failed with status: ";
-
   // lazily allocated, since it is infrequently used.
   private final InternalLogId logId =
       InternalLogId.allocate(DelayedClientTransport.class, /*details=*/ null);
@@ -138,7 +125,6 @@ final class DelayedClientTransport implements ManagedClientTransport {
       PickSubchannelArgs args = new PickSubchannelArgsImpl(
           method, headers, callOptions, new PickDetailsConsumerImpl(tracers));
       PickerState state = pickerState;
-      PendingStream pendingStream;
       while (true) {
         if (state.shutdownStatus != null) {
           return new FailingClientStream(state.shutdownStatus, tracers);
@@ -171,13 +157,13 @@ final class DelayedClientTransport implements ManagedClientTransport {
         synchronized (lock) {
           PickerState newerState = pickerState;
           if (state == newerState) {
-            pendingStream = createPendingStream(args, tracers, pickResult);
-            break;
+            String delayType = determineQueuingDelayType(pickResult);
+            String delayReason = determineQueuingDelayReason(pickResult);
+            return createPendingStream(args, tracers, pickResult, delayType, delayReason);
           }
           state = newerState;
         }
       }
-      return pendingStream;
     } finally {
       syncContext.drain();
     }
@@ -188,10 +174,9 @@ final class DelayedClientTransport implements ManagedClientTransport {
    * schedule tasks on syncContext.
    */
   @GuardedBy("lock")
-  private PendingStream createPendingStream(
-      PickSubchannelArgs args, ClientStreamTracer[] tracers, @Nullable PickResult pickResult) {
-    PendingStream pendingStream = new PendingStream(args, tracers,
-        determineQueuingDelayType(pickResult), determineQueuingDelayReason(pickResult));
+  private PendingStream createPendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers,
+      PickResult pickResult, String delayType, String delayReason) {
+    PendingStream pendingStream = new PendingStream(args, tracers, delayType, delayReason);
     if (args.getCallOptions().isWaitForReady() && pickResult != null && pickResult.hasResult()) {
       pendingStream.lastPickStatus = pickResult.getStatus();
     }
@@ -320,8 +305,6 @@ final class DelayedClientTransport implements ManagedClientTransport {
       final ClientTransport transport = GrpcUtil.getTransportFromPickResult(pickResult,
           callOptions.isWaitForReady());
       if (transport != null) {
-        // The delay must end before the real stream is created: creating it calls the tracers
-        // (streamCreated()), which must not be called before the delay has been reported.
         stream.endDelay();
         Executor executor = defaultAppExecutor;
         // createRealStream may be expensive. It will start real streams on the transport. If
@@ -336,8 +319,9 @@ final class DelayedClientTransport implements ManagedClientTransport {
         }
         toRemove.add(stream);
       } else { // stay pending
-        stream.updateDelay(
-            determineQueuingDelayType(pickResult), determineQueuingDelayReason(pickResult));
+        String delayType = determineQueuingDelayType(pickResult);
+        String delayReason = determineQueuingDelayReason(pickResult);
+        stream.updateDelay(delayType, delayReason);
       }
     }
 
@@ -381,34 +365,34 @@ final class DelayedClientTransport implements ManagedClientTransport {
 
   private static String determineQueuingDelayType(@Nullable PickResult pickResult) {
     if (pickResult == null) {
-      return DELAY_TYPE_CONNECTING;
+      return "connecting";
     }
     if (pickResult.getSubchannel() != null) {
-      return DELAY_TYPE_SUBCHANNEL_STATE_MISMATCH;
+      return "subchannel_state_mismatch";
     }
     if (!pickResult.getStatus().isOk()) {
-      return DELAY_TYPE_PICKER_FAILING_WITH_WAIT_FOR_READY;
+      return "picker_failing_with_wait_for_ready";
     }
     if (pickResult.getDelayType() != null) {
       return pickResult.getDelayType();
     }
-    return DELAY_TYPE_CONNECTING;
+    return "connecting";
   }
 
   private static String determineQueuingDelayReason(@Nullable PickResult pickResult) {
     if (pickResult == null) {
-      return DELAY_REASON_WAITING_FOR_PICKER;
+      return "client channel: waiting for picker";
     }
     if (pickResult.getSubchannel() != null) {
-      return DELAY_REASON_SUBCHANNEL_STATE_MISMATCH;
+      return "subchannel returned by LB picker has no connected subchannel";
     }
     if (!pickResult.getStatus().isOk()) {
-      return DELAY_REASON_WAIT_FOR_READY_FAILED_PREFIX + pickResult.getStatus();
+      return "wait_for_ready RPC failed with status: " + pickResult.getStatus();
     }
     if (pickResult.getDelayReason() != null) {
       return pickResult.getDelayReason();
     }
-    return DELAY_REASON_WAITING_FOR_PICKER;
+    return "client channel: waiting for picker";
   }
 
   private class PendingStream extends DelayedStream {
@@ -420,38 +404,32 @@ final class DelayedClientTransport implements ManagedClientTransport {
     @Nullable private String activeDelayType;
     @GuardedBy("this")
     @Nullable private String activeDelayReason;
-    @GuardedBy("this")
-    private boolean delayEnded;
 
     private PendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers,
         String delayType, String delayReason) {
       super("connecting_and_lb");
       this.args = args;
       this.tracers = tracers;
-      this.activeDelayType = checkNotNull(delayType, "delayType");
-      this.activeDelayReason = checkNotNull(delayReason, "delayReason");
+      this.activeDelayType = delayType;
+      this.activeDelayReason = delayReason;
       for (ClientStreamTracer tracer : tracers) {
         tracer.recordDelayStart(delayType, delayReason);
       }
     }
 
     /**
-     * Updates the delay telemetry state of a stream whose pick stayed queued.
+     * Updates active attempt delay telemetry state upon load balancing state transitions.
      *
-     * <p>If {@code newType} differs from the type of the delay in progress, that delay is ended
-     * and a new one is started. If only the reason changed, the delay in progress is kept and the
-     * new reason is reported on it.
+     * <p>If {@code newType} differs from the active delay type, active segment timers and child
+     * spans are ended and a new segment is initiated. If only {@code newReason} changes, a
+     * structured transition event is appended to the active span without span re-creation.
      */
     synchronized void updateDelay(String newType, String newReason) {
-      checkNotNull(newType, "newType");
-      checkNotNull(newReason, "newReason");
-      if (getRealStream() != null || delayEnded) {
-        // Stream is already connected or cancelled. Do nothing.
+      if (getRealStream() != null) {
         return;
       }
       if (!newType.equals(activeDelayType)) {
-        // Delay type changed (e.g., from RLS lookup to connecting). Per gRFC A121 the delay in
-        // progress must be ended before the new one is started.
+        // Delay type changed (e.g., from RLS lookup to connecting). End the previous delay.
         for (ClientStreamTracer tracer : tracers) {
           tracer.recordDelayEnd(activeDelayType);
         }
@@ -461,8 +439,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
           tracer.recordDelayStart(newType, newReason);
         }
       } else if (!newReason.equals(activeDelayReason)) {
-        // Delay type is unchanged, but the reason changed (e.g., connection status detail
-        // updated).
+        // Delay type is unchanged, but the reason changed (e.g., priority failover).
         activeDelayReason = newReason;
         for (ClientStreamTracer tracer : tracers) {
           tracer.recordDelayReasonChanged(newType, newReason);
@@ -471,26 +448,18 @@ final class DelayedClientTransport implements ManagedClientTransport {
     }
 
     /**
-     * Ends the delay in progress, if it has not ended already. This must happen before the stream
-     * is handed a real stream or is cancelled, so that the delay is reported before any terminal
-     * callback.
+     * Ends active attempt delay segment telemetry upon stream creation or stream cancellation.
      */
     synchronized void endDelay() {
-      if (delayEnded) {
-        return;
+      if (activeDelayType != null) {
+        for (ClientStreamTracer tracer : tracers) {
+          tracer.recordDelayEnd(activeDelayType);
+        }
+        activeDelayType = null;
+        activeDelayReason = null;
       }
-      delayEnded = true;
-      for (ClientStreamTracer tracer : tracers) {
-        tracer.recordDelayEnd(activeDelayType);
-      }
-      activeDelayType = null;
-      activeDelayReason = null;
     }
 
-    /**
-     * Ends the delay and then hands this stream over to {@code stream}. The delay must end first:
-     * {@link DelayedStream#setStream} may start {@code stream} inline, which can close the tracers.
-     */
     Runnable setStreamAndEndDelay(ClientStream stream) {
       endDelay();
       return setStream(stream);

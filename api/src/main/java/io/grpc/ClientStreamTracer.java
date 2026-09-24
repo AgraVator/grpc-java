@@ -58,59 +58,42 @@ public abstract class ClientStreamTracer extends StreamTracer {
   }
 
   /**
-   * Called when a delay begins, or when the {@code delayType} of an ongoing delay changes, which
-   * ends the previous delay and starts a new one.
+   * Called when an attempt-level delay (such as waiting for a load balancing pick or connection
+   * establishment) starts, or when the {@code delayType} of the ongoing delay changes, in which
+   * case {@link #recordDelayEnd} is called for the previous delay first.
    *
-   * <p>Delays recorded on this tracer are attempt-scoped: they measure time an RPC attempt spends
-   * waiting for a load balancing pick or for a connection to be established. Implementations
-   * should start a timer and open a child tracing span named strictly {@code "Delay"} carrying the
-   * canonical {@code grpc.delay_type} attribute.
+   * <p>Implementations should start a timer and open a child tracing span (named strictly
+   * {@code "Delay"}) carrying the canonical {@code grpc.delay_type} attribute.
    *
-   * <p>The channel is the sole owner of the current delay type and supplies it on every call, so
-   * implementations do not need to store it.
-   *
-   * <p>This method may be invoked on channel-internal threads. Implementations must return
-   * promptly, must not block, and must not re-enter gRPC.
-   *
-   * @param delayType canonical low-cardinality label categorizing the delay (e.g., "connecting").
-   *     Never {@code null}.
-   * @param delayReason high-cardinality diagnostic string describing granular runtime conditions.
-   *     Never {@code null}.
+   * @param delayType canonical low-cardinality label categorizing the delay (e.g., "connecting")
+   * @param delayReason high-cardinality diagnostic string describing granular runtime conditions
    * @since 1.85.0
    */
   public void recordDelayStart(String delayType, String delayReason) {
   }
 
   /**
-   * Called when the reason for an ongoing delay changes while its {@code delayType} stays the same
-   * (for example, when a petiole policy updates its connection status detail while remaining in
-   * {@code "connecting"}).
+   * Called when an attempt-level delay reason changes while the delay type remains constant (for
+   * example, when a load balancing policy updates its connection status detail).
    *
-   * <p>Implementations should record a structured event (such as {@code "Delay triggered"}) on the
-   * active delay span without recreating the span or resetting cumulative timers.
+   * <p>Implementations should record a structured event (such as {@code "Delay triggered"}) on
+   * the active delay span without recreating the span or resetting cumulative timers.
    *
-   * <p>This method may be invoked on channel-internal threads. Implementations must return
-   * promptly, must not block, and must not re-enter gRPC.
-   *
-   * @param delayType canonical low-cardinality label of the ongoing delay. Never {@code null}.
-   * @param delayReason updated high-cardinality diagnostic string describing the new conditions.
-   *     Never {@code null}.
+   * @param delayType canonical low-cardinality label of the ongoing delay
+   * @param delayReason updated high-cardinality diagnostic string describing new conditions
    * @since 1.85.0
    */
   public void recordDelayReasonChanged(String delayType, String delayReason) {
   }
 
   /**
-   * Called when a delay resolves, for example upon a successful pick or stream creation.
+   * Called when an attempt-level delay ends upon successful pick or stream creation, or when the
+   * attempt is cancelled or reaches its deadline while still waiting.
    *
    * <p>Implementations should close the active child tracing span and record the elapsed duration
-   * to the {@code grpc.client.attempt.delay.duration} histogram, labeled with the supplied
-   * {@code delayType}.
+   * to the {@code grpc.client.attempt.delay.duration} histogram labeled with {@code delayType}.
    *
-   * <p>This method may be invoked on channel-internal threads. Implementations must return
-   * promptly, must not block, and must not re-enter gRPC.
-   *
-   * @param delayType canonical low-cardinality label of the delay being ended. Never {@code null}.
+   * @param delayType canonical low-cardinality label of the delay being ended
    * @since 1.85.0
    */
   public void recordDelayEnd(String delayType) {
@@ -178,45 +161,41 @@ public abstract class ClientStreamTracer extends StreamTracer {
     }
 
     /**
-     * Called when a delay begins, or when the {@code delayType} of an ongoing delay changes, which
-     * ends the previous delay and starts a new one.
+     * Called when a call-level delay (such as waiting for name resolution) starts before any
+     * individual RPC attempt is created, or when the {@code delayType} of the ongoing delay
+     * changes, in which case {@link #recordDelayEnd} is called for the previous delay first.
      *
-     * <p>Delays recorded on the factory are call-scoped: they measure time the RPC spends waiting
-     * before any attempt is created, such as waiting for name resolution. Implementations should
-     * start a timer and open a child tracing span named strictly {@code "Delay"} carrying the
-     * canonical {@code grpc.delay_type} attribute.
+     * <p>Implementations should start a timer and open a child tracing span (named strictly
+     * {@code "Delay"}) carrying the canonical {@code grpc.delay_type} attribute.
      *
-     * <p>These are the same three methods declared on {@link ClientStreamTracer}; the scope of the
-     * delay, and therefore the histogram it is recorded to, is determined by whether the channel
-     * calls them on the factory (call-scoped) or on the stream tracer (attempt-scoped).
-     *
-     * <p>For the full contract and threading semantics, see
-     * {@link ClientStreamTracer#recordDelayStart(String, String)}.
-     *
+     * @param delayType canonical low-cardinality label categorizing the delay (e.g., "resolving")
+     * @param delayReason high-cardinality diagnostic string describing granular runtime conditions
      * @since 1.85.0
      */
     public void recordDelayStart(String delayType, String delayReason) {
     }
 
     /**
-     * Called when the reason for an ongoing call-scoped delay changes while its {@code delayType}
-     * stays the same, for example when the name resolver reports a second consecutive failure.
+     * Called when a call-level delay reason changes while the delay type remains constant.
      *
-     * <p>For the full contract and threading semantics, see
-     * {@link ClientStreamTracer#recordDelayReasonChanged(String, String)}.
+     * <p>Implementations should record a structured event (such as {@code "Delay triggered"}) on
+     * the active call delay span without recreating the span or resetting timers.
      *
+     * @param delayType canonical low-cardinality label of the ongoing delay
+     * @param delayReason updated high-cardinality diagnostic string describing new conditions
      * @since 1.85.0
      */
     public void recordDelayReasonChanged(String delayType, String delayReason) {
     }
 
     /**
-     * Called when a call-scoped delay resolves, for example when name resolution completes, or
-     * when the RPC is cancelled or reaches its deadline while still waiting.
+     * Called when a call-level delay ends upon successful name resolution, or when the RPC is
+     * cancelled or reaches its deadline before resolution completes.
      *
-     * <p>For the full contract and threading semantics, see
-     * {@link ClientStreamTracer#recordDelayEnd(String)}.
+     * <p>Implementations should close the active call delay span and record the elapsed duration
+     * to the {@code grpc.client.call.delay.duration} histogram labeled with {@code delayType}.
      *
+     * @param delayType canonical low-cardinality label of the delay being ended
      * @since 1.85.0
      */
     public void recordDelayEnd(String delayType) {

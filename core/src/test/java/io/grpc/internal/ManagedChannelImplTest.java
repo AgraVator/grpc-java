@@ -1133,7 +1133,7 @@ public class ManagedChannelImplTest {
     verifyNoMoreInteractions(mockLoadBalancer);
   }
 
-  @Test
+  @Test  
   public void noMoreCallbackAfterLoadBalancerShutdown_configError() throws InterruptedException {
     FakeNameResolverFactory nameResolverFactory =
         new FakeNameResolverFactory.Builder(expectedUri)
@@ -4878,76 +4878,6 @@ public class ManagedChannelImplTest {
         .fromServiceConfig(rawServiceConfig, true, 3, 4, policySelection);
   }
 
-  /** The reason the channel reports while an RPC waits for the initial name resolution. */
-  private static final String RESOLVING_REASON =
-      "waiting for name resolution to complete for target " + TARGET;
-
-  private static String resolutionFailedReason(Status error) {
-    return "name resolution failed for target " + TARGET + ": " + error;
-  }
-
-  private static void setResolverError(FakeNameResolverFactory nsFactory, @Nullable Status error) {
-    for (FakeNameResolverFactory.FakeNameResolver resolver : nsFactory.resolvers) {
-      resolver.error = error;
-    }
-  }
-
-  /**
-   * Records the gRFC A121 delay callbacks the channel makes on a call-scoped tracer factory.
-   *
-   * <p>This is a real {@link ClientStreamTracer.Factory} rather than a mock so that the assertions
-   * below run against the channel's actual callback sequence. Recording the callbacks as an
-   * ordered list also lets each test pin the exact event stream, which is what A121 specifies,
-   * instead of checking interactions one at a time and leaving the ordering and the absence of
-   * extra callbacks unverified.
-   */
-  private static final class RecordingCallTracerFactory extends ClientStreamTracer.Factory {
-    // The channel starts delays from the SynchronizationContext but may end them from a call
-    // executor thread, so the list has to tolerate concurrent appends.
-    private final List<String> events = Collections.synchronizedList(new ArrayList<String>());
-
-    @Override
-    public ClientStreamTracer newClientStreamTracer(StreamInfo info, Metadata headers) {
-      return new ClientStreamTracer() {};
-    }
-
-    @Override
-    public void recordDelayStart(String delayType, String delayReason) {
-      events.add("start:" + delayType + ":" + delayReason);
-    }
-
-    @Override
-    public void recordDelayReasonChanged(String delayType, String delayReason) {
-      events.add("reason:" + delayType + ":" + delayReason);
-    }
-
-    @Override
-    public void recordDelayEnd(String delayType) {
-      events.add("end:" + delayType);
-    }
-
-    /** Snapshot of the events recorded so far, in the order the channel produced them. */
-    List<String> events() {
-      synchronized (events) {
-        return new ArrayList<>(events);
-      }
-    }
-  }
-
-  /** The event a tracer sees when the channel opens the delay for the initial name resolution. */
-  private static final String START_RESOLVING = "start:resolving:" + RESOLVING_REASON;
-  private static final String END_RESOLVING = "end:resolving";
-
-  /** The event for a delay that opens while initial name resolution is already failing. */
-  private static String startResolvingFailed(Status error) {
-    return "start:resolving:" + resolutionFailedReason(error);
-  }
-
-  /** The event for a resolver failure that only updates the reason of an open delay. */
-  private static String reasonResolvingFailed(Status error) {
-    return "reason:resolving:" + resolutionFailedReason(error);
-  }
-
   @Test
   public void callDelay_normalDeferredResolution() {
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
@@ -4955,17 +4885,20 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
 
     nsFactory.allResolved();
 
-    assertThat(tracerFactory.events())
-        .containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
+    verify(mockTracerFactory).recordDelayEnd("resolving");
     executor.runDueTasks();
   }
 
@@ -4976,8 +4909,10 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
@@ -4986,8 +4921,8 @@ public class ManagedChannelImplTest {
       public void run() {}
     });
 
-    // Resolution already completed, so per A121 no delay is recorded at all.
-    assertThat(tracerFactory.events()).isEmpty();
+    verify(mockTracerFactory, never()).recordDelayStart(anyString(), anyString());
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
     executor.runDueTasks();
   }
 
@@ -4998,42 +4933,20 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
 
     call.cancel("Cancelled while queued", null);
 
-    // Per gRFC A121 the channel owns the call-level delay, so cancelling the call ends it.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-    verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
-    assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
-  }
-
-  @Test
-  public void callDelay_cancellationWhileQueued_laterResolutionDoesNotRecordDelay() {
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false).build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
-
-    call.cancel("Cancelled while queued", null);
-    nsFactory.allResolved();
-
-    // The cancelled call is still released from the queue, but the channel already ended its
-    // delay when the call was cancelled, so no second end or reason change may follow.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
+    verify(mockTracerFactory).recordDelayEnd("resolving");
     executor.runDueTasks();
   }
 
@@ -5044,115 +4957,48 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
     CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
+        .withStreamTracerFactory(mockTracerFactory)
         .withDeadline(Deadline.after(100, TimeUnit.MILLISECONDS, timer.getDeadlineTicker()));
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
 
     timer.forwardTime(101, TimeUnit.MILLISECONDS);
 
-    // The deadline cancels the call, and per gRFC A121 the channel ends the open delay on that
-    // path. Exactly one end is emitted.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-    verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
-    assertEquals(Status.Code.DEADLINE_EXCEEDED, statusCaptor.getValue().getCode());
-  }
-
-  @Test
-  public void callDelay_resolutionFailure_failFastCallEndsDelay() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
-
-    nsFactory.allResolved();
-
-    // A121 line 135: a fail-fast call is not blocked by a resolution failure, so it proceeds and
-    // the delay ends rather than having its reason updated.
-    assertThat(tracerFactory.events())
-        .containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
+    verify(mockTracerFactory).recordDelayEnd("resolving");
     executor.runDueTasks();
   }
 
   @Test
-  public void callDelay_resolutionFailure_waitForReadyCallChangesDelayReason() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
+  public void callDelay_resolutionFailure() {
     FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
         .setResolvedAtStart(false)
-        .setError(resolutionError)
+        .setError(Status.UNAVAILABLE.withDescription("Simulated resolver failure"))
         .build();
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
-        .withWaitForReady();
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
 
     nsFactory.allResolved();
 
-    // A121 line 135: a wait-for-ready call stays queued across a resolution failure, so the delay
-    // goes on with a new reason instead of ending.
-    assertThat(tracerFactory.events())
-        .containsExactly(START_RESOLVING, reasonResolvingFailed(resolutionError)).inOrder();
-    verify(mockCallListener, never()).onClose(any(Status.class), any(Metadata.class));
-
-    // The delay only ends once a resolution result lets the call proceed.
-    setResolverError(nsFactory, null);
-    nsFactory.allResolved();
-
-    assertThat(tracerFactory.events()).containsExactly(
-        START_RESOLVING, reasonResolvingFailed(resolutionError), END_RESOLVING).inOrder();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_consecutiveResolutionFailures_changeReasonWithoutRestartingDelay() {
-    Status firstError = Status.UNAVAILABLE.withDescription("First resolver failure");
-    Status secondError = Status.UNAVAILABLE.withDescription("Second resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(firstError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
-        .withWaitForReady();
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    nsFactory.allResolved();
-    setResolverError(nsFactory, secondError);
-    nsFactory.allResolved();
-
-    // A121 line 135: consecutive failures only change the reason. Pinning the whole sequence also
-    // proves the second failure neither restarted the delay nor ended it.
-    assertThat(tracerFactory.events()).containsExactly(
-        START_RESOLVING,
-        reasonResolvingFailed(firstError),
-        reasonResolvingFailed(secondError)).inOrder();
+    verify(mockTracerFactory).recordDelayEnd("resolving");
     executor.runDueTasks();
   }
 
@@ -5163,17 +5009,20 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
     ClientCall<String, Integer> call = channel.newCall(method, callOptions);
     call.start(mockCallListener, new Metadata());
 
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
+    verify(mockTracerFactory).recordDelayStart(
+        eq("resolving"), eq("waiting for name resolution or service config"));
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
 
     channel.shutdownNow();
 
-    // shutdownNow() cancels the queued call, which ends its open delay.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
+    verify(mockTracerFactory).recordDelayEnd("resolving");
     executor.runDueTasks();
   }
 
@@ -5184,16 +5033,18 @@ public class ManagedChannelImplTest {
     channelBuilder.nameResolverFactory(nsFactory);
     createChannel();
 
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
+    ClientStreamTracer.Factory mockTracerFactory = mock(ClientStreamTracer.Factory.class);
+    when(mockTracerFactory.newClientStreamTracer(any(StreamInfo.class), any(Metadata.class)))
+        .thenReturn(new ClientStreamTracer() {});
+    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(mockTracerFactory);
 
     channel.syncContext.execute(() -> {
       ClientCall<String, Integer> call = channel.newCall(method, callOptions);
       call.cancel("Cancelled before syncContext drains", null);
     });
 
-    // The call ended before the queuing runnable ran, so no delay may be opened at all.
-    assertThat(tracerFactory.events()).isEmpty();
+    verify(mockTracerFactory, never()).recordDelayStart(anyString(), anyString());
+    verify(mockTracerFactory, never()).recordDelayEnd(anyString());
     executor.runDueTasks();
   }
 
@@ -5230,274 +5081,6 @@ public class ManagedChannelImplTest {
     });
 
     verify(tracer2, never()).recordDelayStart(anyString(), anyString());
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_multipleTracerFactories_allSeeTheSameDelayInOrder() {
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false).build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory first = new RecordingCallTracerFactory();
-    RecordingCallTracerFactory second = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(first)
-        .withStreamTracerFactory(second);
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    nsFactory.allResolved();
-
-    // A121 line 119: every call tracer attached to the RPC observes the same delay lifecycle.
-    assertThat(first.events())
-        .containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    assertThat(second.events())
-        .containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_noTracerFactories_doesNotThrow() {
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false).build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    // No stream tracer factory at all: the channel takes the empty-factory shortcut and must still
-    // queue, release and complete the call normally.
-    ClientCall<String, Integer> call = channel.newCall(method, CallOptions.DEFAULT);
-    call.start(mockCallListener, new Metadata());
-
-    nsFactory.allResolved();
-    executor.runDueTasks();
-
-    verify(mockCallListener, never()).onClose(any(Status.class), any(Metadata.class));
-  }
-
-  @Test
-  public void callDelay_resolutionFailure_noTracerFactories_doesNotThrow() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    // A wait-for-ready call with no tracer factory stays queued across the failure. The channel
-    // must take the empty-factory shortcut rather than build a reason string nobody reads.
-    ClientCall<String, Integer> call =
-        channel.newCall(method, CallOptions.DEFAULT.withWaitForReady());
-    call.start(mockCallListener, new Metadata());
-
-    nsFactory.allResolved();
-    verify(mockCallListener, never()).onClose(any(Status.class), any(Metadata.class));
-
-    setResolverError(nsFactory, null);
-    nsFactory.allResolved();
-    executor.runDueTasks();
-
-    verify(mockCallListener, never()).onClose(any(Status.class), any(Metadata.class));
-  }
-
-  @Test
-  public void callDelay_cancelledWhileQueued_laterResolutionFailureIsNotReported() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
-        .withWaitForReady();
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
-
-    // Queue the resolver failure first and cancel only afterwards, both from inside the
-    // SynchronizationContext. Cancelling marks the delay terminated synchronously but merely
-    // schedules the call's removal from the pending queue, so the failure is delivered while the
-    // cancelled call is still queued, which is the case this test is about. Cancelling from the
-    // test thread instead would drain the removal first and leave the failure sweeping an empty
-    // queue without ever reaching the call.
-    channel.syncContext.execute(() -> {
-      nsFactory.allResolved();
-      call.cancel("Cancelled while queued", null);
-    });
-
-    // Cancelling ends the delay, so the resolution failure that follows must not be reported as
-    // a reason change on a delay that is already over.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-    verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
-    assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
-  }
-
-  @Test
-  public void callDelay_cancelledWhileQueued_laterResolutionSuccessDoesNotEndDelayTwice() {
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false).build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
-
-    // A successful resolution reaches the pending calls one SynchronizationContext hop later than
-    // a failure does, because the resolver's result is forwarded through onResult() before
-    // onResult2() applies it. Cancelling from the nested runnable therefore lands between those
-    // two hops, which leaves the cancelled call in the queue for the release pass that follows.
-    channel.syncContext.execute(() -> {
-      nsFactory.allResolved();
-      channel.syncContext.execute(() -> call.cancel("Cancelled while queued", null));
-    });
-
-    // The release pass reprocesses the cancelled call and tries to end its delay again, but the
-    // delay already ended when the call was cancelled, so no second end event is emitted.
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-    verify(mockCallListener).onClose(statusCaptor.capture(), any(Metadata.class));
-    assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
-  }
-
-  @Test
-  public void callDelay_queuedAfterResolutionCompletes_neverOpensDelay() {
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false).build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT.withStreamTracerFactory(tracerFactory);
-
-    // Start the call from a runnable that is already queued behind the resolver's result but
-    // ahead of the hop that applies it. newCall() still observes the initial config selector and
-    // so builds a pending call, but by the time that call's own queuing runnable drains,
-    // resolution has completed and the call is handed straight to a real call instead of being
-    // added to the pending queue.
-    channel.syncContext.execute(() -> {
-      nsFactory.allResolved();
-      channel.syncContext.execute(() -> {
-        ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-        call.start(mockCallListener, new Metadata());
-      });
-    });
-
-    // The call never waited on name resolution, so per A121 no delay may be reported for it.
-    assertThat(tracerFactory.events()).isEmpty();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_resolutionFailureThenSuccess_endsDelayExactlyOnce() {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    RecordingCallTracerFactory failFast = new RecordingCallTracerFactory();
-    ClientCall<String, Integer> failFastCall =
-        channel.newCall(method, CallOptions.DEFAULT.withStreamTracerFactory(failFast));
-    failFastCall.start(mockCallListener, new Metadata());
-    assertThat(failFast.events()).containsExactly(START_RESOLVING);
-
-    // The failure releases the fail-fast call, which ends its delay.
-    nsFactory.allResolved();
-    assertThat(failFast.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-
-    // A later successful resolution sweeps the pending queue again. The already-released call may
-    // still be in it, and must not have its delay ended a second time.
-    setResolverError(nsFactory, null);
-    nsFactory.allResolved();
-    assertThat(failFast.events()).containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_waitForReadyCallAfterResolutionFailure_queuesAndRecordsResolvingDelay() {
-    Status firstError = Status.UNAVAILABLE.withDescription("First resolver failure");
-    Status secondError = Status.UNAVAILABLE.withDescription("Second resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(firstError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    createChannel();
-
-    // Fail initial name resolution before any RPC is issued.
-    nsFactory.allResolved();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
-        .withWaitForReady();
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    // Because no ServiceConfig has been resolved yet, the wait-for-ready call must queue in
-    // pendingCalls and start its call-level resolving delay with the failure reason directly.
-    assertThat(tracerFactory.events()).containsExactly(startResolvingFailed(firstError));
-
-    // Subsequent resolution failure updates the reason.
-    setResolverError(nsFactory, secondError);
-    nsFactory.allResolved();
-
-    assertThat(tracerFactory.events()).containsExactly(
-        startResolvingFailed(firstError), reasonResolvingFailed(secondError)).inOrder();
-
-    // Resolution success releases the call and ends the resolving delay.
-    setResolverError(nsFactory, null);
-    nsFactory.allResolved();
-
-    assertThat(tracerFactory.events()).containsExactly(
-        startResolvingFailed(firstError),
-        reasonResolvingFailed(secondError),
-        END_RESOLVING).inOrder();
-    executor.runDueTasks();
-  }
-
-  @Test
-  public void callDelay_resolutionFailureWithDefaultServiceConfig_releasesWaitForReadyCall()
-      throws Exception {
-    Status resolutionError = Status.UNAVAILABLE.withDescription("Simulated resolver failure");
-    FakeNameResolverFactory nsFactory = new FakeNameResolverFactory.Builder(expectedUri)
-        .setResolvedAtStart(false)
-        .setError(resolutionError)
-        .build();
-    channelBuilder.nameResolverFactory(nsFactory);
-    Map<String, Object> defaultServiceConfig =
-        parseConfig("{\"methodConfig\":[{\"name\":[{}],\"waitForReady\":true}]}");
-    channelBuilder.defaultServiceConfig(defaultServiceConfig);
-    createChannel();
-
-    RecordingCallTracerFactory tracerFactory = new RecordingCallTracerFactory();
-    CallOptions callOptions = CallOptions.DEFAULT
-        .withStreamTracerFactory(tracerFactory)
-        .withWaitForReady();
-    ClientCall<String, Integer> call = channel.newCall(method, callOptions);
-    call.start(mockCallListener, new Metadata());
-
-    assertThat(tracerFactory.events()).containsExactly(START_RESOLVING);
-
-    // When initial resolution fails but defaultServiceConfig is configured, the channel falls back
-    // to defaultServiceConfig and releases queued calls from pendingCalls immediately, so the
-    // delay ends instead of merely changing reason.
-    nsFactory.allResolved();
-
-    assertThat(tracerFactory.events())
-        .containsExactly(START_RESOLVING, END_RESOLVING).inOrder();
     executor.runDueTasks();
   }
 }

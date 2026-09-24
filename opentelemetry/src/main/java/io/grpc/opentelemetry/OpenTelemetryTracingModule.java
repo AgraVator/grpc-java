@@ -20,8 +20,6 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static io.grpc.ClientStreamTracer.NAME_RESOLUTION_DELAYED;
 import static io.grpc.internal.GrpcUtil.IMPLEMENTATION_VERSION;
 import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.BAGGAGE_KEY;
-import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.DELAY_REASON_KEY;
-import static io.grpc.opentelemetry.internal.OpenTelemetryConstants.DELAY_TYPE_KEY;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
@@ -44,6 +42,7 @@ import io.grpc.internal.GrpcUtil;
 import io.grpc.opentelemetry.internal.OpenTelemetryConstants;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.baggage.Baggage;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
@@ -62,11 +61,6 @@ import javax.annotation.Nullable;
  */
 final class OpenTelemetryTracingModule {
   private static final Logger logger = Logger.getLogger(OpenTelemetryTracingModule.class.getName());
-
-  /** Name of the child span that bounds a single delay, as defined by gRFC A121. */
-  private static final String DELAY_SPAN_NAME = "Delay";
-  /** Name of the event that carries each value of {@code grpc.delay_reason}, per gRFC A121. */
-  private static final String DELAY_TRIGGERED_EVENT_NAME = "Delay triggered";
 
   @VisibleForTesting
   final io.grpc.Context.Key<Span> otelSpan = io.grpc.Context.key("opentelemetry-span-key");
@@ -151,11 +145,8 @@ final class OpenTelemetryTracingModule {
     volatile int callEnded;
     private final Span clientSpan;
     private final String fullMethodName;
-
-    /** The delay span in progress, or {@code null} if no delay is open. */
     @GuardedBy("this")
     @Nullable private Span activeCallDelaySpan;
-    /** The type {@link #activeCallDelaySpan} was started with. */
     @GuardedBy("this")
     @Nullable private String activeCallDelayType;
 
@@ -206,8 +197,6 @@ final class OpenTelemetryTracingModule {
         }
         callEnded = 1;
       }
-      // The channel ends any open delay before the call ends, but the call can also be cancelled
-      // by the application while a delay is open, so terminate the span rather than leak it.
       synchronized (this) {
         endActiveDelaySpan();
       }
@@ -215,46 +204,46 @@ final class OpenTelemetryTracingModule {
     }
 
     @Override
-    public synchronized void recordDelayStart(String delayType, String delayReason) {
-      checkNotNull(delayType, "delayType");
-      checkNotNull(delayReason, "delayReason");
+    public void recordDelayStart(String delayType, String delayReason) {
       if (isCallEnded()) {
         return;
       }
-      if (activeCallDelaySpan != null && delayType.equals(activeCallDelayType)) {
-        recordDelayReasonChanged(delayType, delayReason);
-        return;
+      synchronized (this) {
+        if (isCallEnded()) {
+          return;
+        }
+        if (activeCallDelaySpan != null && delayType.equals(activeCallDelayType)) {
+          addDelayEvent(activeCallDelaySpan, delayReason);
+          return;
+        }
+        endActiveDelaySpan();
+        activeCallDelayType = delayType;
+        activeCallDelaySpan = otelTracer.spanBuilder("Delay")
+            .setParent(Context.current().with(clientSpan))
+            .setAttribute("grpc.delay_type", delayType)
+            .startSpan();
+        addDelayEvent(activeCallDelaySpan, delayReason);
       }
-      // Close any previous delay segment before starting a new one, so the two do not overlap.
-      endActiveDelaySpan();
-      activeCallDelayType = delayType;
-      activeCallDelaySpan = otelTracer.spanBuilder(DELAY_SPAN_NAME)
-          .setParent(Context.current().with(clientSpan))
-          .setAttribute(DELAY_TYPE_KEY, delayType)
-          .startSpan();
-      activeCallDelaySpan.addEvent(
-          DELAY_TRIGGERED_EVENT_NAME, Attributes.of(DELAY_REASON_KEY, delayReason));
     }
 
     @Override
-    public synchronized void recordDelayReasonChanged(String delayType, String delayReason) {
-      checkNotNull(delayType, "delayType");
-      checkNotNull(delayReason, "delayReason");
-      if (isCallEnded() || activeCallDelaySpan == null) {
+    public void recordDelayReasonChanged(String delayType, String delayReason) {
+      if (isCallEnded()) {
         return;
       }
-      // A121 records only the reason on the event; the type is an attribute of the span itself.
-      activeCallDelaySpan.addEvent(
-          DELAY_TRIGGERED_EVENT_NAME, Attributes.of(DELAY_REASON_KEY, delayReason));
+      synchronized (this) {
+        if (isCallEnded() || activeCallDelaySpan == null) {
+          return;
+        }
+        addDelayEvent(activeCallDelaySpan, delayReason);
+      }
     }
 
     @Override
     public synchronized void recordDelayEnd(String delayType) {
-      checkNotNull(delayType, "delayType");
       endActiveDelaySpan();
     }
 
-    /** Ends the open delay span, if any. */
     @GuardedBy("this")
     private void endActiveDelaySpan() {
       if (activeCallDelaySpan != null) {
@@ -270,10 +259,8 @@ final class OpenTelemetryTracingModule {
     private final Span parentSpan;
     volatile int seqNo;
     boolean isPendingStream;
-    /** The delay span in progress, or {@code null} if no delay is open. */
     @GuardedBy("this")
     @Nullable private Span activeDelaySpan;
-    /** The type {@link #activeDelaySpan} was started with. */
     @GuardedBy("this")
     @Nullable private String activeDelayType;
     @GuardedBy("this")
@@ -303,46 +290,36 @@ final class OpenTelemetryTracingModule {
 
     @Override
     public synchronized void recordDelayStart(String delayType, String delayReason) {
-      checkNotNull(delayType, "delayType");
-      checkNotNull(delayReason, "delayReason");
       if (streamClosed) {
         return;
       }
       if (activeDelaySpan != null && delayType.equals(activeDelayType)) {
-        // Do not recreate the span if the delay type is unchanged (e.g. priority failover).
-        recordDelayReasonChanged(delayType, delayReason);
+        // Do not recreate the span if the delay type is unchanged (e.g., priority failover).
+        addDelayEvent(activeDelaySpan, delayReason);
         return;
       }
-      // Close any previous delay segment before starting a new one, so the two do not overlap.
       endActiveDelaySpan();
       activeDelayType = delayType;
-      activeDelaySpan = otelTracer.spanBuilder(DELAY_SPAN_NAME)
+      activeDelaySpan = otelTracer.spanBuilder("Delay")
           .setParent(Context.current().with(span))
-          .setAttribute(DELAY_TYPE_KEY, delayType)
+          .setAttribute("grpc.delay_type", delayType)
           .startSpan();
-      activeDelaySpan.addEvent(
-          DELAY_TRIGGERED_EVENT_NAME, Attributes.of(DELAY_REASON_KEY, delayReason));
+      addDelayEvent(activeDelaySpan, delayReason);
     }
 
     @Override
     public synchronized void recordDelayReasonChanged(String delayType, String delayReason) {
-      checkNotNull(delayType, "delayType");
-      checkNotNull(delayReason, "delayReason");
       if (streamClosed || activeDelaySpan == null) {
         return;
       }
-      // A121 records only the reason on the event; the type is an attribute of the span itself.
-      activeDelaySpan.addEvent(
-          DELAY_TRIGGERED_EVENT_NAME, Attributes.of(DELAY_REASON_KEY, delayReason));
+      addDelayEvent(activeDelaySpan, delayReason);
     }
 
     @Override
     public synchronized void recordDelayEnd(String delayType) {
-      checkNotNull(delayType, "delayType");
       endActiveDelaySpan();
     }
 
-    /** Ends the active child span upon pick completion, stream creation or stream closure. */
     @GuardedBy("this")
     private void endActiveDelaySpan() {
       if (activeDelaySpan != null) {
@@ -605,6 +582,12 @@ final class OpenTelemetryTracingModule {
   // Receiving:
   // |-- Event 'Inbound message received', attributes('sequence-numer' = 0,
   //                                                  'message-size' = 7854) ----|
+  private static void addDelayEvent(Span delaySpan, String delayReason) {
+    delaySpan.addEvent(
+        "Delay triggered",
+        Attributes.of(AttributeKey.stringKey("grpc.delay_reason"), delayReason));
+  }
+
   private void recordOutboundMessageSentEvent(Span span,
       int seqNo, long optionalWireSize, long optionalUncompressedSize) {
     AttributesBuilder attributesBuilder = Attributes.builder();

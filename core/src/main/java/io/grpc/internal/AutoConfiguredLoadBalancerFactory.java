@@ -97,13 +97,8 @@ public final class AutoConfiguredLoadBalancerFactory extends LoadBalancerProvide
 
       if (delegateProvider == null
           || !policySelection.provider.getPolicyName().equals(delegateProvider.getPolicyName())) {
-        // The outgoing policy is torn down here and the incoming one has not produced a picker
-        // yet, so any RPC is queued until it does. We choose to annotate the gap instead of
-        // leaving the channel to report its generic "waiting for picker".
         helper.updateBalancingState(
-            ConnectivityState.CONNECTING,
-            new FixedResultPicker(PickResult.withNoResult(
-                "connecting", "waiting for the load balancing policy to be applied")));
+            ConnectivityState.CONNECTING, new FixedResultPicker(PickResult.withNoResult()));
         delegate.shutdown();
         delegateProvider = policySelection.provider;
         LoadBalancer old = delegate;

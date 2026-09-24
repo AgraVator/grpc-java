@@ -22,7 +22,6 @@ import static io.grpc.ConnectivityState.IDLE;
 import static io.grpc.ConnectivityState.READY;
 import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
 
-import com.google.common.base.MoreObjects;
 import io.grpc.ConnectivityState;
 import io.grpc.InternalLogId;
 import io.grpc.LoadBalancer;
@@ -205,9 +204,6 @@ final class PriorityLoadBalancer extends LoadBalancer {
 
   private void updateOverallState(
       @Nullable String priority, ConnectivityState state, SubchannelPicker picker) {
-    if (priority != null && (state == CONNECTING || state == IDLE)) {
-      picker = new PriorityPicker(picker, priorityNames.indexOf(priority), priority);
-    }
     if (!Objects.equals(priority, currentPriority) || !state.equals(currentConnectivityState)
         || !picker.equals(currentPicker)) {
       currentPriority = priority;
@@ -335,7 +331,12 @@ final class PriorityLoadBalancer extends LoadBalancer {
         }
         ConnectivityState oldState = connectivityState;
         connectivityState = newState;
-        picker = newPicker;
+        int priorityIndex = priorityNames.indexOf(priority);
+        if (priorityIndex >= 0 && (newState == CONNECTING || newState == IDLE)) {
+          picker = new PriorityPicker(newPicker, String.valueOf(priorityIndex));
+        } else {
+          picker = newPicker;
+        }
 
         if (deletionTimer != null && deletionTimer.isPending()) {
           return;
@@ -371,52 +372,26 @@ final class PriorityLoadBalancer extends LoadBalancer {
     }
   }
 
-  /**
-   * Prepends this policy's numeric priority to the delay type reported by the child policy, per
-   * <a href="https://github.com/grpc/proposal/blob/master/A121-rpc-delay-observability.md">gRFC
-   * A121</a>. E.g. a child reporting {@code "connecting"} at priority 0 becomes
-   * {@code "0:connecting"}, and nested priority policies stack their prefixes, e.g.
-   * {@code "0:1:connecting"}.
-   *
-   * <p>Only the numeric priority is used in the delay type, because the delay type is used as a
-   * metric label and must stay low-cardinality. The priority name, which embeds the xDS cluster
-   * name, is only reported in the (high-cardinality, tracing-only) delay reason.
-   */
   private static final class PriorityPicker extends SubchannelPicker {
     private final SubchannelPicker delegate;
-    private final int priorityIndex;
-    private final String priorityName;
+    private final String priority;
 
-    PriorityPicker(SubchannelPicker delegate, int priorityIndex, String priorityName) {
+    PriorityPicker(SubchannelPicker delegate, String priority) {
       this.delegate = checkNotNull(delegate, "delegate");
-      this.priorityIndex = priorityIndex;
-      this.priorityName = checkNotNull(priorityName, "priorityName");
+      this.priority = checkNotNull(priority, "priority");
     }
 
     @Override
     public PickResult pickSubchannel(PickSubchannelArgs args) {
       PickResult childResult = delegate.pickSubchannel(args);
       if (!childResult.hasResult() && childResult.getDelayType() != null) {
-        String childType = childResult.getDelayType();
         String childReason = childResult.getDelayReason();
-        String composedType = priorityIndex + ":" + childType;
-        String reason = "waiting on priority " + priorityIndex + " (child '" + priorityName
-            + "'): " + (childReason != null ? childReason : childType);
+        String composedType = priority + ":" + childResult.getDelayType();
+        String reason = "waiting on priority group " + priority + " ("
+            + (childReason != null ? childReason : "connecting") + ")";
         return PickResult.withNoResult(composedType, reason);
       }
       return childResult;
-    }
-
-    @Nullable
-    private static PickResult fixedPickResult(SubchannelPicker picker) {
-      SubchannelPicker cur = picker;
-      while (cur instanceof PriorityPicker) {
-        cur = ((PriorityPicker) cur).delegate;
-      }
-      if (cur instanceof FixedResultPicker) {
-        return picker.pickSubchannel(null);
-      }
-      return null;
     }
 
     @Override
@@ -428,38 +403,12 @@ final class PriorityLoadBalancer extends LoadBalancer {
         return false;
       }
       PriorityPicker that = (PriorityPicker) o;
-      if (priorityIndex != that.priorityIndex
-          || !priorityName.equals(that.priorityName)
-          || !delegate.equals(that.delegate)) {
-        return false;
-      }
-      PickResult thisFixed = fixedPickResult(this);
-      PickResult thatFixed = fixedPickResult(that);
-      if (thisFixed != null && thatFixed != null) {
-        return Objects.equals(thisFixed.getDelayType(), thatFixed.getDelayType())
-            && Objects.equals(thisFixed.getDelayReason(), thatFixed.getDelayReason());
-      }
-      return true;
+      return delegate.equals(that.delegate) && priority.equals(that.priority);
     }
 
     @Override
     public int hashCode() {
-      PickResult fixed = fixedPickResult(this);
-      return Objects.hash(
-          delegate,
-          priorityIndex,
-          priorityName,
-          fixed != null ? fixed.getDelayType() : null,
-          fixed != null ? fixed.getDelayReason() : null);
-    }
-
-    @Override
-    public String toString() {
-      return MoreObjects.toStringHelper(this)
-          .add("delegate", delegate)
-          .add("priorityIndex", priorityIndex)
-          .add("priorityName", priorityName)
-          .toString();
+      return Objects.hash(delegate, priority);
     }
   }
 }

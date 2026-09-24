@@ -742,8 +742,8 @@ public abstract class LoadBalancer {
      * @since 1.85.0
      */
     public static PickResult withNoResult(String delayType, String delayReason) {
-      checkNotNull(delayType, "delayType");
-      checkNotNull(delayReason, "delayReason");
+      Preconditions.checkNotNull(delayType, "delayType");
+      Preconditions.checkNotNull(delayReason, "delayReason");
       return new PickResult(null, null, Status.OK, false, null, delayType, delayReason);
     }
 
@@ -829,8 +829,6 @@ public abstract class LoadBalancer {
           .add("status", status)
           .add("drop", drop)
           .add("authority-override", authorityOverride)
-          .add("delayType", delayType)
-          .add("delayReason", delayReason)
           .toString();
     }
 
@@ -842,10 +840,6 @@ public abstract class LoadBalancer {
     /**
      * Returns true if the {@link Subchannel}, {@link Status}, and
      * {@link ClientStreamTracer.Factory} all match.
-     *
-     * <p>The delay type and delay reason are deliberately excluded: they are diagnostic
-     * telemetry rather than part of the pick decision, and the channel re-reads them from each
-     * {@code PickResult} instead of comparing results.
      */
     @Override
     public boolean equals(Object other) {

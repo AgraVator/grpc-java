@@ -76,7 +76,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
    *     Never {@code null}.
    * @param delayReason high-cardinality diagnostic string describing granular runtime conditions.
    *     Never {@code null}.
-   * @since 1.84.0
+   * @since 1.85.0
    */
   public void recordDelayStart(String delayType, String delayReason) {
   }
@@ -95,7 +95,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
    * @param delayType canonical low-cardinality label of the ongoing delay. Never {@code null}.
    * @param delayReason updated high-cardinality diagnostic string describing the new conditions.
    *     Never {@code null}.
-   * @since 1.84.0
+   * @since 1.85.0
    */
   public void recordDelayReasonChanged(String delayType, String delayReason) {
   }
@@ -111,7 +111,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
    * promptly, must not block, and must not re-enter gRPC.
    *
    * @param delayType canonical low-cardinality label of the delay being ended. Never {@code null}.
-   * @since 1.84.0
+   * @since 1.85.0
    */
   public void recordDelayEnd(String delayType) {
   }
@@ -193,7 +193,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * <p>For the full contract and threading semantics, see
      * {@link ClientStreamTracer#recordDelayStart(String, String)}.
      *
-     * @since 1.84.0
+     * @since 1.85.0
      */
     public void recordDelayStart(String delayType, String delayReason) {
     }
@@ -205,7 +205,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * <p>For the full contract and threading semantics, see
      * {@link ClientStreamTracer#recordDelayReasonChanged(String, String)}.
      *
-     * @since 1.84.0
+     * @since 1.85.0
      */
     public void recordDelayReasonChanged(String delayType, String delayReason) {
     }
@@ -217,7 +217,7 @@ public abstract class ClientStreamTracer extends StreamTracer {
      * <p>For the full contract and threading semantics, see
      * {@link ClientStreamTracer#recordDelayEnd(String)}.
      *
-     * @since 1.84.0
+     * @since 1.85.0
      */
     public void recordDelayEnd(String delayType) {
     }

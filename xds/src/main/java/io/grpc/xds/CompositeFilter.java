@@ -20,6 +20,7 @@ import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -43,6 +44,7 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
+import io.grpc.StatusOr;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.internal.matcher.MatchContext;
 import io.grpc.xds.internal.matcher.MatchResult;
@@ -54,7 +56,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -373,7 +377,7 @@ final class CompositeFilter implements Filter {
         }
         return new FilterDelegate(delegates, samplePercent);
       } catch (InvalidProtocolBufferException e) {
-        throw new RuntimeException(e);
+        throw new IllegalArgumentException("Could not parse ExecuteFilterAction", e);
       }
     }
   }
@@ -552,7 +556,12 @@ final class CompositeFilter implements Filter {
     }
 
     final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> resolvedDelegates =
-        resolveAll(effective, delegate -> resolveClientDelegate(delegate, scheduler));
+        buildResolvedDelegates(
+            effective,
+            Filter.Provider::isClientFilter,
+            "client",
+            (filter, childCfg) ->
+                filter.buildClientInterceptor(childCfg, /* overrideConfig= */ null, scheduler));
 
     return new ClientInterceptor() {
       @Override
@@ -575,61 +584,28 @@ final class CompositeFilter implements Filter {
     }
 
     final Map<TypedExtensionConfig, ResolvedDelegate<ServerInterceptor>> resolvedDelegates =
-        resolveAll(effective, this::resolveServerDelegate);
+        buildResolvedDelegates(
+            effective,
+            Filter.Provider::isServerFilter,
+            "server",
+            (filter, childCfg) ->
+                filter.buildServerInterceptor(childCfg, /* overrideConfig= */ null));
 
     return new ServerInterceptor() {
       @Override
       public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
           ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-
-        // ":method" is the HTTP method, which is always POST for gRPC. The gRPC full method name
-        // is carried by ":path" alone.
-        MatchContext context = MatchContext.newBuilder()
-            .setMetadata(headers)
-            .setMethod("POST")
-            .setPath("/" + call.getMethodDescriptor().getFullMethodName())
-            .setHost(call.getAuthority())
-            .build();
-
-        MatchResult matchResult;
-        try {
-          matchResult = effective.matcher.match(context);
-        } catch (RuntimeException e) {
-          call.close(Status.UNAVAILABLE.withDescription(
-              "composite filter matcher evaluation failed").withCause(e), new Metadata());
+        StatusOr<List<ServerInterceptor>> selected = selectInterceptors(
+            effective.matcher,
+            resolvedDelegates,
+            headers,
+            call.getMethodDescriptor().getFullMethodName(),
+            call.getAuthority());
+        if (!selected.hasValue()) {
+          call.close(selected.getStatus(), new Metadata());
           return new ServerCall.Listener<ReqT>() {};
         }
-        if (matchResult == null || !matchResult.matched) {
-          logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
-              call.getMethodDescriptor().getFullMethodName());
-          call.close(
-              Status.UNAVAILABLE.withDescription("no match found in composite filter"),
-              new Metadata());
-          return new ServerCall.Listener<ReqT>() {};
-        }
-
-        // Only matcher evaluation and sampling happen per RPC. The nested filters and their
-        // interceptors were already built once above, at configuration time.
-        List<ServerInterceptor> interceptors = new ArrayList<>();
-        for (ResolvedDelegate<ServerInterceptor> resolved
-            : resolveDelegates(matchResult, resolvedDelegates)) {
-          if (!resolved.delegate.shouldExecute()) {
-            logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
-                call.getMethodDescriptor().getFullMethodName());
-            continue;
-          }
-          if (resolved.error != null) {
-            call.close(resolved.error, new Metadata());
-            return new ServerCall.Listener<ReqT>() {};
-          }
-          interceptors.addAll(resolved.interceptors);
-        }
-
-        if (logger.isLoggable(Level.FINE)) {
-          logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
-              new Object[] {interceptors.size(),
-                  call.getMethodDescriptor().getFullMethodName()});
-        }
+        List<ServerInterceptor> interceptors = selected.getValue();
         ServerCallHandler<ReqT, RespT> wrapped = next;
         for (int i = interceptors.size() - 1; i >= 0; i--) {
           wrapped = InternalServerInterceptors.interceptCallHandlerCreate(
@@ -644,45 +620,41 @@ final class CompositeFilter implements Filter {
    * Builds the nested filters' interceptors for every action in the matcher tree. This runs once
    * per configuration update, not per RPC, so that the state a nested filter keeps across RPCs,
    * such as a cache or a shared connection, is kept as the filter's contract promises.
+   *
+   * <p>Side support is checked across the entire chain before building any child interceptor, so
+   * a chain containing an unsupported filter never mutates shared filter state or allocates side
+   * channels for earlier filters in that chain.
    */
-  private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> resolveAll(
-      CompositeFilterConfig effective, Function<FilterDelegate, ResolvedDelegate<I>> resolver) {
+  private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> buildResolvedDelegates(
+      CompositeFilterConfig effective,
+      Predicate<Filter.Provider> isSupportedOnSide,
+      String sideName,
+      BiFunction<Filter, FilterConfig, I> buildInterceptor) {
     Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new LinkedHashMap<>();
     for (Map.Entry<TypedExtensionConfig, FilterDelegate> entry : effective.delegates.entrySet()) {
-      resolved.put(entry.getKey(), resolver.apply(entry.getValue()));
+      resolved.put(
+          entry.getKey(),
+          resolveDelegate(entry.getValue(), isSupportedOnSide, sideName, buildInterceptor));
     }
     return Collections.unmodifiableMap(resolved);
   }
 
-  private ResolvedDelegate<ServerInterceptor> resolveServerDelegate(FilterDelegate delegate) {
-    List<ServerInterceptor> interceptors = new ArrayList<>();
+  private <I> ResolvedDelegate<I> resolveDelegate(
+      FilterDelegate delegate,
+      Predicate<Filter.Provider> isSupportedOnSide,
+      String sideName,
+      BiFunction<Filter, FilterConfig, I> buildInterceptor) {
     for (NestedFilter nested : delegate.delegates) {
-      if (!nested.provider.isServerFilter()) {
+      if (!isSupportedOnSide.test(nested.provider)) {
         return new ResolvedDelegate<>(delegate, Collections.emptyList(),
             Status.UNAVAILABLE.withDescription(
-                "Filter " + nested.config.name + " is not supported on server side"));
-      }
-      ServerInterceptor interceptor = nestedFilter(nested.config)
-          .buildServerInterceptor(nested.config.filterConfig, /* overrideConfig= */ null);
-      if (interceptor != null) {
-        interceptors.add(interceptor);
+                "Filter " + nested.config.name + " is not supported on " + sideName + " side"));
       }
     }
-    return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
-  }
-
-  private ResolvedDelegate<ClientInterceptor> resolveClientDelegate(
-      FilterDelegate delegate, ScheduledExecutorService scheduler) {
-    List<ClientInterceptor> interceptors = new ArrayList<>();
+    List<I> interceptors = new ArrayList<>(delegate.delegates.size());
     for (NestedFilter nested : delegate.delegates) {
-      if (!nested.provider.isClientFilter()) {
-        return new ResolvedDelegate<>(delegate, Collections.emptyList(),
-            Status.UNAVAILABLE.withDescription(
-                "Filter " + nested.config.name + " is not supported on client side"));
-      }
-      ClientInterceptor interceptor = nestedFilter(nested.config)
-          .buildClientInterceptor(nested.config.filterConfig, /* overrideConfig= */ null,
-              scheduler);
+      I interceptor =
+          buildInterceptor.apply(nestedFilter(nested.config), nested.config.filterConfig);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
@@ -715,19 +687,63 @@ final class CompositeFilter implements Filter {
     return (CompositeFilterConfig) config;
   }
 
-  static <I> List<ResolvedDelegate<I>> resolveDelegates(@Nullable MatchResult matchResult,
-      Map<TypedExtensionConfig, ResolvedDelegate<I>> delegatesMap) {
-    if (matchResult == null || !matchResult.matched || matchResult.actions.isEmpty()) {
-      return Collections.emptyList();
+  /**
+   * Evaluates {@code matcher} and {@link FilterDelegate#shouldExecute} for one RPC, returning the
+   * pre-built nested interceptors to run (empty when skipped or not sampled) or the {@link Status}
+   * to fail the RPC with. The nested filters and their interceptors were already built once at
+   * configuration time.
+   */
+  private static <I> StatusOr<List<I>> selectInterceptors(
+      UnifiedMatcher matcher,
+      Map<TypedExtensionConfig, ResolvedDelegate<I>> delegatesMap,
+      Metadata headers,
+      String fullMethodName,
+      @Nullable String host) {
+    // ":method" is the HTTP method, which is always POST for gRPC. The gRPC full method name is
+    // carried by ":path" alone.
+    MatchContext context = MatchContext.newBuilder()
+        .setMetadata(headers)
+        .setMethod("POST")
+        .setPath("/" + fullMethodName)
+        .setHost(host)
+        .build();
+
+    MatchResult matchResult;
+    try {
+      matchResult = matcher.match(context);
+    } catch (RuntimeException e) {
+      return StatusOr.fromStatus(Status.UNAVAILABLE
+          .withDescription("composite filter matcher evaluation failed")
+          .withCause(e));
     }
-    List<ResolvedDelegate<I>> list = new ArrayList<>();
-    for (TypedExtensionConfig action : matchResult.actions) {
-      ResolvedDelegate<I> d = delegatesMap.get(action);
-      if (d != null) {
-        list.add(d);
-      }
+    if (matchResult == null || !matchResult.matched) {
+      logger.log(Level.FINE, "No match in composite filter matcher tree for {0}", fullMethodName);
+      return StatusOr.fromStatus(
+          Status.UNAVAILABLE.withDescription("no match found in composite filter"));
     }
-    return Collections.unmodifiableList(list);
+    if (matchResult.actions.size() != 1) {
+      return StatusOr.fromStatus(Status.INTERNAL.withDescription(
+          "composite filter matcher returned unexpected action count: "
+              + matchResult.actions.size()));
+    }
+    ResolvedDelegate<I> resolved = delegatesMap.get(matchResult.actions.get(0));
+    if (resolved == null) {
+      return StatusOr.fromStatus(Status.INTERNAL.withDescription(
+          "no filter chain found for matched composite filter action"));
+    }
+    if (!resolved.delegate.shouldExecute()) {
+      logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
+          fullMethodName);
+      return StatusOr.fromValue(Collections.emptyList());
+    }
+    if (resolved.error != null) {
+      return StatusOr.fromStatus(resolved.error);
+    }
+    if (logger.isLoggable(Level.FINE)) {
+      logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
+          new Object[] {resolved.interceptors.size(), fullMethodName});
+    }
+    return StatusOr.fromValue(resolved.interceptors);
   }
 
   /**
@@ -810,51 +826,13 @@ final class CompositeFilter implements Filter {
 
       String host = callOptions.getAuthority() != null
           ? callOptions.getAuthority() : next.authority();
-      MatchContext context = MatchContext.newBuilder()
-          .setMetadata(headers)
-          .setMethod("POST")
-          .setPath("/" + method.getFullMethodName())
-          .setHost(host)
-          .build();
-
-      MatchResult matchResult;
-      try {
-        matchResult = matcher.match(context);
-      } catch (RuntimeException e) {
-        failCall(responseListener, Status.UNAVAILABLE.withDescription(
-            "composite filter matcher evaluation failed").withCause(e));
+      StatusOr<List<ClientInterceptor>> selected =
+          selectInterceptors(matcher, delegatesMap, headers, method.getFullMethodName(), host);
+      if (!selected.hasValue()) {
+        failCall(responseListener, selected.getStatus());
         return;
       }
-      if (matchResult == null || !matchResult.matched) {
-        logger.log(Level.FINE, "No match in composite filter matcher tree for {0}",
-            method.getFullMethodName());
-        failCall(responseListener,
-            Status.UNAVAILABLE.withDescription("no match found in composite filter"));
-        return;
-      }
-
-      // Only matcher evaluation and sampling happen per RPC. The nested filters and their
-      // interceptors were already built once at configuration time; see
-      // CompositeFilter#buildClientInterceptor.
-      List<ClientInterceptor> interceptors = new ArrayList<>();
-      for (ResolvedDelegate<ClientInterceptor> resolved
-          : resolveDelegates(matchResult, delegatesMap)) {
-        if (!resolved.delegate.shouldExecute()) {
-          logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
-              method.getFullMethodName());
-          continue;
-        }
-        if (resolved.error != null) {
-          failCall(responseListener, resolved.error);
-          return;
-        }
-        interceptors.addAll(resolved.interceptors);
-      }
-
-      if (logger.isLoggable(Level.FINE)) {
-        logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
-            new Object[] {interceptors.size(), method.getFullMethodName()});
-      }
+      List<ClientInterceptor> interceptors = selected.getValue();
       // interceptForward, not intercept: A103 specifies filter_chain as "a chain of filters to
       // call, in order", so the first entry has to run first. ClientInterceptors.intercept makes
       // the *last* interceptor outermost, which would run the chain backwards.
@@ -870,6 +848,11 @@ final class CompositeFilter implements Filter {
     private void failCall(Listener<RespT> responseListener, Status status) {
       delegate = noopCall();
       responseListener.onClose(status, new Metadata());
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this).add("delegate", delegate).toString();
     }
   }
 }

@@ -39,6 +39,7 @@ import com.google.protobuf.ByteString;
 import io.envoyproxy.envoy.config.core.v3.Address;
 import io.envoyproxy.envoy.config.core.v3.AggregatedConfigSource;
 import io.envoyproxy.envoy.config.core.v3.ConfigSource;
+import io.envoyproxy.envoy.config.core.v3.GrpcService;
 import io.envoyproxy.envoy.config.core.v3.RuntimeFractionalPercent;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress;
 import io.envoyproxy.envoy.config.core.v3.TrafficDirection;
@@ -59,6 +60,7 @@ import io.envoyproxy.envoy.extensions.filters.common.matcher.action.v3.SkipFilte
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.FilterChainConfiguration;
+import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor;
 import io.envoyproxy.envoy.extensions.filters.http.fault.v3.FaultAbort;
 import io.envoyproxy.envoy.extensions.filters.http.fault.v3.HTTPFault;
 import io.envoyproxy.envoy.extensions.filters.http.rbac.v3.RBAC;
@@ -98,6 +100,7 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.Filter.NamedFilterConfig;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData;
+import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.matcher.MatchResult;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
 import java.util.Collections;
@@ -105,6 +108,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -536,31 +540,41 @@ public class CompositeFilterTest {
       }
     }
 
+    private static Any buildRealNestedCompositeConfig(int compositeLevels) {
+      Any current = Any.pack(HTTPFault.newBuilder()
+          .setAbort(FaultAbort.newBuilder()
+              .setGrpcStatus(Status.Code.ABORTED.value())
+              .setPercentage(FractionalPercent.newBuilder()
+                  .setNumerator(100)
+                  .setDenominator(FractionalPercent.DenominatorType.HUNDRED)))
+          .build());
+      for (int i = compositeLevels - 1; i >= 0; i--) {
+        Matcher.OnMatch action = Matcher.OnMatch.newBuilder()
+            .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                .setName("level_" + i)
+                .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                    .setTypedConfig(TypedExtensionConfig.newBuilder()
+                        .setName("child_" + i)
+                        .setTypedConfig(current))
+                    .build())))
+            .build();
+        Matcher matcher = Matcher.newBuilder()
+            .setMatcherList(Matcher.MatcherList.newBuilder()
+                .addMatchers(createHeaderFieldMatcher("x-depth", String.valueOf(i), action)))
+            .build();
+        current = Any.pack(createExtensionWithMatcher(matcher));
+      }
+      return current;
+    }
+
     @Test
     public void parseFilterConfig_exceedsRecursionLimit() {
-      Matcher.OnMatch matchAction = createExecuteAction("child", FAKE_TYPE_URL);
-      Matcher matcher = Matcher.newBuilder()
-          .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
-                  .setOnMatch(matchAction)
-                  .build())
-              .build())
-          .build();
-
-      final Any configAny = Any.pack(createExtensionWithMatcher(matcher));
-
-      when(fakeProvider.parseFilterConfig(any(), any()))
-          .thenAnswer(invocation -> {
-            FilterConfigParseContext context = invocation.getArgument(1);
-            int depth = context.recursionDepth();
-            FilterConfigParseContext childContext = context.toBuilder()
-                .recursionDepth(depth + 1)
-                .build();
-            return provider.parseFilterConfig(configAny, childContext);
-          });
+      CompositeFilter.Provider realProvider = new CompositeFilter.Provider();
+      // 9 nested CompositeFilter levels occupy recursionDepth 0..8; level 8 hits the limit.
+      Any nineLevels = buildRealNestedCompositeConfig(9);
 
       ConfigOrError<? extends FilterConfig> result =
-          provider.parseFilterConfig(configAny, getFilterContext());
+          realProvider.parseFilterConfig(nineLevels, getFilterContext());
 
       assertThat(result.errorDetail).contains("Maximum recursion depth of 8 exceeded");
     }
@@ -782,12 +796,6 @@ public class CompositeFilterTest {
       assertThat(filter.buildClientInterceptor(
           result.config, null, mock(ScheduledExecutorService.class))).isNull();
       assertThat(filter.buildServerInterceptor(result.config, null)).isNull();
-    }
-
-    @Test
-    public void whenEnabled_reportedAsSupportedOnBothSides() {
-      assertThat(provider.isClientFilter()).isTrue();
-      assertThat(provider.isServerFilter()).isTrue();
     }
 
     @Test
@@ -1826,33 +1834,6 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void clientInterceptor_unaryCall_methodsSafeAfterCancelledBeforeStart() {
-      CompositeFilter filter = newFilter("composite");
-      UnifiedMatcher mockMatcher = mock(UnifiedMatcher.class);
-      ClientInterceptor interceptor = filter.buildClientInterceptor(
-          new CompositeFilter.CompositeFilterConfig(mockMatcher, Collections.emptyMap()), null,
-          mock(ScheduledExecutorService.class));
-
-      Channel next = mock(Channel.class);
-      MethodDescriptor<Void, Void> method = createMockMethod();
-      ClientCall<Void, Void> call = interceptor.interceptCall(method, CallOptions.DEFAULT, next);
-
-      call.cancel("cancelled before start", null);
-
-      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
-      call.start(listener, new Metadata());
-
-      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
-      verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
-      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.CANCELLED);
-
-      // Subsequent calls from stubs must be safe no-ops
-      call.request(1);
-      call.sendMessage(null);
-      call.halfClose();
-    }
-
-    @Test
     public void filterContext_passesFilterNameAndMetricsRecorderToChild() {
       Matcher.OnMatch matchAction = createExecuteAction("my_child_filter", FAKE_TYPE_URL);
       Matcher matcher = Matcher.newBuilder()
@@ -2135,25 +2116,12 @@ public class CompositeFilterTest {
 
     @Test
     public void recursionDepth_nestedCompositeFilters_depth7Allowed() {
-      final Any leafConfig = Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
-          .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "v", createExecuteAction("leaf", FAKE_TYPE_URL)))
-              .build())
-          .build()));
+      CompositeFilter.Provider realProvider = new CompositeFilter.Provider();
+      // 8 nested CompositeFilter levels occupy recursionDepth 0..7, with a real FaultFilter leaf.
+      Any eightLevels = buildRealNestedCompositeConfig(8);
 
-      when(fakeProvider.parseFilterConfig(any(), any()))
-          .thenAnswer(invocation -> {
-            FilterConfigParseContext context = invocation.getArgument(1);
-            int depth = context.recursionDepth();
-            if (depth < 7) {
-              return provider.parseFilterConfig(leafConfig, context);
-            }
-            return ConfigOrError.fromConfig(fakeConfig);
-          });
-
-      ConfigOrError<? extends FilterConfig> result =
-          provider.parseFilterConfig(leafConfig, getFilterContext());
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          realProvider.parseFilterConfig(eightLevels, getFilterContext());
 
       assertThat(result.errorDetail).isNull();
       assertThat(result.config).isNotNull();
@@ -2161,25 +2129,12 @@ public class CompositeFilterTest {
 
     @Test
     public void recursionDepth_nestedCompositeFilters_depth8Rejected() {
-      final Any leafConfig = Any.pack(createExtensionWithMatcher(Matcher.newBuilder()
-          .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(createHeaderFieldMatcher(
-                  "h", "v", createExecuteAction("child", FAKE_TYPE_URL)))
-              .build())
-          .build()));
+      CompositeFilter.Provider realProvider = new CompositeFilter.Provider();
+      // Adding a 9th CompositeFilter level reaches recursionDepth 8 and must be rejected.
+      Any nineLevels = buildRealNestedCompositeConfig(9);
 
-      when(fakeProvider.parseFilterConfig(any(), any()))
-          .thenAnswer(invocation -> {
-            FilterConfigParseContext context = invocation.getArgument(1);
-            int depth = context.recursionDepth();
-            if (depth <= 8) {
-              return provider.parseFilterConfig(leafConfig, context);
-            }
-            return ConfigOrError.fromConfig(fakeConfig);
-          });
-
-      ConfigOrError<? extends FilterConfig> result =
-          provider.parseFilterConfig(leafConfig, getFilterContext());
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          realProvider.parseFilterConfig(nineLevels, getFilterContext());
 
       assertThat(result.errorDetail).contains("Maximum recursion depth of 8 exceeded");
     }
@@ -2519,7 +2474,7 @@ public class CompositeFilterTest {
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
 
-      assertThat(result.errorDetail).isNotNull();
+      assertThat(result.errorDetail).contains("Could not parse ExecuteFilterAction");
     }
 
     @Test
@@ -2997,16 +2952,6 @@ public class CompositeFilterTest {
     }
 
     @Test
-    public void resolveDelegates_nullOrUnmatchedOrEmptyActions_returnsEmptyList() {
-      assertThat(CompositeFilter.resolveDelegates(null, Collections.emptyMap())).isEmpty();
-      assertThat(CompositeFilter.resolveDelegates(
-          io.grpc.xds.internal.matcher.MatchResult.noMatch(), Collections.emptyMap())).isEmpty();
-      assertThat(CompositeFilter.resolveDelegates(
-          io.grpc.xds.internal.matcher.MatchResult.create(Collections.emptyList()),
-          Collections.emptyMap())).isEmpty();
-    }
-
-    @Test
     public void cancelBeforeStart_realCallNeverCreatedAndCallIsNoop() {
       ClientInterceptor clientInterceptor = newFilter("composite").buildClientInterceptor(
           passthroughCompositeConfig(), null, mock(ScheduledExecutorService.class));
@@ -3259,6 +3204,242 @@ public class CompositeFilterTest {
       // Only one underlying Filter instance should be created for the shared name.
       verify(fakeProvider, times(1)).newInstance(any(FilterContext.class));
     }
+
+    @Test
+    public void clientDelegate_unsupportedSecondFilter_doesNotBuildOrLeakFirstFilterChannel() {
+      System.setProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", "true");
+      try {
+        AtomicInteger createdChannels = new AtomicInteger();
+        CachedChannelManager channelManager = new CachedChannelManager(cfg -> {
+          createdChannels.incrementAndGet();
+          ManagedChannel ch =
+              InProcessChannelBuilder.forName("leaked-ext-proc").directExecutor().build();
+          ch.shutdownNow();
+          return ch;
+        });
+
+        ExternalProcessor extProcProto = ExternalProcessor.newBuilder()
+            .setGrpcService(GrpcService.newBuilder()
+                .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                    .setTargetUri("dns:///localhost:12345")
+                    .addChannelCredentialsPlugin(Any.newBuilder()
+                        .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service."
+                            + "channel_credentials.insecure.v3.InsecureCredentials")
+                        .build())))
+            .build();
+        Matcher.OnMatch chainWithRbac = Matcher.OnMatch.newBuilder()
+            .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                .setName("ext_proc_then_rbac")
+                .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                    .setFilterChain(FilterChainConfiguration.newBuilder()
+                        .addTypedConfig(TypedExtensionConfig.newBuilder()
+                            .setName("ext_proc")
+                            .setTypedConfig(Any.pack(extProcProto)))
+                        .addTypedConfig(TypedExtensionConfig.newBuilder()
+                            .setName("rbac")
+                            .setTypedConfig(Any.pack(RBAC.getDefaultInstance()))))
+                    .build())))
+            .build();
+        Matcher matcher = matcherFallingThroughTo(chainWithRbac).build();
+
+        CompositeFilter.Provider realProvider = new CompositeFilter.Provider();
+        ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+            realProvider.parseFilterConfig(
+                Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+        assertThat(parsed.errorDetail).isNull();
+
+        Map<String, Filter> instances = new HashMap<>();
+        Function<NamedFilterConfig, Filter> lookup = new Function<NamedFilterConfig, Filter>() {
+          @Override
+          public Filter apply(NamedFilterConfig cfg) {
+            return instances.computeIfAbsent(cfg.filterStateKey(), key -> {
+              FilterContext ctx = FilterContext.create(cfg.name, metricRecorder, this);
+              if (ExternalProcessorFilter.TYPE_URL.equals(cfg.filterConfig.typeUrl())) {
+                return new ExternalProcessorFilter(ctx, channelManager);
+              }
+              return FilterRegistry.getDefaultRegistry()
+                  .get(cfg.filterConfig.typeUrl())
+                  .newInstance(ctx);
+            });
+          }
+        };
+        // Pre-populate instances just like XdsNameResolver's activeFilters registry does.
+        for (NamedFilterConfig nestedCfg : parsed.config.nestedFilterConfigs()) {
+          Filter unused = lookup.apply(nestedCfg);
+        }
+
+        CompositeFilter composite = (CompositeFilter) realProvider.newInstance(
+            FilterContext.create("composite", metricRecorder, lookup));
+        ClientInterceptor interceptor = composite.buildClientInterceptor(
+            parsed.config, null, mock(ScheduledExecutorService.class));
+
+        // RBAC is unsupported on the client side, so ExternalProcessorFilter.buildClientInterceptor
+        // must never be called for this chain and must not allocate a side-channel.
+        assertThat(createdChannels.get()).isEqualTo(0);
+
+        ClientCall<Void, Void> call = interceptor.interceptCall(
+            createMockMethod(), CallOptions.DEFAULT, passthroughChannel());
+        ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+        call.start(listener, new Metadata());
+        ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+        verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+        assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+        assertThat(statusCaptor.getValue().getDescription())
+            .isEqualTo("Filter rbac is not supported on client side");
+      } finally {
+        System.clearProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT");
+      }
+    }
+
+    @Test
+    public void serverDelegate_unsupportedSecondFilter_doesNotClobberSharedFirstFilterState() {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      Function<String, Filter.Provider> realPlusStateful = typeUrl -> {
+        if (StatefulFilter.DEFAULT_TYPE_URL.equals(typeUrl)) {
+          return statefulProvider;
+        }
+        return FilterRegistry.getDefaultRegistry().get(typeUrl);
+      };
+      CompositeFilter.Provider compositeProvider = new CompositeFilter.Provider(realPlusStateful);
+
+      Any validServerCfg = Any.newBuilder()
+          .setTypeUrl(StatefulFilter.DEFAULT_TYPE_URL)
+          .setValue(ByteString.copyFromUtf8("valid-server-cfg"))
+          .build();
+      Any brokenChainCfg = Any.newBuilder()
+          .setTypeUrl(StatefulFilter.DEFAULT_TYPE_URL)
+          .setValue(ByteString.copyFromUtf8("broken-chain-cfg"))
+          .build();
+      Any clientOnlyFaultCfg = Any.pack(HTTPFault.getDefaultInstance());
+
+      Matcher.OnMatch validAction = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("valid_server_action")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("shared_stateful")
+                      .setTypedConfig(validServerCfg))
+                  .build())))
+          .build();
+      Matcher.OnMatch brokenServerChain = Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("broken_server_action")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setFilterChain(FilterChainConfiguration.newBuilder()
+                      .addTypedConfig(TypedExtensionConfig.newBuilder()
+                          .setName("shared_stateful")
+                          .setTypedConfig(brokenChainCfg))
+                      .addTypedConfig(TypedExtensionConfig.newBuilder()
+                          .setName("fault")
+                          .setTypedConfig(clientOnlyFaultCfg)))
+                  .build())))
+          .build();
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("x-branch", "valid", validAction))
+              .addMatchers(createHeaderFieldMatcher("x-branch", "broken", brokenServerChain)))
+          .build();
+
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+          compositeProvider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(parsed.errorDetail).isNull();
+
+      Map<String, Filter> instances = new HashMap<>();
+      Function<NamedFilterConfig, Filter> lookup = new Function<NamedFilterConfig, Filter>() {
+        @Override
+        public Filter apply(NamedFilterConfig cfg) {
+          return instances.computeIfAbsent(cfg.filterStateKey(), key ->
+              realPlusStateful.apply(cfg.filterConfig.typeUrl())
+                  .newInstance(FilterContext.create(cfg.name, metricRecorder, this)));
+        }
+      };
+      for (NamedFilterConfig nestedCfg : parsed.config.nestedFilterConfigs()) {
+        Filter unused = lookup.apply(nestedCfg);
+      }
+
+      CompositeFilter composite = (CompositeFilter) compositeProvider.newInstance(
+          FilterContext.create("composite", metricRecorder, lookup));
+      ServerInterceptor unused = composite.buildServerInterceptor(parsed.config, null);
+
+      StatefulFilter sharedInstance = statefulProvider.getInstance(0);
+      assertThat(sharedInstance).isNotNull();
+      assertThat(sharedInstance.lastCfg).contains("valid-server-cfg");
+      assertThat(sharedInstance.lastCfg).doesNotContain("broken-chain-cfg");
+    }
+
+    @Test
+    public void selectInterceptors_emptyOrUnknownActionOnMatch_failsClosedWithInternal() {
+      UnifiedMatcher emptyActionsMatcher = mock(UnifiedMatcher.class);
+      when(emptyActionsMatcher.match(any()))
+          .thenReturn(MatchResult.create(Collections.emptyList()));
+
+      com.github.xds.core.v3.TypedExtensionConfig unmappedAction =
+          com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName("unmapped")
+              .setTypedConfig(Any.pack(SkipFilter.getDefaultInstance()))
+              .build();
+      UnifiedMatcher unmappedActionMatcher = mock(UnifiedMatcher.class);
+      when(unmappedActionMatcher.match(any()))
+          .thenReturn(MatchResult.create(Collections.singletonList(unmappedAction)));
+
+      CompositeFilter composite = new CompositeFilter(/* filterLookup= */ null);
+      for (UnifiedMatcher anomalousMatcher
+          : new UnifiedMatcher[] {emptyActionsMatcher, unmappedActionMatcher}) {
+        CompositeFilter.CompositeFilterConfig cfg =
+            new CompositeFilter.CompositeFilterConfig(anomalousMatcher, Collections.emptyMap());
+
+        // Client side must fail closed with Status.INTERNAL and never forward to next.
+        ClientInterceptor clientInterceptor =
+            composite.buildClientInterceptor(cfg, null, mock(ScheduledExecutorService.class));
+        Channel nextChannel = mock(Channel.class);
+        ClientCall<Void, Void> clientCall = clientInterceptor.interceptCall(
+            createMockMethod(), CallOptions.DEFAULT, nextChannel);
+        ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+        clientCall.start(listener, new Metadata());
+        verify(nextChannel, never()).newCall(any(), any());
+        ArgumentCaptor<Status> clientStatus = ArgumentCaptor.forClass(Status.class);
+        verify(listener).onClose(clientStatus.capture(), any(Metadata.class));
+        assertThat(clientStatus.getValue().getCode()).isEqualTo(Status.Code.INTERNAL);
+
+        // Server side must also fail closed with Status.INTERNAL and never invoke next.
+        ServerInterceptor serverInterceptor = composite.buildServerInterceptor(cfg, null);
+        ServerCall<Void, Void> serverCall = mock(ServerCall.class);
+        when(serverCall.getMethodDescriptor()).thenReturn(createMockMethod());
+        ServerCallHandler<Void, Void> nextHandler = mock(ServerCallHandler.class);
+        serverInterceptor.interceptCall(serverCall, new Metadata(), nextHandler);
+        verify(nextHandler, never()).startCall(any(), any());
+        ArgumentCaptor<Status> serverStatus = ArgumentCaptor.forClass(Status.class);
+        verify(serverCall).close(serverStatus.capture(), any(Metadata.class));
+        assertThat(serverStatus.getValue().getCode()).isEqualTo(Status.Code.INTERNAL);
+      }
+    }
+
+    @Test
+    public void unstartedCompositeClientCall_toString_doesNotThrowNotStarted() {
+      Matcher skipAll = matcherFallingThroughTo(
+          Matcher.OnMatch.newBuilder()
+              .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                  .setName("skip")
+                  .setTypedConfig(Any.pack(SkipFilter.getDefaultInstance())))
+              .build())
+          .build();
+      CompositeFilter.Provider realProvider = new CompositeFilter.Provider();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+          realProvider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(skipAll)), getFilterContext());
+      assertThat(parsed.errorDetail).isNull();
+
+      ClientInterceptor interceptor = new CompositeFilter(/* filterLookup= */ null)
+          .buildClientInterceptor(parsed.config, null, mock(ScheduledExecutorService.class));
+      ClientCall<Void, Void> call = interceptor.interceptCall(
+          createMockMethod(), CallOptions.DEFAULT, passthroughChannel());
+
+      assertThat(call.toString()).contains("delegate=null");
+
+      call.start(mock(ClientCall.Listener.class), new Metadata());
+      assertThat(call.toString()).doesNotContain("delegate=null");
+    }
   }
 
   @RunWith(JUnit4.class)
@@ -3450,6 +3631,137 @@ public class CompositeFilterTest {
           .contains("Filter rbac is not supported on client side");
     }
 
+    @Test
+    public void multiBranchSideMismatchAndSampling_isolatesBranches() {
+      Matcher multiBranch = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "healthy",
+                  executeAction("fault", faultAbort(Status.Code.ABORTED))))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "unsampled-rbac",
+                  executeActionSampled("rbac-zero", 0, Any.pack(RBAC.getDefaultInstance()))))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "sampled-rbac",
+                  executeActionSampled("rbac-hundred", 100, Any.pack(RBAC.getDefaultInstance()))))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "fault-then-rbac",
+                  executeActionChain("mixed",
+                      faultAbort(Status.Code.PERMISSION_DENIED),
+                      Any.pack(RBAC.getDefaultInstance())))))
+          .build();
+      pushCompositeConfig(multiBranch);
+
+      // 1. Healthy sibling branch executes normally.
+      StatusRuntimeException healthyErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "healthy"));
+      assertThat(healthyErr.getStatus().getCode()).isEqualTo(Status.Code.ABORTED);
+
+      // 2. 0%-sampled unsupported-side filter passes through without failing.
+      assertThat(callWithHeader(MATCH_HEADER, "unsampled-rbac")).isEqualTo(EXPECTED_RESPONSE);
+
+      // 3. 100%-sampled unsupported-side filter fails with UNAVAILABLE.
+      StatusRuntimeException sampledErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "sampled-rbac"));
+      assertThat(sampledErr.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(sampledErr.getStatus().getDescription())
+          .contains("Filter rbac-hundred is not supported on client side");
+
+      // 4. [supported FaultFilter, unsupported RBAC] fails with UNAVAILABLE for RBAC rather than
+      // running FaultFilter's PERMISSION_DENIED abort.
+      StatusRuntimeException mixedErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "fault-then-rbac"));
+      assertThat(mixedErr.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(mixedErr.getStatus().getDescription())
+          .contains("Filter mixed-1 is not supported on client side");
+    }
+
+    @Test
+    public void nestedCompositeFilter_executesTwoLevelMatcherOnRealRpc() {
+      ExtensionWithMatcher innerComposite = ExtensionWithMatcher.newBuilder()
+          .setExtensionConfig(TypedExtensionConfig.newBuilder()
+              .setName("inner-composite")
+              .setTypedConfig(Any.pack(Composite.getDefaultInstance())))
+          .setXdsMatcher(matcherOnOtherHeader("inner-run",
+              executeAction("inner-fault", faultAbort(Status.Code.RESOURCE_EXHAUSTED))))
+          .build();
+
+      pushCompositeConfig(matcherOnHeader("outer-run",
+          executeAction("inner-composite", Any.pack(innerComposite))));
+
+      // Outer matches, inner matches -> inner FaultFilter aborts with RESOURCE_EXHAUSTED.
+      Metadata bothHeaders = new Metadata();
+      bothHeaders.put(MATCH_HEADER, "outer-run");
+      bothHeaders.put(OTHER_HEADER, "inner-run");
+      StatusRuntimeException matchedErr = assertThrows(StatusRuntimeException.class,
+          () -> stub().withInterceptors(MetadataUtils.newAttachHeadersInterceptor(bothHeaders))
+              .unaryRpc(SimpleRequest.getDefaultInstance()));
+      assertThat(matchedErr.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+
+      // Outer matches, inner has no match -> inner composite fails RPC with UNAVAILABLE.
+      StatusRuntimeException innerNoMatch = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "outer-run"));
+      assertThat(innerNoMatch.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(innerNoMatch.getStatus().getDescription())
+          .contains("no match found in composite filter");
+    }
+
+    @Test
+    public void duplicateAndEmptyActionNamesAndFilterChainPrecedence_dispatchCorrectly() {
+      Matcher.OnMatch dupFirst = action("dup", Any.pack(ExecuteFilterAction.newBuilder()
+          .setTypedConfig(TypedExtensionConfig.newBuilder()
+              .setName("fault-a")
+              .setTypedConfig(faultAbort(Status.Code.PERMISSION_DENIED)))
+          .build()));
+      Matcher.OnMatch dupSecond = action("dup", Any.pack(ExecuteFilterAction.newBuilder()
+          .setTypedConfig(TypedExtensionConfig.newBuilder()
+              .setName("fault-b")
+              .setTypedConfig(faultAbort(Status.Code.RESOURCE_EXHAUSTED)))
+          .build()));
+      Matcher.OnMatch emptyNameAbort = action("", Any.pack(ExecuteFilterAction.newBuilder()
+          .setTypedConfig(TypedExtensionConfig.newBuilder()
+              .setName("")
+              .setTypedConfig(faultAbort(Status.Code.ABORTED)))
+          .build()));
+      Matcher.OnMatch emptyNameSkip = action("", Any.pack(SkipFilter.getDefaultInstance()));
+      Matcher.OnMatch bothChainAndTypedConfig = action("precedence", Any.pack(
+          ExecuteFilterAction.newBuilder()
+              .setTypedConfig(TypedExtensionConfig.newBuilder()
+                  .setName("ignored-single")
+                  .setTypedConfig(faultAbort(Status.Code.INTERNAL)))
+              .setFilterChain(FilterChainConfiguration.newBuilder()
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("winning-chain")
+                      .setTypedConfig(faultAbort(Status.Code.UNAUTHENTICATED))))
+              .build()));
+
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "dup-1", dupFirst))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "dup-2", dupSecond))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "empty-abort", emptyNameAbort))
+              .addMatchers(fieldMatcherOnHeader(MATCH_HEADER.name(), "empty-skip", emptyNameSkip))
+              .addMatchers(
+                  fieldMatcherOnHeader(MATCH_HEADER.name(), "both", bothChainAndTypedConfig)))
+          .build();
+      pushCompositeConfig(matcher);
+
+      StatusRuntimeException e1 = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "dup-1"));
+      assertThat(e1.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+
+      StatusRuntimeException e2 = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "dup-2"));
+      assertThat(e2.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+
+      StatusRuntimeException e3 = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "empty-abort"));
+      assertThat(e3.getStatus().getCode()).isEqualTo(Status.Code.ABORTED);
+
+      assertThat(callWithHeader(MATCH_HEADER, "empty-skip")).isEqualTo(EXPECTED_RESPONSE);
+
+      // A103: when filter_chain is set, typed_config is ignored.
+      StatusRuntimeException e5 = assertThrows(StatusRuntimeException.class,
+          () -> callWithHeader(MATCH_HEADER, "both"));
+      assertThat(e5.getStatus().getCode()).isEqualTo(Status.Code.UNAUTHENTICATED);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // RPC helpers
     // ---------------------------------------------------------------------------------------------
@@ -3546,21 +3858,27 @@ public class CompositeFilterTest {
       return matcherOnNamedHeader(OTHER_HEADER.name(), value, onMatch);
     }
 
+    private static Matcher.MatcherList.FieldMatcher fieldMatcherOnHeader(
+        String headerName, String headerValue, Matcher.OnMatch onMatch) {
+      return Matcher.MatcherList.FieldMatcher.newBuilder()
+          .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
+              .setSinglePredicate(Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
+                  .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                      .setName("request-headers")
+                      .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
+                          .setHeaderName(headerName)
+                          .build())))
+                  .setValueMatch(StringMatcher.newBuilder().setExact(headerValue))))
+          .setOnMatch(onMatch)
+          .build();
+    }
+
     /** A single-predicate matcher list, with no on_no_match, keyed on one request header. */
     private static Matcher matcherOnNamedHeader(
         String headerName, String headerValue, Matcher.OnMatch onMatch) {
       return Matcher.newBuilder()
           .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
-                  .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
-                      .setSinglePredicate(Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
-                          .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
-                              .setName("request-headers")
-                              .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
-                                  .setHeaderName(headerName)
-                                  .build())))
-                          .setValueMatch(StringMatcher.newBuilder().setExact(headerValue))))
-                  .setOnMatch(onMatch)))
+              .addMatchers(fieldMatcherOnHeader(headerName, headerValue, onMatch)))
           .build();
     }
 
@@ -3734,6 +4052,136 @@ public class CompositeFilterTest {
       assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
     }
 
+    @Test
+    public void multiBranchSideMismatchAndSampling_isolatesBranchesOnServer() {
+      Any clientOnlyFault = Any.pack(HTTPFault.newBuilder()
+          .setAbort(FaultAbort.newBuilder()
+              .setGrpcStatus(Status.Code.ABORTED.value())
+              .setPercentage(FractionalPercent.newBuilder()
+                  .setNumerator(100)
+                  .setDenominator(FractionalPercent.DenominatorType.HUNDRED)))
+          .build());
+      Matcher.OnMatch unsampledFault = action("fault-0", Any.pack(ExecuteFilterAction.newBuilder()
+          .setTypedConfig(TypedExtensionConfig.newBuilder()
+              .setName("fault-zero")
+              .setTypedConfig(clientOnlyFault))
+          .setSamplePercent(RuntimeFractionalPercent.newBuilder()
+              .setDefaultValue(FractionalPercent.newBuilder()
+                  .setNumerator(0)
+                  .setDenominator(FractionalPercent.DenominatorType.HUNDRED)))
+          .build()));
+      Matcher.OnMatch sampledFault = action("fault-100", Any.pack(ExecuteFilterAction.newBuilder()
+          .setTypedConfig(TypedExtensionConfig.newBuilder()
+              .setName("fault-hundred")
+              .setTypedConfig(clientOnlyFault))
+          .build()));
+      Matcher.OnMatch rbacThenFault = action("rbac-then-fault", Any.pack(
+          ExecuteFilterAction.newBuilder()
+              .setFilterChain(FilterChainConfiguration.newBuilder()
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("rbac-first")
+                      .setTypedConfig(denyAllRbac()))
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("fault-second")
+                      .setTypedConfig(clientOnlyFault)))
+              .build()));
+
+      Matcher multiBranch = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(serverFieldMatcher("healthy", executeRbacAction()))
+              .addMatchers(serverFieldMatcher("unsampled-fault", unsampledFault))
+              .addMatchers(serverFieldMatcher("sampled-fault", sampledFault))
+              .addMatchers(serverFieldMatcher("rbac-then-fault", rbacThenFault)))
+          .build();
+      pushServerCompositeMatcher(multiBranch);
+      awaitCompositeFilterActive();
+
+      StatusRuntimeException healthyErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("healthy"));
+      assertThat(healthyErr.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+
+      assertThat(callWithMatchHeaderValue("unsampled-fault")).isEqualTo(EXPECTED_RESPONSE);
+
+      StatusRuntimeException sampledErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("sampled-fault"));
+      assertThat(sampledErr.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(sampledErr.getStatus().getDescription())
+          .contains("Filter fault-hundred is not supported on server side");
+
+      // [supported RBAC, unsupported FaultFilter] must fail with UNAVAILABLE for fault-second
+      // rather than running RBAC's PERMISSION_DENIED.
+      StatusRuntimeException mixedErr = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("rbac-then-fault"));
+      assertThat(mixedErr.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(mixedErr.getStatus().getDescription())
+          .contains("Filter fault-second is not supported on server side");
+    }
+
+    @Test
+    public void filterChainAndNestedComposite_executesInConfiguredOrderOnServer() {
+      Any innerCompositeOnlyMatchesNested = Any.pack(ExtensionWithMatcher.newBuilder()
+          .setExtensionConfig(TypedExtensionConfig.newBuilder()
+              .setName("inner-server-composite")
+              .setTypedConfig(Any.pack(Composite.getDefaultInstance())))
+          .setXdsMatcher(Matcher.newBuilder()
+              .setMatcherList(Matcher.MatcherList.newBuilder()
+                  .addMatchers(serverFieldMatcher("nested-match", executeRbacAction()))))
+          .build());
+
+      Matcher.OnMatch rbacThenInner = action("rbac-then-inner", Any.pack(
+          ExecuteFilterAction.newBuilder()
+              .setFilterChain(FilterChainConfiguration.newBuilder()
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("rbac")
+                      .setTypedConfig(denyAllRbac()))
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("inner")
+                      .setTypedConfig(innerCompositeOnlyMatchesNested)))
+              .build()));
+      Matcher.OnMatch innerThenRbac = action("inner-then-rbac", Any.pack(
+          ExecuteFilterAction.newBuilder()
+              .setFilterChain(FilterChainConfiguration.newBuilder()
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("inner")
+                      .setTypedConfig(innerCompositeOnlyMatchesNested))
+                  .addTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName("rbac")
+                      .setTypedConfig(denyAllRbac())))
+              .build()));
+      Matcher.OnMatch delegateToInner = action("delegate-inner", Any.pack(
+          ExecuteFilterAction.newBuilder()
+              .setTypedConfig(TypedExtensionConfig.newBuilder()
+                  .setName("inner")
+                  .setTypedConfig(innerCompositeOnlyMatchesNested))
+              .build()));
+
+      Matcher matcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(serverFieldMatcher("rbac-first", rbacThenInner))
+              .addMatchers(serverFieldMatcher("inner-first", innerThenRbac))
+              .addMatchers(serverFieldMatcher("nested-match", delegateToInner)))
+          .build();
+      pushServerCompositeMatcher(matcher);
+      awaitCompositeFilterActive();
+
+      // RBAC runs before the unmatched inner composite -> PERMISSION_DENIED wins.
+      StatusRuntimeException e1 = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("rbac-first"));
+      assertThat(e1.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+
+      // Unmatched inner composite runs before RBAC -> UNAVAILABLE ("no match") wins.
+      StatusRuntimeException e2 = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("inner-first"));
+      assertThat(e2.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(e2.getStatus().getDescription())
+          .contains("no match found in composite filter");
+
+      // Outer composite delegates to inner composite, which matches "nested-match" and runs RBAC.
+      StatusRuntimeException e3 = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("nested-match"));
+      assertThat(e3.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
@@ -3775,8 +4223,12 @@ public class CompositeFilterTest {
     }
 
     private SimpleResponse callWithMatchHeader() {
+      return callWithMatchHeaderValue("run");
+    }
+
+    private SimpleResponse callWithMatchHeaderValue(String value) {
       Metadata headers = new Metadata();
-      headers.put(MATCH_HEADER, "run");
+      headers.put(MATCH_HEADER, value);
       return stub().withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
           .unaryRpc(SimpleRequest.getDefaultInstance());
     }
@@ -3794,11 +4246,15 @@ public class CompositeFilterTest {
      * client listener is left at its default, so only the server side is under test.
      */
     private void pushServerCompositeConfig(Matcher.OnMatch onMatch) {
+      pushServerCompositeMatcher(matcherOnMatchHeader(onMatch));
+    }
+
+    private void pushServerCompositeMatcher(Matcher matcher) {
       ExtensionWithMatcher compositeConfig = ExtensionWithMatcher.newBuilder()
           .setExtensionConfig(TypedExtensionConfig.newBuilder()
               .setName(COMPOSITE_FILTER_NAME)
               .setTypedConfig(Any.pack(Composite.getDefaultInstance())))
-          .setXdsMatcher(matcherOnMatchHeader(onMatch))
+          .setXdsMatcher(matcher)
           .build();
 
       HttpFilter composite = HttpFilter.newBuilder()
@@ -3850,19 +4306,25 @@ public class CompositeFilterTest {
     // Proto builders
     // ---------------------------------------------------------------------------------------------
 
+    private static Matcher.MatcherList.FieldMatcher serverFieldMatcher(
+        String headerValue, Matcher.OnMatch onMatch) {
+      return Matcher.MatcherList.FieldMatcher.newBuilder()
+          .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
+              .setSinglePredicate(Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
+                  .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                      .setName("request-headers")
+                      .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
+                          .setHeaderName(MATCH_HEADER.name())
+                          .build())))
+                  .setValueMatch(StringMatcher.newBuilder().setExact(headerValue))))
+          .setOnMatch(onMatch)
+          .build();
+    }
+
     private static Matcher matcherOnMatchHeader(Matcher.OnMatch onMatch) {
       return Matcher.newBuilder()
           .setMatcherList(Matcher.MatcherList.newBuilder()
-              .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
-                  .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
-                      .setSinglePredicate(Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
-                          .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
-                              .setName("request-headers")
-                              .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
-                                  .setHeaderName(MATCH_HEADER.name())
-                                  .build())))
-                          .setValueMatch(StringMatcher.newBuilder().setExact("run"))))
-                  .setOnMatch(onMatch)))
+              .addMatchers(serverFieldMatcher("run", onMatch)))
           .build();
     }
 
@@ -3943,13 +4405,54 @@ public class CompositeFilterTest {
           })
           .build().start());
 
-      // Matches every RPC with no nested filters, so only the composite's own call wrapping runs.
-      UnifiedMatcher matchAll = mock(UnifiedMatcher.class);
-      when(matchAll.match(any())).thenReturn(MatchResult.create(Collections.emptyList()));
-      ClientInterceptor interceptor =
-          new CompositeFilter(/* filterLookup= */ null).buildClientInterceptor(
-              new CompositeFilter.CompositeFilterConfig(matchAll, Collections.emptyMap()), null,
-              mock(ScheduledExecutorService.class));
+      // Matches every RPC via a real parsed SkipFilter config, so only CompositeClientCall runs.
+      System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+      ClientInterceptor interceptor;
+      try {
+        Matcher.OnMatch skip = Matcher.OnMatch.newBuilder()
+            .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                .setName("skip")
+                .setTypedConfig(Any.pack(SkipFilter.getDefaultInstance())))
+            .build();
+        Matcher matchAll = Matcher.newBuilder()
+            .setMatcherList(Matcher.MatcherList.newBuilder()
+                .addMatchers(Matcher.MatcherList.FieldMatcher.newBuilder()
+                    .setPredicate(Matcher.MatcherList.Predicate.newBuilder()
+                        .setSinglePredicate(
+                            Matcher.MatcherList.Predicate.SinglePredicate.newBuilder()
+                                .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                                    .setName("request-headers")
+                                    .setTypedConfig(Any.pack(
+                                        HttpRequestHeaderMatchInput.newBuilder()
+                                            .setHeaderName("x-never-set")
+                                            .build())))
+                                .setValueMatch(StringMatcher.newBuilder().setExact("never"))))
+                    .setOnMatch(skip)))
+            .setOnNoMatch(skip)
+            .build();
+        ExtensionWithMatcher proto = ExtensionWithMatcher.newBuilder()
+            .setExtensionConfig(TypedExtensionConfig.newBuilder()
+                .setName("composite")
+                .setTypedConfig(Any.pack(Composite.getDefaultInstance())))
+            .setXdsMatcher(matchAll)
+            .build();
+        FilterConfigParseContext parseContext = FilterConfigParseContext.builder()
+            .bootstrapInfo(Bootstrapper.BootstrapInfo.builder()
+                .servers(Collections.singletonList(
+                    Bootstrapper.ServerInfo.create("test_target", Collections.emptyMap())))
+                .node(EnvoyProtoData.Node.newBuilder().build())
+                .build())
+            .serverInfo(Bootstrapper.ServerInfo.create(
+                "test_target", Collections.emptyMap(), false, true, false, false))
+            .build();
+        ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+            new CompositeFilter.Provider().parseFilterConfig(Any.pack(proto), parseContext);
+        assertThat(parsed.errorDetail).isNull();
+        interceptor = new CompositeFilter(/* filterLookup= */ null)
+            .buildClientInterceptor(parsed.config, null, null);
+      } finally {
+        System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+      }
       ManagedChannel channel = grpcCleanup.register(InProcessChannelBuilder.forName(serverName)
           .directExecutor()
           .intercept(interceptor)

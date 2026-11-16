@@ -1103,9 +1103,8 @@ public abstract class AbstractTransportTest {
     Metadata clientStreamTrailers =
         clientStreamListener.awaitTrailers(TIMEOUT_MS, TimeUnit.MILLISECONDS);
     checkClientStatus(status, clientStreamStatus);
-    assertEquals(
-        Lists.newArrayList(trailers.getAll(asciiKey)),
-        Lists.newArrayList(clientStreamTrailers.getAll(asciiKey)));
+    assertAsciiMetadataValuesEqual(
+        trailers.getAll(asciiKey), clientStreamTrailers.getAll(asciiKey));
     assertEquals(
         Lists.newArrayList(trailers.getAll(binaryKey)),
         Lists.newArrayList(clientStreamTrailers.getAll(binaryKey)));
@@ -2086,6 +2085,67 @@ public abstract class AbstractTransportTest {
     }
     Metadata metadata = clientStreamListener.awaitTrailers(TIMEOUT_MS, TimeUnit.MILLISECONDS);
     assertNull(metadata.get(tellTaleKey));
+  }
+
+  @Test
+  public void serverStream_triggerEvent() throws Exception {
+    server.start(serverListener);
+    client = newClientTransport(server);
+    startTransport(client, mockClientTransportListener);
+    MockServerTransportListener serverTransportListener
+        = serverListener.takeListenerOrFail(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    serverTransport = serverTransportListener.transport;
+
+    ClientStream clientStream = client.newStream(
+        methodDescriptor, new Metadata(), callOptions, noopTracers);
+    ClientStreamListenerBase clientStreamListener = new ClientStreamListenerBase();
+    clientStream.start(clientStreamListener);
+
+    StreamCreation serverStreamCreation
+        = serverTransportListener.takeStreamOrFail(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    ServerStream serverStream = serverStreamCreation.stream;
+    ServerStreamListenerBase serverStreamListener = serverStreamCreation.listener;
+
+    Object event = new Object();
+    serverStream.triggerEvent(event);
+
+    Object receivedEvent = serverStreamListener.eventQueue.poll(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    assertEquals(event, receivedEvent);
+
+    // Cleanup
+    serverStream.close(Status.OK, new Metadata());
+  }
+
+  @Test
+  public void serverStream_triggerEvent_afterClose() throws Exception {
+    server.start(serverListener);
+    client = newClientTransport(server);
+    startTransport(client, mockClientTransportListener);
+    MockServerTransportListener serverTransportListener
+        = serverListener.takeListenerOrFail(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    serverTransport = serverTransportListener.transport;
+
+    ClientStream clientStream = client.newStream(
+        methodDescriptor, new Metadata(), callOptions, noopTracers);
+    ClientStreamListenerBase clientStreamListener = new ClientStreamListenerBase();
+    clientStream.start(clientStreamListener);
+
+    StreamCreation serverStreamCreation
+        = serverTransportListener.takeStreamOrFail(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    ServerStream serverStream = serverStreamCreation.stream;
+    ServerStreamListenerBase serverStreamListener = serverStreamCreation.listener;
+
+    // Close the stream from client side
+    clientStream.cancel(Status.CANCELLED);
+
+    serverStreamListener.awaitClose(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+    Object event = new Object();
+    serverStream.triggerEvent(event);
+
+    // Verify listener did NOT receive the event
+    Object receivedEvent = serverStreamListener.eventQueue.poll(100, TimeUnit.MILLISECONDS);
+    assertNull(receivedEvent);
   }
 
   /**

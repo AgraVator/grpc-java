@@ -556,11 +556,29 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
     }
   }
 
+  /**
+   * Whether the given authority is configured to fall back based solely on the reachability of the
+   * primary server, as described in gRFC A95. The knob is only defined for named authorities, so
+   * resources served by the top-level server list always use the gRFC A71 behavior.
+   */
+  private boolean fallbackOnReachabilityOnly(@Nullable String authority) {
+    if (authority == null) {
+      return false;
+    }
+    AuthorityInfo authorityInfo = bootstrapInfo.authorities().get(authority);
+    return authorityInfo != null && authorityInfo.fallbackOnReachabilityOnly();
+  }
+
   @SuppressWarnings("unchecked")
   private <T extends ResourceUpdate> void handleResourceUpdate(
       XdsResourceType.Args args, List<Any> resources, XdsResourceType<T> xdsResourceType,
       boolean isFirstResponse, ProcessingTracker processingTracker) {
     ControlPlaneClient controlPlaneClient = serverCpClientMap.get(args.serverInfo);
+    if (controlPlaneClient == null) {
+      logger.log(XdsLogLevel.DEBUG,
+          "Couldn't find CPC for {0}, so skipping resource update", args.serverInfo);
+      return;
+    }
 
     if (isFirstResponse) {
       shutdownLowerPriorityCpcs(controlPlaneClient);
@@ -593,8 +611,13 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
     Map<String, ResourceSubscriber<? extends ResourceUpdate>> subscribedResources =
         resourceSubscribers.getOrDefault(xdsResourceType, Collections.emptyMap());
     for (Map.Entry<String, ResourceSubscriber<?>> entry : subscribedResources.entrySet()) {
-      String resourceName = entry.getKey();
       ResourceSubscriber<T> subscriber = (ResourceSubscriber<T>) entry.getValue();
+      // Only process resources subscribed to the control plane that sent this update.
+      if (getActiveCpc(subscriber.authority) != controlPlaneClient) {
+        continue;
+      }
+
+      String resourceName = entry.getKey();
       if (parsedResources.containsKey(resourceName)) {
         // Happy path: the resource updated successfully. Notify the watchers of the update.
         subscriber.onData(parsedResources.get(resourceName), args.versionInfo, updateTime,
@@ -628,9 +651,7 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
       // For State of the World services, notify watchers when their watched resource is missing
       // from the ADS update. Note that we can only do this if the resource update is coming from
       // the same xDS server that the ResourceSubscriber is subscribed to.
-      if (getActiveCpc(subscriber.authority) == controlPlaneClient) {
-        subscriber.onAbsent(processingTracker, args.serverInfo);
-      }
+      subscriber.onAbsent(processingTracker, args.serverInfo);
     }
   }
 
@@ -1057,8 +1078,10 @@ public final class XdsClientImpl extends XdsClient implements ResourceStore {
           if (!authoritiesForClosedCpc.contains(subscriber.authority)) {
             continue;
           }
-          // If subscriber already has data, this is an ambient error.
-          if (subscriber.hasResult()) {
+          // If subscriber already has data, this is an ambient error. But if the authority is
+          // configured to fall back based solely on reachability (gRFC A95), still attempt
+          // fallback below even though the resource is cached.
+          if (subscriber.hasResult() && !fallbackOnReachabilityOnly(subscriber.authority)) {
             subscriber.onError(status, null);
             continue;
           }

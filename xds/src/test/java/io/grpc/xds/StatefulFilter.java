@@ -21,10 +21,16 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.Message;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.MethodDescriptor;
 import io.grpc.ServerInterceptor;
 import java.util.ConcurrentModificationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 import javax.annotation.Nullable;
@@ -46,15 +52,35 @@ class StatefulFilter implements Filter {
    */
   @Nullable final String name;
 
+  private final boolean requiresRequestPayloadAccess;
+  private final boolean requiresResponsePayloadAccess;
   @Nullable volatile String lastCfg = null;
 
   public StatefulFilter(int idx) {
-    this(idx, null);
+    this(idx, null, false, false);
   }
 
-  public StatefulFilter(int idx, @Nullable String name) {
+  public StatefulFilter(
+      int idx,
+      @Nullable String name,
+      boolean requiresRequestPayloadAccess,
+      boolean requiresResponsePayloadAccess) {
     this.idx = idx;
     this.name = name;
+    this.requiresRequestPayloadAccess = requiresRequestPayloadAccess;
+    this.requiresResponsePayloadAccess = requiresResponsePayloadAccess;
+  }
+
+  @Override
+  public boolean requiresRequestPayloadAccess(
+      FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return requiresRequestPayloadAccess;
+  }
+
+  @Override
+  public boolean requiresResponsePayloadAccess(
+      FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return requiresResponsePayloadAccess;
   }
 
   public boolean isShutdown() {
@@ -80,6 +106,21 @@ class StatefulFilter implements Filter {
     return null;
   }
 
+  @Nullable
+  @Override
+  public ClientInterceptor buildClientInterceptor(
+      FilterConfig config,
+      @Nullable FilterConfig overrideConfig,
+      ScheduledExecutorService scheduler) {
+    return new ClientInterceptor() {
+      @Override
+      public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+          MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+        return next.newCall(method, callOptions);
+      }
+    };
+  }
+
   @Override
   public String toString() {
     StringBuilder sb = new StringBuilder().append("StatefulFilter{")
@@ -96,16 +137,31 @@ class StatefulFilter implements Filter {
   static final class Provider implements Filter.Provider {
 
     private final String typeUrl;
+    private final boolean requiresRequestPayloadAccess;
+    private final boolean requiresResponsePayloadAccess;
     private final ConcurrentMap<Integer, StatefulFilter> instances = new ConcurrentHashMap<>();
 
     volatile int counter;
 
     Provider() {
-      this(DEFAULT_TYPE_URL);
+      this(DEFAULT_TYPE_URL, false, false);
+    }
+
+    Provider(boolean requiresRequestPayloadAccess, boolean requiresResponsePayloadAccess) {
+      this(DEFAULT_TYPE_URL, requiresRequestPayloadAccess, requiresResponsePayloadAccess);
     }
 
     Provider(String typeUrl) {
+      this(typeUrl, false, false);
+    }
+
+    Provider(
+        String typeUrl,
+        boolean requiresRequestPayloadAccess,
+        boolean requiresResponsePayloadAccess) {
       this.typeUrl = typeUrl;
+      this.requiresRequestPayloadAccess = requiresRequestPayloadAccess;
+      this.requiresResponsePayloadAccess = requiresResponsePayloadAccess;
     }
 
     @Override
@@ -125,7 +181,8 @@ class StatefulFilter implements Filter {
 
     @Override
     public synchronized StatefulFilter newInstance(FilterContext context) {
-      StatefulFilter filter = new StatefulFilter(counter++, context.filterName());
+      StatefulFilter filter = new StatefulFilter(counter++, context.filterName(),
+          requiresRequestPayloadAccess, requiresResponsePayloadAccess);
       instances.put(filter.idx, filter);
       return filter;
     }

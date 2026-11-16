@@ -27,6 +27,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.util.Durations;
 import io.grpc.Attributes;
 import io.grpc.CallOptions;
@@ -69,6 +70,9 @@ import io.grpc.xds.client.XdsClient;
 import io.grpc.xds.client.XdsInitializationException;
 import io.grpc.xds.client.XdsLogger;
 import io.grpc.xds.client.XdsLogger.XdsLogLevel;
+import io.grpc.xds.internal.extproc.ExternalProcessorUtil;
+import io.grpc.xds.internal.extproc.KnownLengthInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -473,21 +477,7 @@ final class XdsNameResolver extends NameResolver {
       } while (!retainCluster(cluster));
 
       final RouteAction routeAction = selectedRoute.routeAction;
-      Long timeoutNanos = null;
-      if (enableTimeout) {
-        timeoutNanos = routeAction.timeoutNano();
-        if (timeoutNanos == null) {
-          timeoutNanos = routingCfg.fallbackTimeoutNano;
-        }
-        if (timeoutNanos <= 0) {
-          timeoutNanos = null;
-        }
-      }
-      RetryPolicy retryPolicy = routeAction.retryPolicy();
-      // TODO(chengyuanzhang): avoid service config generation and parsing for each call.
-      Map<String, ?> rawServiceConfig =
-          generateServiceConfigWithMethodConfig(timeoutNanos, retryPolicy);
-      ConfigOrError parsedServiceConfig = serviceConfigParser.parseServiceConfig(rawServiceConfig);
+      ConfigOrError parsedServiceConfig = selectedRoute.parsedServiceConfig;
       Object config = parsedServiceConfig.getConfig();
       if (config == null) {
         releaseCluster(cluster);
@@ -788,15 +778,31 @@ final class XdsNameResolver extends NameResolver {
       Map<String, RlsPluginConfig> rlsPluginConfigMap = new HashMap<>();
       for (Route route : routes) {
         RouteAction action = route.routeAction();
+        ConfigOrError parsedServiceConfig = null;
+        if (action != null) {
+          Long timeoutNanos = null;
+          if (enableTimeout) {
+            timeoutNanos = action.timeoutNano();
+            if (timeoutNanos == null) {
+              timeoutNanos = httpMaxStreamDurationNano;
+            }
+            if (timeoutNanos <= 0) {
+              timeoutNanos = null;
+            }
+          }
+          // These settings depend only on the routing snapshot, not on the individual RPC.
+          parsedServiceConfig = serviceConfigParser.parseServiceConfig(
+              generateServiceConfigWithMethodConfig(timeoutNanos, action.retryPolicy()));
+        }
         String prefixedName;
         if (action == null) {
-          routesData.add(new RouteData(route.routeMatch(), null, ImmutableList.of()));
+          routesData.add(new RouteData(route.routeMatch(), null, ImmutableList.of(), null));
         } else if (action.cluster() != null) {
           prefixedName = prefixedClusterName(action.cluster());
           clusters.add(prefixedName);
           clusterNameMap.put(prefixedName, action.cluster());
           ClientInterceptor filters = createFilters(filterConfigs, virtualHost, route, null);
-          routesData.add(new RouteData(route.routeMatch(), route.routeAction(), filters));
+          routesData.add(new RouteData(route.routeMatch(), action, filters, parsedServiceConfig));
         } else if (action.weightedClusters() != null) {
           ImmutableList.Builder<ClientInterceptor> filterList = ImmutableList.builder();
           for (ClusterWeight weightedCluster : action.weightedClusters()) {
@@ -806,7 +812,7 @@ final class XdsNameResolver extends NameResolver {
             filterList.add(createFilters(filterConfigs, virtualHost, route, weightedCluster));
           }
           routesData.add(
-              new RouteData(route.routeMatch(), route.routeAction(), filterList.build()));
+              new RouteData(route.routeMatch(), action, filterList.build(), parsedServiceConfig));
         } else if (action.namedClusterSpecifierPluginConfig() != null) {
           PluginConfig pluginConfig = action.namedClusterSpecifierPluginConfig().config();
           if (pluginConfig instanceof RlsPluginConfig) {
@@ -816,7 +822,7 @@ final class XdsNameResolver extends NameResolver {
             rlsPluginConfigMap.put(prefixedName, (RlsPluginConfig) pluginConfig);
           }
           ClientInterceptor filters = createFilters(filterConfigs, virtualHost, route, null);
-          routesData.add(new RouteData(route.routeMatch(), route.routeAction(), filters));
+          routesData.add(new RouteData(route.routeMatch(), action, filters, parsedServiceConfig));
         } else {
           // Discard route
         }
@@ -871,7 +877,7 @@ final class XdsNameResolver extends NameResolver {
       }
       // Make newly added clusters selectable by config selector and deleted clusters no longer
       // selectable.
-      routingConfig = new RoutingConfig(xdsConfig, httpMaxStreamDurationNano, routesData.build());
+      routingConfig = new RoutingConfig(xdsConfig, routesData.build());
       for (String cluster : deletedClusters) {
         int count = clusterRefs.get(cluster).refCount.decrementAndGet();
         if (count == 0) {
@@ -900,6 +906,8 @@ final class XdsNameResolver extends NameResolver {
         selectedOverrideConfigs.putAll(weightedCluster.filterConfigOverrides());
       }
 
+      boolean anyFilterRequiresRequestPayload = false;
+      boolean anyFilterRequiresResponsePayload = false;
       ImmutableList.Builder<ClientInterceptor> filterInterceptors = ImmutableList.builder();
       for (NamedFilterConfig namedFilter : filterConfigs) {
         String name = namedFilter.name;
@@ -914,13 +922,19 @@ final class XdsNameResolver extends NameResolver {
 
         if (interceptor != null) {
           filterInterceptors.add(interceptor);
+          if (filter.requiresRequestPayloadAccess(config, overrideConfig)) {
+            anyFilterRequiresRequestPayload = true;
+          }
+          if (filter.requiresResponsePayloadAccess(config, overrideConfig)) {
+            anyFilterRequiresResponsePayload = true;
+          }
         }
       }
 
       ImmutableList.Builder<ClientInterceptor> withRawMessage = ImmutableList.builder();
-      if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)
-          || GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
-        withRawMessage.add(new RawMessageClientInterceptor());
+      if (anyFilterRequiresRequestPayload || anyFilterRequiresResponsePayload) {
+        withRawMessage.add(new RawMessageClientInterceptor(
+            anyFilterRequiresRequestPayload, anyFilterRequiresResponsePayload));
       }
       withRawMessage.addAll(filterInterceptors.build());
       return combineInterceptors(withRawMessage.build());
@@ -954,21 +968,18 @@ final class XdsNameResolver extends NameResolver {
    */
   private static class RoutingConfig {
     final XdsConfig xdsConfig;
-    final long fallbackTimeoutNano;
     final ImmutableList<RouteData> routes;
     final Status errorStatus;
 
     private RoutingConfig(
-        XdsConfig xdsConfig, long fallbackTimeoutNano, ImmutableList<RouteData> routes) {
+        XdsConfig xdsConfig, ImmutableList<RouteData> routes) {
       this.xdsConfig = checkNotNull(xdsConfig, "xdsConfig");
-      this.fallbackTimeoutNano = fallbackTimeoutNano;
       this.routes = checkNotNull(routes, "routes");
       this.errorStatus = null;
     }
 
     private RoutingConfig(Status errorStatus) {
       this.xdsConfig = null;
-      this.fallbackTimeoutNano = 0;
       this.routes = null;
       this.errorStatus = checkNotNull(errorStatus, "errorStatus");
       checkArgument(!errorStatus.isOk(), "errorStatus should not be okay");
@@ -986,20 +997,27 @@ final class XdsNameResolver extends NameResolver {
      * clusters.
      */
     final ImmutableList<ClientInterceptor> filterChoices;
+    /** Parsed method config shared by RPCs using this route; null for non-forwarding actions. */
+    @Nullable
+    final ConfigOrError parsedServiceConfig;
 
-    RouteData(RouteMatch routeMatch, @Nullable RouteAction routeAction, ClientInterceptor filter) {
-      this(routeMatch, routeAction, ImmutableList.of(filter));
+    RouteData(RouteMatch routeMatch, @Nullable RouteAction routeAction, ClientInterceptor filter,
+        @Nullable ConfigOrError parsedServiceConfig) {
+      this(routeMatch, routeAction, ImmutableList.of(filter), parsedServiceConfig);
     }
 
     RouteData(
         RouteMatch routeMatch,
         @Nullable RouteAction routeAction,
-        ImmutableList<ClientInterceptor> filterChoices) {
+        ImmutableList<ClientInterceptor> filterChoices,
+        @Nullable ConfigOrError parsedServiceConfig) {
       this.routeMatch = checkNotNull(routeMatch, "routeMatch");
       checkArgument(
           routeAction == null || !filterChoices.isEmpty(),
           "filter may be empty only for non-forwarding action");
       this.routeAction = routeAction;
+      this.parsedServiceConfig = routeAction == null ? null
+          : checkNotNull(parsedServiceConfig, "parsedServiceConfig");
       if (routeAction != null && routeAction.weightedClusters() != null) {
         checkArgument(
             routeAction.weightedClusters().size() == filterChoices.size(),
@@ -1145,6 +1163,13 @@ final class XdsNameResolver extends NameResolver {
         new MethodDescriptor.Marshaller<InputStream>() {
           @Override
           public InputStream stream(InputStream value) {
+            // For retry attempts, RetriableStream calls stream(value) once per attempt.
+            // Returning a fresh KnownLengthInputStream wrapping the immutable ByteString ensures
+            // each retry attempt reads from the beginning of the payload rather than an already
+            // drained stream.
+            if (value instanceof KnownLengthInputStream) {
+              return new KnownLengthInputStream(((KnownLengthInputStream) value).getByteString());
+            }
             return value;
           }
 
@@ -1154,73 +1179,186 @@ final class XdsNameResolver extends NameResolver {
           }
         };
 
+    private final boolean interceptRequest;
+    private final boolean interceptResponse;
+
+    RawMessageClientInterceptor() {
+      this(true, true);
+    }
+
+    RawMessageClientInterceptor(boolean interceptRequest, boolean interceptResponse) {
+      this.interceptRequest = interceptRequest;
+      this.interceptResponse = interceptResponse;
+    }
+
     @Override
     public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+        final MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+      if (interceptRequest && interceptResponse) {
+        return interceptBoth(method, callOptions, next);
+      } else if (interceptRequest) {
+        return interceptRequestOnly(method, callOptions, next);
+      } else if (interceptResponse) {
+        return interceptResponseOnly(method, callOptions, next);
+      } else {
+        return next.newCall(method, callOptions);
+      }
+    }
+
+    private static <ReqT, RespT> ClientCall<ReqT, RespT> interceptBoth(
         final MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
       MethodDescriptor<InputStream, InputStream> rawMethod =
           method.toBuilder(RAW_MARSHALLER, RAW_MARSHALLER).build();
       final ClientCall<InputStream, InputStream> rawCall = next.newCall(rawMethod, callOptions);
-      return new ClientCall<ReqT, RespT>() {
+      return new PartialForwardingClientCall<ReqT, RespT>() {
         @Override
-        public void start(final Listener<RespT> responseListener, Metadata headers) {
-          rawCall.start(new Listener<InputStream>() {
-            @Override
-            public void onHeaders(Metadata headers) {
-              responseListener.onHeaders(headers);
-            }
-
-            @Override
-            public void onMessage(InputStream message) {
-              responseListener.onMessage(method.getResponseMarshaller().parse(message));
-            }
-
-            @Override
-            public void onClose(Status status, Metadata trailers) {
-              responseListener.onClose(status, trailers);
-            }
-
-            @Override
-            public void onReady() {
-              responseListener.onReady();
-            }
-          }, headers);
+        protected ClientCall<?, ?> delegate() {
+          return rawCall;
         }
 
         @Override
-        public void request(int numMessages) {
-          rawCall.request(numMessages);
-        }
-
-        @Override
-        public void cancel(@Nullable String message, @Nullable Throwable cause) {
-          rawCall.cancel(message, cause);
-        }
-
-        @Override
-        public void halfClose() {
-          rawCall.halfClose();
+        public void start(Listener<RespT> responseListener, Metadata headers) {
+          rawCall.start(createRawListener(method, responseListener), headers);
         }
 
         @Override
         public void sendMessage(ReqT message) {
-          rawCall.sendMessage(method.getRequestMarshaller().stream(message));
-        }
-
-        @Override
-        public boolean isReady() {
-          return rawCall.isReady();
-        }
-
-        @Override
-        public void setMessageCompression(boolean enabled) {
-          rawCall.setMessageCompression(enabled);
-        }
-
-        @Override
-        public Attributes getAttributes() {
-          return rawCall.getAttributes();
+          sendSerializedMessage(rawCall, method, message);
         }
       };
+    }
+
+    private static <ReqT, RespT> ClientCall<ReqT, RespT> interceptRequestOnly(
+        final MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+      MethodDescriptor<InputStream, RespT> rawReqMethod =
+          method.toBuilder(RAW_MARSHALLER, method.getResponseMarshaller()).build();
+      final ClientCall<InputStream, RespT> rawCall = next.newCall(rawReqMethod, callOptions);
+      return new PartialForwardingClientCall<ReqT, RespT>() {
+        @Override
+        protected ClientCall<?, ?> delegate() {
+          return rawCall;
+        }
+
+        @Override
+        public void start(Listener<RespT> responseListener, Metadata headers) {
+          rawCall.start(responseListener, headers);
+        }
+
+        @Override
+        public void sendMessage(ReqT message) {
+          sendSerializedMessage(rawCall, method, message);
+        }
+      };
+    }
+
+    private static <ReqT, RespT> ClientCall<ReqT, RespT> interceptResponseOnly(
+        final MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+      MethodDescriptor<ReqT, InputStream> rawRespMethod =
+          method.toBuilder(method.getRequestMarshaller(), RAW_MARSHALLER).build();
+      final ClientCall<ReqT, InputStream> rawCall = next.newCall(rawRespMethod, callOptions);
+      return new PartialForwardingClientCall<ReqT, RespT>() {
+        @Override
+        protected ClientCall<?, ?> delegate() {
+          return rawCall;
+        }
+
+        @Override
+        public void start(Listener<RespT> responseListener, Metadata headers) {
+          rawCall.start(createRawListener(method, responseListener), headers);
+        }
+
+        @Override
+        public void sendMessage(ReqT message) {
+          rawCall.sendMessage(message);
+        }
+      };
+    }
+
+    private static <RespT> ClientCall.Listener<InputStream> createRawListener(
+        final MethodDescriptor<?, RespT> method,
+        final ClientCall.Listener<RespT> responseListener) {
+      return new ClientCall.Listener<InputStream>() {
+        @Override
+        public void onHeaders(Metadata headers) {
+          responseListener.onHeaders(headers);
+        }
+
+        @Override
+        public void onMessage(InputStream message) {
+          responseListener.onMessage(method.getResponseMarshaller().parse(message));
+        }
+
+        @Override
+        public void onClose(Status status, Metadata trailers) {
+          responseListener.onClose(status, trailers);
+        }
+
+        @Override
+        public void onReady() {
+          responseListener.onReady();
+        }
+      };
+    }
+
+    private static <ReqT> void sendSerializedMessage(
+        ClientCall<InputStream, ?> rawCall,
+        MethodDescriptor<ReqT, ?> method,
+        ReqT message) {
+      ByteString byteString;
+      try {
+        InputStream stream = method.getRequestMarshaller().stream(message);
+        try {
+          byteString = ExternalProcessorUtil.outboundStreamToByteString(stream);
+        } finally {
+          try {
+            stream.close();
+          } catch (IOException ignored) {
+            // ignore
+          }
+        }
+      } catch (IOException | RuntimeException e) {
+        rawCall.cancel("Failed to read message for raw message interceptor", e);
+        return;
+      } catch (Error e) {
+        rawCall.cancel("Client sendMessage() failed with Error", e);
+        throw e;
+      }
+      rawCall.sendMessage(new KnownLengthInputStream(byteString));
+    }
+
+    private abstract static class PartialForwardingClientCall<ReqT, RespT>
+        extends ClientCall<ReqT, RespT> {
+      protected abstract ClientCall<?, ?> delegate();
+
+      @Override
+      public void request(int numMessages) {
+        delegate().request(numMessages);
+      }
+
+      @Override
+      public void cancel(@Nullable String message, @Nullable Throwable cause) {
+        delegate().cancel(message, cause);
+      }
+
+      @Override
+      public void halfClose() {
+        delegate().halfClose();
+      }
+
+      @Override
+      public boolean isReady() {
+        return delegate().isReady();
+      }
+
+      @Override
+      public void setMessageCompression(boolean enabled) {
+        delegate().setMessageCompression(enabled);
+      }
+
+      @Override
+      public Attributes getAttributes() {
+        return delegate().getAttributes();
+      }
     }
   }
 }

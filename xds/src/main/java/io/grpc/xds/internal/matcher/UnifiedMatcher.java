@@ -26,7 +26,7 @@ import javax.annotation.Nullable;
  */
 public abstract class UnifiedMatcher {
 
-  static final int MAX_RECURSION_DEPTH = 16;
+  public static final int MAX_RECURSION_DEPTH = 16;
  
   public abstract MatchResult match(MatchContext context);
 

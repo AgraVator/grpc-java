@@ -190,7 +190,7 @@ final class CompositeFilter implements Filter {
       }
       try {
         Map<TypedExtensionConfig, FilterDelegate> delegates = new LinkedHashMap<>();
-        collectDelegates(matcherProto, delegates, context);
+        collectDelegates(matcherProto, delegates, context, /* matcherDepth= */ 0);
         UnifiedMatcher matcher = UnifiedMatcher.fromProto(
             matcherProto, this::validateActionTypeUrl);
         return ConfigOrError.fromConfig(
@@ -214,7 +214,11 @@ final class CompositeFilter implements Filter {
      * as C-core does, rather than accepted as an always-on_no_match matcher.
      */
     private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context) {
+        FilterConfigParseContext context, int matcherDepth) {
+      if (matcherDepth > UnifiedMatcher.MAX_RECURSION_DEPTH) {
+        throw new IllegalArgumentException(
+            "Matcher tree depth exceeds limit of " + UnifiedMatcher.MAX_RECURSION_DEPTH);
+      }
       if (!matcher.hasMatcherList() && !matcher.hasMatcherTree()) {
         throw new IllegalArgumentException(
             "xds_matcher: no matcher_list or matcher_tree specified");
@@ -222,35 +226,36 @@ final class CompositeFilter implements Filter {
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
           if (fm.hasOnMatch()) {
-            collectOnMatch(fm.getOnMatch(), map, context);
+            collectOnMatch(fm.getOnMatch(), map, context, matcherDepth);
           }
         }
       } else if (matcher.hasMatcherTree()) {
         Matcher.MatcherTree tree = matcher.getMatcherTree();
         if (tree.hasExactMatchMap()) {
           for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
+            collectOnMatch(om, map, context, matcherDepth);
           }
         } else if (tree.hasPrefixMatchMap()) {
           for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
+            collectOnMatch(om, map, context, matcherDepth);
           }
         }
       }
       if (matcher.hasOnNoMatch()) {
-        collectOnMatch(matcher.getOnNoMatch(), map, context);
+        collectOnMatch(matcher.getOnNoMatch(), map, context, matcherDepth);
       }
     }
 
     private void collectOnMatch(Matcher.OnMatch onMatch,
         Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context) {
+        FilterConfigParseContext context,
+        int matcherDepth) {
       if (onMatch.getKeepMatching()) {
         throw new IllegalArgumentException(
             "keep_matching is not permitted anywhere in the composite filter matcher tree");
       }
       if (onMatch.hasMatcher()) {
-        collectDelegates(onMatch.getMatcher(), map, context);
+        collectDelegates(onMatch.getMatcher(), map, context, matcherDepth + 1);
       } else if (onMatch.hasAction()) {
         TypedExtensionConfig action = onMatch.getAction();
         // Keyed by the action message rather than by action.name: `name` is an opaque identifier
@@ -352,7 +357,7 @@ final class CompositeFilter implements Filter {
                 "Nested filter cannot be a terminal filter: " + typeUrl);
           }
           Filter.Provider provider = registryLookup.apply(typeUrl);
-          if (provider == null) {
+          if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
             throw new IllegalArgumentException("Action filter not found: " + typeUrl);
           }
 

@@ -176,7 +176,7 @@ public class CompositeFilterTest {
 
       when(fakeUnsupportedProvider.typeUrls()).thenReturn(new String[]{FAKE_UNSUPPORTED_TYPE_URL});
       when(fakeUnsupportedProvider.isClientFilter()).thenReturn(false);
-      when(fakeUnsupportedProvider.isServerFilter()).thenReturn(false);
+      when(fakeUnsupportedProvider.isServerFilter()).thenReturn(true);
       FilterConfig fakeUnsupportedConfig = mock(FilterConfig.class);
       when(fakeUnsupportedConfig.typeUrl()).thenReturn(FAKE_UNSUPPORTED_TYPE_URL);
       when(fakeUnsupportedProvider.parseFilterConfig(
@@ -1407,6 +1407,8 @@ public class CompositeFilterTest {
 
     @Test
     public void serverInterceptor_unsupportedSideChildFilterFailsWithUnavailable() {
+      when(fakeUnsupportedProvider.isClientFilter()).thenReturn(true);
+      when(fakeUnsupportedProvider.isServerFilter()).thenReturn(false);
       Matcher.OnMatch matchAction = createExecuteAction("unsupported", FAKE_UNSUPPORTED_TYPE_URL);
       Matcher matcher = Matcher.newBuilder()
           .setMatcherList(Matcher.MatcherList.newBuilder()
@@ -3514,6 +3516,36 @@ public class CompositeFilterTest {
       assertThat(noMatcher.errorDetail).isNull();
       assertThat(composite.requiresRequestPayloadAccess(noMatcher.config, null)).isFalse();
       assertThat(composite.requiresResponsePayloadAccess(noMatcher.config, null)).isFalse();
+    }
+
+    @Test
+    public void parseFilterConfig_matcherDepthExceeding16_rejectsBeforeParsingLeafChildFilters() {
+      Matcher leaf = matcherFallingThroughTo(createExecuteAction("leaf", FAKE_TYPE_URL)).build();
+      Matcher current = leaf;
+      for (int i = 0; i < UnifiedMatcher.MAX_RECURSION_DEPTH + 1; i++) {
+        current = matcherFallingThroughTo(
+            Matcher.OnMatch.newBuilder().setMatcher(current).build()).build();
+      }
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(current)), getFilterContext());
+      assertThat(result.config).isNull();
+      assertThat(result.errorDetail).contains("Matcher tree depth exceeds limit of 16");
+      verify(fakeProvider, never()).parseFilterConfig(any(), any());
+    }
+
+    @Test
+    public void parseFilterConfig_flagDisabledNestedFilter_rejectedAtParseTime() {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_EXT_AUTHZ_ON_CLIENT");
+      String extAuthzTypeUrl =
+          "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz";
+      Matcher matcher = matcherFallingThroughTo(
+          executeNestedFilter("disabled_authz", extAuthzTypeUrl)).build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(result.config).isNull();
+      assertThat(result.errorDetail).contains("Action filter not found: " + extAuthzTypeUrl);
     }
 
     /** An ExecuteFilterAction running one nested filter of {@code typeUrl}, with empty config. */

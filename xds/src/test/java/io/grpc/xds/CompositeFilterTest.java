@@ -3440,6 +3440,94 @@ public class CompositeFilterTest {
       call.start(mock(ClientCall.Listener.class), new Metadata());
       assertThat(call.toString()).doesNotContain("delegate=null");
     }
+
+    @Test
+    public void payloadAccess_reportsNestedFiltersOfEffectiveConfigOnly() {
+      String requestTypeUrl = "type.googleapis.com/grpc.test.RequestPayloadFilter";
+      String responseTypeUrl = "type.googleapis.com/grpc.test.ResponsePayloadFilter";
+      StatefulFilter.Provider requestReader =
+          new StatefulFilter.Provider(requestTypeUrl, true, false);
+      StatefulFilter.Provider responseReader =
+          new StatefulFilter.Provider(responseTypeUrl, false, true);
+      Function<String, Filter.Provider> registry = typeUrl -> {
+        if (requestTypeUrl.equals(typeUrl)) {
+          return requestReader;
+        }
+        if (responseTypeUrl.equals(typeUrl)) {
+          return responseReader;
+        }
+        return FilterRegistry.getDefaultRegistry().get(typeUrl);
+      };
+      CompositeFilter.Provider compositeProvider = new CompositeFilter.Provider(registry);
+      Map<String, Filter> instances = new HashMap<>();
+      Function<NamedFilterConfig, Filter> lookup = new Function<NamedFilterConfig, Filter>() {
+        @Override
+        public Filter apply(NamedFilterConfig cfg) {
+          return instances.computeIfAbsent(cfg.filterStateKey(), key ->
+              registry.apply(cfg.filterConfig.typeUrl())
+                  .newInstance(FilterContext.create(cfg.name, metricRecorder, this)));
+        }
+      };
+      CompositeFilter composite = (CompositeFilter) compositeProvider.newInstance(
+          FilterContext.create("composite", metricRecorder, lookup));
+
+      // Only the "read" branch needs the request payload; the other branch skips.
+      Matcher topLevel = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(createHeaderFieldMatcher("x-branch", "read",
+                  executeNestedFilter("request_reader", requestTypeUrl)))
+              .addMatchers(createHeaderFieldMatcher("x-branch", "skip",
+                  Matcher.OnMatch.newBuilder()
+                      .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                          .setName("skip")
+                          .setTypedConfig(Any.pack(SkipFilter.getDefaultInstance())))
+                      .build())))
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+          compositeProvider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(topLevel)), getFilterContext());
+      assertThat(parsed.errorDetail).isNull();
+      assertThat(composite.requiresRequestPayloadAccess(parsed.config, null)).isTrue();
+      assertThat(composite.requiresResponsePayloadAccess(parsed.config, null)).isFalse();
+
+      // A per-route override replaces the whole matcher tree, so only its nested filters count.
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> override =
+          compositeProvider.parseFilterConfigOverride(
+              Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+                  .setXdsMatcher(matcherFallingThroughTo(
+                      executeNestedFilter("response_reader", responseTypeUrl)))
+                  .build()),
+              getFilterContext());
+      assertThat(override.errorDetail).isNull();
+      assertThat(composite.requiresRequestPayloadAccess(parsed.config, override.config)).isFalse();
+      assertThat(composite.requiresResponsePayloadAccess(parsed.config, override.config)).isTrue();
+
+      // With no matcher the composite builds no interceptor, so it needs no payload either.
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> noMatcher =
+          compositeProvider.parseFilterConfig(
+              Any.pack(ExtensionWithMatcher.newBuilder()
+                  .setExtensionConfig(TypedExtensionConfig.newBuilder()
+                      .setName("composite")
+                      .setTypedConfig(Any.pack(Composite.getDefaultInstance())))
+                  .build()),
+              getFilterContext());
+      assertThat(noMatcher.errorDetail).isNull();
+      assertThat(composite.requiresRequestPayloadAccess(noMatcher.config, null)).isFalse();
+      assertThat(composite.requiresResponsePayloadAccess(noMatcher.config, null)).isFalse();
+    }
+
+    /** An ExecuteFilterAction running one nested filter of {@code typeUrl}, with empty config. */
+    private static Matcher.OnMatch executeNestedFilter(String filterName, String typeUrl) {
+      return Matcher.OnMatch.newBuilder()
+          .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+              .setName(filterName + "_action")
+              .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                  .setTypedConfig(TypedExtensionConfig.newBuilder()
+                      .setName(filterName)
+                      .setTypedConfig(Any.newBuilder().setTypeUrl(typeUrl)))
+                  .build())))
+          .build();
+    }
   }
 
   @RunWith(JUnit4.class)

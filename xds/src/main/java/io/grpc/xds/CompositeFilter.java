@@ -57,6 +57,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.logging.Level;
@@ -614,6 +615,42 @@ final class CompositeFilter implements Filter {
         return wrapped.startCall(call, headers);
       }
     };
+  }
+
+  /**
+   * Whether any nested filter the effective config can run reads request payloads. The resolver
+   * installs the raw-message interceptor once per route, outside this filter, so the answer has to
+   * cover every action rather than whichever one a given RPC matches.
+   */
+  @Override
+  public boolean requiresRequestPayloadAccess(
+      FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return anyNestedFilter(config, overrideConfig, (filter, nestedConfig) ->
+        filter.requiresRequestPayloadAccess(nestedConfig, /* overrideConfig= */ null));
+  }
+
+  /** As {@link #requiresRequestPayloadAccess}, for response payloads. */
+  @Override
+  public boolean requiresResponsePayloadAccess(
+      FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return anyNestedFilter(config, overrideConfig, (filter, nestedConfig) ->
+        filter.requiresResponsePayloadAccess(nestedConfig, /* overrideConfig= */ null));
+  }
+
+  private boolean anyNestedFilter(FilterConfig config, @Nullable FilterConfig overrideConfig,
+      BiPredicate<Filter, FilterConfig> predicate) {
+    CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
+    if (effective.matcher == null) {
+      return false;
+    }
+    for (FilterDelegate delegate : effective.delegates.values()) {
+      for (NestedFilter nested : delegate.delegates) {
+        if (predicate.test(nestedFilter(nested.config), nested.config.filterConfig)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**

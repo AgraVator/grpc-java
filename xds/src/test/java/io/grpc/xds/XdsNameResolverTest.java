@@ -3978,4 +3978,33 @@ public class XdsNameResolverTest {
     assertThat(testCall.methodDescriptor.getResponseMarshaller())
         .isNotSameInstanceAs(call1.methodDescriptor.getResponseMarshaller());
   }
+
+  /**
+   * A filter nested in a composite reads payloads through the same raw-message interceptor as a
+   * top-level one, so the composite has to report what its nested filters need.
+   */
+  @Test
+  public void rawMessageClientInterceptor_nestedFilterRequiresRequestPayloadAccess() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      String payloadTypeUrl = "type.googleapis.com/grpc.test.RequestPayloadStatefulFilter";
+      filterStateTestSetupResolverWithComposite(
+          new StatefulFilter.Provider(payloadTypeUrl, true, false));
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+
+      xdsClient.deliverLdsUpdateWithFilters(filterStateTestVhost(), ImmutableList.of(
+          new NamedFilterConfig("composite", parseComposite(compositeAnyWrapping(
+              executeChain(statefulTypedConfig("reader", payloadTypeUrl))))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)));
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(testCall.methodDescriptor.getRequestMarshaller())
+          .isNotSameInstanceAs(call1.methodDescriptor.getRequestMarshaller());
+      assertThat(testCall.methodDescriptor.getResponseMarshaller())
+          .isSameInstanceAs(call1.methodDescriptor.getResponseMarshaller());
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
 }

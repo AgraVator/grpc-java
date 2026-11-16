@@ -716,18 +716,12 @@ final class XdsServerWrapper extends Server {
             continue;
           }
 
-          // Override vhost filter configs with more specific per-route configs.
-          Map<String, FilterConfig> perRouteOverrides = ImmutableMap.<String, FilterConfig>builder()
-              .putAll(virtualHost.filterConfigOverrides())
-              .putAll(route.filterConfigOverrides())
-              .buildKeepingLast();
-
           // Interceptors for this vhost/route combo.
           List<ServerInterceptor> interceptors = new ArrayList<>(filterConfigs.size());
           for (NamedFilterConfig namedFilter : filterConfigs) {
             String name = namedFilter.name;
             FilterConfig config = namedFilter.filterConfig;
-            FilterConfig overrideConfig = perRouteOverrides.get(name);
+            FilterConfig overrideConfig = Filter.lookupOverride(name, virtualHost, route, null);
             String filterKey = namedFilter.filterStateKey();
 
             Filter filter = chainFilters.get(filterKey);

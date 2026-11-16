@@ -28,9 +28,8 @@ import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
@@ -62,8 +61,33 @@ interface Filter extends Closeable {
   }
 
   /**
+   * Returns {@code overrideConfig} when it is of the same config type as {@code config} (replacing
+   * it outright on a route), or {@code config} otherwise.
+   */
+  static FilterConfig effectiveConfig(FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return overrideConfig != null && overrideConfig.getClass() == config.getClass()
+        ? overrideConfig : config;
+  }
+
+  @Nullable
+  static FilterConfig lookupOverride(
+      String name,
+      @Nullable VirtualHost vhost,
+      @Nullable VirtualHost.Route route,
+      @Nullable VirtualHost.Route.RouteAction.ClusterWeight weight) {
+    FilterConfig override = weight != null ? weight.filterConfigOverrides().get(name) : null;
+    if (override == null && route != null) {
+      override = route.filterConfigOverrides().get(name);
+    }
+    return override != null || vhost == null ? override : vhost.filterConfigOverrides().get(name);
+  }
+
+  /**
    * Collects every filter config that needs an instance: the HCM's top-level configs plus the
-   * nested configs of those and of their per-route overrides in {@code vhosts}, recursively.
+   * nested configs of whichever config is effective on each route (or of the HCM configs when no
+   * routes are present). Because a composite per-route override replaces the whole composite filter
+   * rather than a section of it, an overridden composite config contributes no nested filters on
+   * that route.
    */
   static List<NamedFilterConfig> collectAllFilterConfigs(
       @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
@@ -71,47 +95,34 @@ interface Filter extends Closeable {
     if (hcmConfigs == null) {
       return result;
     }
-    Set<String> hcmNames = new HashSet<>();
-    for (NamedFilterConfig config : hcmConfigs) {
-      result.add(config);
-      hcmNames.add(config.name);
-      collectNestedFilterConfigs(config.filterConfig, result);
-    }
+    result.addAll(hcmConfigs);
+    Set<FilterConfig> effectiveConfigs = Collections.newSetFromMap(new IdentityHashMap<>());
     if (vhosts != null) {
       for (VirtualHost vhost : vhosts) {
-        collectNestedFilterConfigs(vhost.filterConfigOverrides(), hcmNames, result);
         for (VirtualHost.Route route : vhost.routes()) {
-          collectNestedFilterConfigs(route.filterConfigOverrides(), hcmNames, result);
-          if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
-            for (VirtualHost.Route.RouteAction.ClusterWeight weight
-                : route.routeAction().weightedClusters()) {
-              collectNestedFilterConfigs(weight.filterConfigOverrides(), hcmNames, result);
+          List<VirtualHost.Route.RouteAction.ClusterWeight> weights =
+              route.routeAction() != null ? route.routeAction().weightedClusters() : null;
+          for (VirtualHost.Route.RouteAction.ClusterWeight weight
+              : weights != null && !weights.isEmpty()
+                  ? weights
+                  : Collections.<VirtualHost.Route.RouteAction.ClusterWeight>singletonList(null)) {
+            for (NamedFilterConfig top : hcmConfigs) {
+              effectiveConfigs.add(effectiveConfig(
+                  top.filterConfig, lookupOverride(top.name, vhost, route, weight)));
             }
           }
         }
       }
     }
-    return result;
-  }
-
-  /**
-   * Collects the nested configs of the overrides for filters in {@code hcmNames}. An override
-   * whose top-level filter is absent is never applied, so nothing is instantiated for it.
-   */
-  static void collectNestedFilterConfigs(Map<String, FilterConfig> overrides,
-      Set<String> hcmNames, List<NamedFilterConfig> result) {
-    for (Map.Entry<String, FilterConfig> override : overrides.entrySet()) {
-      if (hcmNames.contains(override.getKey())) {
-        collectNestedFilterConfigs(override.getValue(), result);
+    if (effectiveConfigs.isEmpty()) {
+      for (NamedFilterConfig top : hcmConfigs) {
+        effectiveConfigs.add(top.filterConfig);
       }
     }
-  }
-
-  static void collectNestedFilterConfigs(FilterConfig config, List<NamedFilterConfig> result) {
-    for (NamedFilterConfig nested : config.nestedFilterConfigs()) {
-      result.add(nested);
-      collectNestedFilterConfigs(nested.filterConfig, result);
+    for (FilterConfig effective : effectiveConfigs) {
+      result.addAll(effective.nestedFilterConfigs());
     }
+    return result;
   }
 
   /**

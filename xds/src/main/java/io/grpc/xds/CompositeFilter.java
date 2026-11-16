@@ -128,39 +128,40 @@ final class CompositeFilter implements Filter {
     @Override
     public ConfigOrError<CompositeFilterConfig> parseFilterConfig(
         Message rawProtoMessage, FilterConfigParseContext context) {
-      if (!(rawProtoMessage instanceof Any)) {
+      ConfigOrError<ExtensionWithMatcher> unpacked =
+          unpackConfigProto(rawProtoMessage, context, ExtensionWithMatcher.class);
+      if (unpacked.errorDetail != null) {
+        return ConfigOrError.fromError(unpacked.errorDetail);
+      }
+      ExtensionWithMatcher proto = unpacked.config;
+      if (!proto.hasExtensionConfig()
+          || !proto.getExtensionConfig().hasTypedConfig()
+          || !proto.getExtensionConfig().getTypedConfig().is(Composite.class)) {
         return ConfigOrError.fromError(
-            "Invalid message type: " + rawProtoMessage.getClass().getName());
+            "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
       }
-      if (context.recursionDepth() >= FilterConfigParseContext.MAX_RECURSION_DEPTH) {
-        return ConfigOrError.fromError("Maximum recursion depth of "
-            + FilterConfigParseContext.MAX_RECURSION_DEPTH + " exceeded");
-      }
-      try {
-        Any any = (Any) rawProtoMessage;
-        if (!any.is(ExtensionWithMatcher.class)) {
-          return ConfigOrError.fromError(
-              "Expected ExtensionWithMatcher but got: " + any.getTypeUrl());
-        }
-        ExtensionWithMatcher proto = any.unpack(ExtensionWithMatcher.class);
-        if (!proto.hasExtensionConfig()
-            || !proto.getExtensionConfig().hasTypedConfig()
-            || !proto.getExtensionConfig().getTypedConfig().is(Composite.class)) {
-          return ConfigOrError.fromError(
-              "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
-        }
-        // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
-        // per-route override may still supply one. A present one must carry a matcher_list or
-        // matcher_tree (A106). The deprecated `matcher` field is ignored, per A103.
-        return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
-      } catch (InvalidProtocolBufferException e) {
-        return ConfigOrError.fromError("Invalid proto: " + e);
-      }
+      // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
+      // per-route override may still supply one. A present one must carry a matcher_list or
+      // matcher_tree (A106). The deprecated `matcher` field is ignored, per A103.
+      return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
     }
 
     @Override
     public ConfigOrError<CompositeFilterConfig> parseFilterConfigOverride(
         Message rawProtoMessage, FilterConfigParseContext context) {
+      ConfigOrError<ExtensionWithMatcherPerRoute> unpacked =
+          unpackConfigProto(rawProtoMessage, context, ExtensionWithMatcherPerRoute.class);
+      if (unpacked.errorDetail != null) {
+        return ConfigOrError.fromError(unpacked.errorDetail);
+      }
+      if (!unpacked.config.hasXdsMatcher()) {
+        return ConfigOrError.fromError("ExtensionWithMatcherPerRoute.xds_matcher must be set");
+      }
+      return parseMatcherConfig(unpacked.config.getXdsMatcher(), context);
+    }
+
+    private static <T extends Message> ConfigOrError<T> unpackConfigProto(
+        Message rawProtoMessage, FilterConfigParseContext context, Class<T> clazz) {
       if (!(rawProtoMessage instanceof Any)) {
         return ConfigOrError.fromError(
             "Invalid message type: " + rawProtoMessage.getClass().getName());
@@ -169,17 +170,13 @@ final class CompositeFilter implements Filter {
         return ConfigOrError.fromError("Maximum recursion depth of "
             + FilterConfigParseContext.MAX_RECURSION_DEPTH + " exceeded");
       }
+      Any any = (Any) rawProtoMessage;
+      if (!any.is(clazz)) {
+        return ConfigOrError.fromError(
+            "Expected " + clazz.getSimpleName() + " but got: " + any.getTypeUrl());
+      }
       try {
-        Any any = (Any) rawProtoMessage;
-        if (!any.is(ExtensionWithMatcherPerRoute.class)) {
-          return ConfigOrError.fromError(
-              "Expected ExtensionWithMatcherPerRoute but got: " + any.getTypeUrl());
-        }
-        ExtensionWithMatcherPerRoute proto = any.unpack(ExtensionWithMatcherPerRoute.class);
-        if (!proto.hasXdsMatcher()) {
-          return ConfigOrError.fromError("ExtensionWithMatcherPerRoute.xds_matcher must be set");
-        }
-        return parseMatcherConfig(proto.getXdsMatcher(), context);
+        return ConfigOrError.fromConfig(any.unpack(clazz));
       } catch (InvalidProtocolBufferException e) {
         return ConfigOrError.fromError("Invalid proto: " + e);
       }
@@ -415,13 +412,14 @@ final class CompositeFilter implements Filter {
       return TYPE_URL_EXTENSION_WITH_MATCHER;
     }
 
-    /** The direct children; the collector recurses into each child's own nested configs. */
+    /** Every nested filter config in this composite filter tree, recursively. */
     @Override
     public List<NamedFilterConfig> nestedFilterConfigs() {
       List<NamedFilterConfig> nested = new ArrayList<>();
       for (FilterDelegate delegate : delegates.values()) {
         for (NestedFilter nestedFilter : delegate.delegates) {
           nested.add(nestedFilter.config);
+          nested.addAll(nestedFilter.config.filterConfig.nestedFilterConfigs());
         }
       }
       return nested;
@@ -526,24 +524,20 @@ final class CompositeFilter implements Filter {
   }
 
   /**
-   * A {@link FilterDelegate} whose nested filter interceptors have already been built, at
-   * configuration time.
+   * A {@link FilterDelegate} whose nested filter interceptors (or side-support failure status) have
+   * already been built at configuration time.
    *
-   * <p>Per RPC we only need to evaluate {@link FilterDelegate#shouldExecute} and reuse
-   * {@link #interceptors}. If a nested filter is not supported on the side being built,
-   * {@link #error} holds the status to fail matching RPCs with; the error is deliberately
-   * deferred to RPC time so that a delegate which is never sampled in never fails anything.
+   * <p>Per RPC we only need to evaluate {@link FilterDelegate#shouldExecute} and reuse the
+   * pre-built {@code interceptors} result; a side-support error is deliberately deferred to RPC
+   * time so that a delegate which is never sampled in never fails anything.
    */
-  static final class ResolvedDelegate<I> {
+  private static final class ResolvedDelegate<I> {
     final FilterDelegate delegate;
-    final List<I> interceptors;
-    @Nullable
-    final Status error;
+    final StatusOr<List<I>> interceptors;
 
-    ResolvedDelegate(FilterDelegate delegate, List<I> interceptors, @Nullable Status error) {
+    ResolvedDelegate(FilterDelegate delegate, StatusOr<List<I>> interceptors) {
       this.delegate = delegate;
-      this.interceptors = Collections.unmodifiableList(interceptors);
-      this.error = error;
+      this.interceptors = interceptors;
     }
   }
 
@@ -551,8 +545,9 @@ final class CompositeFilter implements Filter {
   public ClientInterceptor buildClientInterceptor(FilterConfig config,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
     Preconditions.checkNotNull(config, "config");
-    CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
-    if (effective == null || effective.matcher == null) {
+    CompositeFilterConfig effective =
+        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
+    if (effective.matcher == null) {
       return null;
     }
 
@@ -579,8 +574,9 @@ final class CompositeFilter implements Filter {
   public ServerInterceptor buildServerInterceptor(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
     Preconditions.checkNotNull(config, "config");
-    CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
-    if (effective == null || effective.matcher == null) {
+    CompositeFilterConfig effective =
+        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
+    if (effective.matcher == null) {
       return null;
     }
 
@@ -639,7 +635,8 @@ final class CompositeFilter implements Filter {
 
   private boolean anyNestedFilter(FilterConfig config, @Nullable FilterConfig overrideConfig,
       BiPredicate<Filter, FilterConfig> predicate) {
-    CompositeFilterConfig effective = getEffectiveConfig(config, overrideConfig);
+    CompositeFilterConfig effective =
+        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
     if (effective.matcher == null) {
       return false;
     }
@@ -683,9 +680,9 @@ final class CompositeFilter implements Filter {
       BiFunction<Filter, FilterConfig, I> buildInterceptor) {
     for (NestedFilter nested : delegate.delegates) {
       if (!isSupportedOnSide.test(nested.provider)) {
-        return new ResolvedDelegate<>(delegate, Collections.emptyList(),
+        return new ResolvedDelegate<>(delegate, StatusOr.fromStatus(
             Status.UNAVAILABLE.withDescription(
-                "Filter " + nested.config.name + " is not supported on " + sideName + " side"));
+                "Filter " + nested.config.name + " is not supported on " + sideName + " side")));
       }
     }
     List<I> interceptors = new ArrayList<>(delegate.delegates.size());
@@ -696,14 +693,15 @@ final class CompositeFilter implements Filter {
         interceptors.add(interceptor);
       }
     }
-    return new ResolvedDelegate<>(delegate, interceptors, /* error= */ null);
+    return new ResolvedDelegate<>(
+        delegate, StatusOr.fromValue(Collections.unmodifiableList(interceptors)));
   }
 
   /**
    * The nested filter instance for {@code nested}, obtained from the registry that owns every
    * filter instance of this HCM. The registry creates it from {@link
    * CompositeFilterConfig#nestedFilterConfigs()}, reuses it across updates so that state such as
-   * a cache or a side channel survives them, and closes it once no config declares it.
+   * a cache or a side channel survives them, and closes it once no effective config uses it.
    */
   private Filter nestedFilter(NamedFilterConfig nested) {
     Function<NamedFilterConfig, Filter> lookup = Preconditions.checkNotNull(filterLookup,
@@ -711,17 +709,6 @@ final class CompositeFilter implements Filter {
             + "must be created by the xDS resolver/server (3-arg FilterContext.create)");
     return Preconditions.checkNotNull(lookup.apply(nested),
         "No filter instance for nested filter %s", nested.filterStateKey());
-  }
-
-  private static CompositeFilterConfig getEffectiveConfig(
-      FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    // A per-route override replaces the top-level config outright, per A103. Only the top-level
-    // matcher may be absent; callers then build no interceptor, the no-op passthrough. An
-    // override of another filter's type is ignored, as C-core's GetOverrideConfig does.
-    if (overrideConfig instanceof CompositeFilterConfig) {
-      return (CompositeFilterConfig) overrideConfig;
-    }
-    return (CompositeFilterConfig) config;
   }
 
   /**
@@ -773,14 +760,11 @@ final class CompositeFilter implements Filter {
           fullMethodName);
       return StatusOr.fromValue(Collections.emptyList());
     }
-    if (resolved.error != null) {
-      return StatusOr.fromStatus(resolved.error);
-    }
-    if (logger.isLoggable(Level.FINE)) {
+    if (resolved.interceptors.hasValue() && logger.isLoggable(Level.FINE)) {
       logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
-          new Object[] {resolved.interceptors.size(), fullMethodName});
+          new Object[] {resolved.interceptors.getValue().size(), fullMethodName});
     }
-    return StatusOr.fromValue(resolved.interceptors);
+    return resolved.interceptors;
   }
 
   /**

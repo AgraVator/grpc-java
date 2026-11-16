@@ -2129,6 +2129,73 @@ public class XdsServerWrapperTest {
   }
 
   /**
+   * Because an RDS override replaces a composite filter outright rather than patching a section of
+   * it, overriding "c" on every route closes the HCM composite's own nested filter, a route
+   * override shadows a virtual-host override without instantiating the virtual-host override's
+   * nested filter, and a composite override attached to a non-composite top-level filter is
+   * ignored.
+   */
+  @Test
+  public void filterState_wholeCompositeOverride_closesShadowedAndIgnoresMismatchedType()
+      throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      CompositeFilter.CompositeFilterConfig nestingA =
+          parseComposite(compositeAnyWrapping(executeStatefulChain("a")));
+
+      xdsClient.deliverLdsUpdate(
+          createFilterChain("chain_a", createHcmForRds(rdsName, ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+              new NamedFilterConfig("c", nestingA),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))),
+          null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+
+      Route baseRoute = filterStateTestRoute(
+          ImmutableMap.of(STATEFUL_1, parseCompositeOverride(executeStatefulChain("ignored"))));
+
+      // RDS 1: composite override under non-composite STATEFUL_1 is ignored; "c" runs "a".
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(baseRoute), NO_FILTER_OVERRIDES));
+      verifyServerStarted(serverStart);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
+      StatefulFilter nestedA = statefulProvider.getAllInstances().get(1);
+
+      // RDS 2: vhost overrides "c" with "v", but the sole route overrides "c" with "r".
+      // Both "a" (HCM) and "v" (vhost) are completely shadowed; "a" closes and "v" never exists.
+      Route routeOverridingC = filterStateTestRoute(
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("r"))));
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(routeOverridingC),
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", "r").inOrder();
+      assertThat(nestedA.isShutdown()).isTrue();
+      StatefulFilter nestedR = statefulProvider.getAllInstances().get(2);
+      assertThat(nestedR.isShutdown()).isFalse();
+
+      // RDS 3: route override removed, exposing the vhost override "v"; "r" closes.
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(baseRoute),
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", "r", "v").inOrder();
+      assertThat(nestedR.isShutdown()).isTrue();
+      assertThat(statefulProvider.getAllInstances().get(3).isShutdown()).isFalse();
+      assertThat(severeLogs).isEmpty();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
    * While a new chain's RDS is pending, the selector still holds the previous LDS's chains, and a
    * re-sent RDS rebuilds their routing configs with the previous HCM's filter set. Such a stale
    * rebuild must not leave the chain without a filter the new LDS added, or the selector update

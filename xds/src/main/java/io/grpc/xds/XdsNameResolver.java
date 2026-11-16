@@ -899,20 +899,14 @@ final class XdsNameResolver extends NameResolver {
         return new PassthroughClientInterceptor();
       }
 
-      Map<String, FilterConfig> selectedOverrideConfigs =
-          new HashMap<>(virtualHost.filterConfigOverrides());
-      selectedOverrideConfigs.putAll(route.filterConfigOverrides());
-      if (weightedCluster != null) {
-        selectedOverrideConfigs.putAll(weightedCluster.filterConfigOverrides());
-      }
-
       boolean anyFilterRequiresRequestPayload = false;
       boolean anyFilterRequiresResponsePayload = false;
       ImmutableList.Builder<ClientInterceptor> filterInterceptors = ImmutableList.builder();
       for (NamedFilterConfig namedFilter : filterConfigs) {
         String name = namedFilter.name;
         FilterConfig config = namedFilter.filterConfig;
-        FilterConfig overrideConfig = selectedOverrideConfigs.get(name);
+        FilterConfig overrideConfig =
+            Filter.lookupOverride(name, virtualHost, route, weightedCluster);
         String filterKey = namedFilter.filterStateKey();
 
         Filter filter = activeFilters.get(filterKey);

@@ -22,13 +22,13 @@ import com.github.xds.type.matcher.v3.Matcher;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute;
 import io.envoyproxy.envoy.extensions.filters.common.matcher.action.v3.SkipFilter;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
 import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
 import io.envoyproxy.envoy.type.v3.FractionalPercent;
 import io.grpc.CallOptions;
@@ -36,7 +36,6 @@ import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
 import io.grpc.ClientInterceptors;
-import io.grpc.Context;
 import io.grpc.ForwardingClientCall;
 import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
@@ -56,7 +55,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
@@ -66,11 +64,14 @@ import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 /**
- * Composite HTTP filter implementation per gRFC A103.
+ * The composite filter of gRFC A103: a matcher tree that selects which nested filters to run for
+ * each RPC.
  *
- * <p>Holds no per-instance state of its own: nested filter instances live in the resolver's or
- * server's active-filter map keyed by {@link NamedFilterConfig#filterStateKey()}, declared via
- * {@link FilterConfig#nestedFilterConfigs()} and resolved via {@link FilterContext#filterLookup()}.
+ * <p>The composite holds no instance state of its own. Nested filter instances are owned by the
+ * same registry in the resolver or server that owns the top-level filters, keyed by filter name
+ * and type. Filters with the same name and type share one instance, whether nested or top-level.
+ * The config declares them through {@link FilterConfig#nestedFilterConfigs()} and the composite
+ * obtains them through {@link FilterContext#filterLookup()} when building interceptors.
  */
 final class CompositeFilter implements Filter {
 
@@ -78,15 +79,7 @@ final class CompositeFilter implements Filter {
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcher";
   static final String TYPE_URL_EXTENSION_WITH_MATCHER_PER_ROUTE =
       "type.googleapis.com/envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute";
-  static final String TYPE_URL_COMPOSITE =
-      "type.googleapis.com/envoy.extensions.filters.http.composite.v3.Composite";
-  private static final String TYPE_URL_TYPED_STRUCT_UDPA =
-      "type.googleapis.com/udpa.type.v1.TypedStruct";
-  private static final String TYPE_URL_TYPED_STRUCT_XDS =
-      "type.googleapis.com/xds.type.v3.TypedStruct";
   private static final Logger logger = Logger.getLogger(CompositeFilter.class.getName());
-  private static final FilterDelegate SKIP_DELEGATE =
-      new FilterDelegate(Collections.emptyList(), null);
 
   @Nullable
   private final Function<NamedFilterConfig, Filter> filterLookup;
@@ -140,30 +133,16 @@ final class CompositeFilter implements Filter {
         return ConfigOrError.fromError(unpacked.errorDetail);
       }
       ExtensionWithMatcher proto = unpacked.config;
-      try {
-        if (!proto.hasExtensionConfig()
-            || !proto.getExtensionConfig().hasTypedConfig()
-            || !TYPE_URL_COMPOSITE.equals(
-                unwrapTypedStructTypeUrl(proto.getExtensionConfig().getTypedConfig()))) {
-          return ConfigOrError.fromError(
-              "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
-        }
-      } catch (InvalidProtocolBufferException e) {
-        return ConfigOrError.fromError("Invalid proto: " + e);
+      if (!proto.hasExtensionConfig()
+          || !proto.getExtensionConfig().hasTypedConfig()
+          || !proto.getExtensionConfig().getTypedConfig().is(Composite.class)) {
+        return ConfigOrError.fromError(
+            "ExtensionWithMatcher.extension_config must contain an empty Composite proto");
       }
-      // Missing xds_matcher is a no-op passthrough; deprecated `matcher` is ignored per A103.
+      // A missing xds_matcher is permitted here and makes the filter a no-op passthrough; a
+      // per-route override may still supply one. A present one must carry a matcher_list or
+      // matcher_tree (A106). The deprecated `matcher` field is ignored, per A103.
       return parseMatcherConfig(proto.hasXdsMatcher() ? proto.getXdsMatcher() : null, context);
-    }
-
-    private static String unwrapTypedStructTypeUrl(Any any) throws InvalidProtocolBufferException {
-      String typeUrl = any.getTypeUrl();
-      if (TYPE_URL_TYPED_STRUCT_UDPA.equals(typeUrl)) {
-        return any.unpack(TypedStruct.class).getTypeUrl();
-      }
-      if (TYPE_URL_TYPED_STRUCT_XDS.equals(typeUrl)) {
-        return any.unpack(com.github.xds.type.v3.TypedStruct.class).getTypeUrl();
-      }
-      return typeUrl;
     }
 
     @Override
@@ -209,10 +188,10 @@ final class CompositeFilter implements Filter {
             new CompositeFilterConfig(null, Collections.emptyMap(), /* matcherProto= */ null));
       }
       try {
+        // Compile the matcher first so its recursion depth check runs before parsing child filters.
+        UnifiedMatcher matcher = UnifiedMatcher.fromProto(matcherProto);
         Map<TypedExtensionConfig, FilterDelegate> delegates = new LinkedHashMap<>();
-        collectDelegates(matcherProto, delegates, context, /* matcherDepth= */ 0);
-        UnifiedMatcher matcher = UnifiedMatcher.fromProto(
-            matcherProto, this::validateActionTypeUrl);
+        collectDelegates(matcherProto, delegates, context);
         return ConfigOrError.fromConfig(
             new CompositeFilterConfig(matcher, delegates, matcherProto));
       } catch (Exception e) {
@@ -220,25 +199,9 @@ final class CompositeFilter implements Filter {
       }
     }
 
-    private boolean validateActionTypeUrl(String typeUrl) {
-      return "type.googleapis.com/envoy.extensions.filters.common.matcher.action.v3.SkipFilter"
-          .equals(typeUrl)
-          || "type.googleapis.com/envoy.extensions.filters.http.composite.v3.ExecuteFilterAction"
-          .equals(typeUrl);
-    }
-
-    /**
-     * Walks {@code matcher} and every matcher nested in its on_match branches, parsing each
-     * action into {@code map}. A106 requires every Matcher to have a matcher_list or a
-     * matcher_tree; one with neither (an empty one, or one with only on_no_match) is rejected,
-     * as C-core does, rather than accepted as an always-on_no_match matcher.
-     */
-    private void collectDelegates(Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context, int matcherDepth) {
-      if (matcherDepth > UnifiedMatcher.MAX_RECURSION_DEPTH) {
-        throw new IllegalArgumentException(
-            "Matcher tree depth exceeds limit of " + UnifiedMatcher.MAX_RECURSION_DEPTH);
-      }
+    private void collectDelegates(
+        Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
+        FilterConfigParseContext context) {
       if (!matcher.hasMatcherList() && !matcher.hasMatcherTree()) {
         throw new IllegalArgumentException(
             "xds_matcher: no matcher_list or matcher_tree specified");
@@ -246,140 +209,125 @@ final class CompositeFilter implements Filter {
       if (matcher.hasMatcherList()) {
         for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
           if (fm.hasOnMatch()) {
-            collectOnMatch(fm.getOnMatch(), map, context, matcherDepth);
+            collectOnMatch(fm.getOnMatch(), map, context);
           }
         }
       } else if (matcher.hasMatcherTree()) {
         Matcher.MatcherTree tree = matcher.getMatcherTree();
         if (tree.hasExactMatchMap()) {
           for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context, matcherDepth);
+            collectOnMatch(om, map, context);
           }
         } else if (tree.hasPrefixMatchMap()) {
           for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context, matcherDepth);
+            collectOnMatch(om, map, context);
           }
         }
       }
       if (matcher.hasOnNoMatch()) {
-        collectOnMatch(matcher.getOnNoMatch(), map, context, matcherDepth);
+        collectOnMatch(matcher.getOnNoMatch(), map, context);
       }
     }
 
-    private void collectOnMatch(Matcher.OnMatch onMatch,
+    private void collectOnMatch(
+        Matcher.OnMatch onMatch,
         Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context,
-        int matcherDepth) {
+        FilterConfigParseContext context) {
       if (onMatch.getKeepMatching()) {
         throw new IllegalArgumentException(
             "keep_matching is not permitted anywhere in the composite filter matcher tree");
       }
       if (onMatch.hasMatcher()) {
-        collectDelegates(onMatch.getMatcher(), map, context, matcherDepth + 1);
+        collectDelegates(onMatch.getMatcher(), map, context);
       } else if (onMatch.hasAction()) {
-        TypedExtensionConfig action = onMatch.getAction();
-        // Keyed by the action message rather than by action.name: `name` is an opaque identifier
-        // that "is not used to select the extension", and nothing constrains it to be unique
-        // across actions, so two distinct actions may legitimately share one. Identical actions
-        // collapse to a single entry, which is intended: the same action reached from several
-        // matcher branches is one delegate, parsed once.
-        if (!map.containsKey(action)) {
-          map.put(action, createFilterDelegate(action, context));
-        }
+        // Keyed by the action proto (not action.name, which is not unique across actions).
+        map.computeIfAbsent(onMatch.getAction(), action -> createFilterDelegate(action, context));
       }
     }
 
-    // Both side predicates delegate here rather than parseFilterConfig checking the flag, so that
-    // a disabled composite filter looks like any other filter this build does not support. That
-    // distinction matters: XdsListenerResource honours the http_filter's is_optional flag when a
-    // filter is unsupported, but treats a parse error as fatal, so checking the flag while
-    // parsing would NACK the whole listener over an optional filter.
     private boolean isSupported() {
       return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", false);
     }
 
-    private FilterDelegate createFilterDelegate(TypedExtensionConfig config,
-        FilterConfigParseContext context) {
+    private FilterDelegate createFilterDelegate(
+        TypedExtensionConfig config, FilterConfigParseContext context) {
+      Any actionAny = config.getTypedConfig();
+      if (actionAny.is(SkipFilter.class)) {
+        try {
+          SkipFilter unused = actionAny.unpack(SkipFilter.class);
+        } catch (InvalidProtocolBufferException e) {
+          throw new IllegalArgumentException("Could not parse SkipFilter action", e);
+        }
+        return new FilterDelegate(Collections.emptyList(), null);
+      }
+      if (!actionAny.is(ExecuteFilterAction.class)) {
+        throw new IllegalArgumentException(
+            "Expected ExecuteFilterAction or SkipFilter but got: " + actionAny.getTypeUrl());
+      }
+      ExecuteFilterAction executeAction;
       try {
-        Any actionAny = config.getTypedConfig();
-        if (actionAny.is(SkipFilter.class)) {
-          try {
-            SkipFilter unused = actionAny.unpack(SkipFilter.class);
-          } catch (InvalidProtocolBufferException e) {
-            throw new IllegalArgumentException("Could not parse SkipFilter action", e);
-          }
-          return SKIP_DELEGATE;
-        }
-        if (!actionAny.is(ExecuteFilterAction.class)) {
-          throw new IllegalArgumentException(
-              "Expected ExecuteFilterAction or SkipFilter but got: " + actionAny.getTypeUrl());
-        }
-        ExecuteFilterAction executeAction = actionAny.unpack(ExecuteFilterAction.class);
-        FractionalPercent samplePercent = null;
-        if (executeAction.hasSamplePercent()) {
-          if (!executeAction.getSamplePercent().hasDefaultValue()) {
-            throw new IllegalArgumentException(
-                "ExecuteFilterAction.sample_percent.default_value: field not set");
-          }
-          samplePercent = executeAction.getSamplePercent().getDefaultValue();
-        }
-        List<io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> childConfigs;
-        if (executeAction.hasFilterChain()) {
-          childConfigs = executeAction.getFilterChain().getTypedConfigList();
-        } else if (executeAction.hasTypedConfig()) {
-          childConfigs = Collections.singletonList(executeAction.getTypedConfig());
-        } else {
-          throw new IllegalArgumentException(
-              "ExecuteFilterAction must specify either typed_config or filter_chain");
-        }
-        List<NestedFilter> delegates = new ArrayList<>(childConfigs.size());
-        for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
-            : childConfigs) {
-          Any childAny = childFilterConfig.getTypedConfig();
-          String typeUrl = childAny.getTypeUrl();
-          Message rawConfig = childAny;
-          try {
-            if (TYPE_URL_TYPED_STRUCT_UDPA.equals(typeUrl)) {
-              TypedStruct typedStruct = childAny.unpack(TypedStruct.class);
-              typeUrl = typedStruct.getTypeUrl();
-              rawConfig = typedStruct.getValue();
-            } else if (TYPE_URL_TYPED_STRUCT_XDS.equals(typeUrl)) {
-              com.github.xds.type.v3.TypedStruct typedStruct =
-                  childAny.unpack(com.github.xds.type.v3.TypedStruct.class);
-              typeUrl = typedStruct.getTypeUrl();
-              rawConfig = typedStruct.getValue();
-            }
-          } catch (InvalidProtocolBufferException e) {
-            throw new IllegalArgumentException("Failed to unpack TypedStruct", e);
-          }
-          if (RouterFilter.TYPE_URL.equals(typeUrl)) {
-            throw new IllegalArgumentException(
-                "Nested filter cannot be a terminal filter: " + typeUrl);
-          }
-          Filter.Provider provider = registryLookup.apply(typeUrl);
-          if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
-            throw new IllegalArgumentException("Action filter not found: " + typeUrl);
-          }
-
-          Filter.FilterConfigParseContext childContext =
-              context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
-          ConfigOrError<? extends FilterConfig> parsed =
-              provider.parseFilterConfig(rawConfig, childContext);
-          if (parsed.errorDetail != null) {
-            throw new IllegalArgumentException(
-                "Failed to parse child filter: " + parsed.errorDetail);
-          }
-          if (parsed.config == RouterFilter.ROUTER_CONFIG) {
-            throw new IllegalArgumentException(
-                "Nested filter cannot be a terminal filter: " + typeUrl);
-          }
-          delegates.add(new NestedFilter(
-              new NamedFilterConfig(childFilterConfig.getName(), parsed.config), provider));
-        }
-        return new FilterDelegate(delegates, samplePercent);
+        executeAction = actionAny.unpack(ExecuteFilterAction.class);
       } catch (InvalidProtocolBufferException e) {
         throw new IllegalArgumentException("Could not parse ExecuteFilterAction", e);
       }
+      FractionalPercent samplePercent = null;
+      if (executeAction.hasSamplePercent()) {
+        if (!executeAction.getSamplePercent().hasDefaultValue()) {
+          throw new IllegalArgumentException(
+              "ExecuteFilterAction.sample_percent.default_value: field not set");
+        }
+        samplePercent = executeAction.getSamplePercent().getDefaultValue();
+      }
+      List<io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig> childConfigs;
+      if (executeAction.hasFilterChain()) {
+        childConfigs = executeAction.getFilterChain().getTypedConfigList();
+      } else if (executeAction.hasTypedConfig()) {
+        childConfigs = Collections.singletonList(executeAction.getTypedConfig());
+      } else {
+        throw new IllegalArgumentException(
+            "ExecuteFilterAction must specify either typed_config or filter_chain");
+      }
+      List<NestedFilter> delegates = new ArrayList<>(childConfigs.size());
+      for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
+          : childConfigs) {
+        Any childAny = childFilterConfig.getTypedConfig();
+        String typeUrl = childAny.getTypeUrl();
+        Message rawConfig = childAny;
+        try {
+          if (childAny.is(TypedStruct.class)) {
+            TypedStruct typedStruct = childAny.unpack(TypedStruct.class);
+            typeUrl = typedStruct.getTypeUrl();
+            rawConfig = typedStruct.getValue();
+          } else if (childAny.is(com.github.xds.type.v3.TypedStruct.class)) {
+            com.github.xds.type.v3.TypedStruct typedStruct =
+                childAny.unpack(com.github.xds.type.v3.TypedStruct.class);
+            typeUrl = typedStruct.getTypeUrl();
+            rawConfig = typedStruct.getValue();
+          }
+        } catch (InvalidProtocolBufferException e) {
+          throw new IllegalArgumentException("Failed to unpack TypedStruct", e);
+        }
+        Filter.Provider provider = registryLookup.apply(typeUrl);
+        if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
+          throw new IllegalArgumentException("Action filter not found: " + typeUrl);
+        }
+
+        Filter.FilterConfigParseContext childContext =
+            context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
+        ConfigOrError<? extends FilterConfig> parsed =
+            provider.parseFilterConfig(rawConfig, childContext);
+        if (parsed.errorDetail != null) {
+          throw new IllegalArgumentException(
+              "Failed to parse child filter: " + parsed.errorDetail);
+        }
+        if (parsed.config == RouterFilter.ROUTER_CONFIG) {
+          throw new IllegalArgumentException(
+              "Nested filter cannot be a terminal filter: " + typeUrl);
+        }
+        delegates.add(new NestedFilter(
+            new NamedFilterConfig(childFilterConfig.getName(), parsed.config), provider));
+      }
+      return new FilterDelegate(delegates, samplePercent);
     }
   }
 
@@ -387,26 +335,13 @@ final class CompositeFilter implements Filter {
     @Nullable
     final UnifiedMatcher matcher;
     final Map<TypedExtensionConfig, FilterDelegate> delegates;
-    /**
-     * The proto the other two fields were parsed from, retained solely to give this config value
-     * equality. Neither {@link UnifiedMatcher} nor {@link FilterDelegate} implements
-     * {@code equals}, but parsing is deterministic, so two configs built from equal protos are
-     * interchangeable.
-     */
     @Nullable
     private final Matcher matcherProto;
-
-    @VisibleForTesting
-    CompositeFilterConfig(@Nullable UnifiedMatcher matcher,
-        Map<TypedExtensionConfig, FilterDelegate> delegates) {
-      this(matcher, delegates, /* matcherProto= */ null);
-    }
 
     CompositeFilterConfig(@Nullable UnifiedMatcher matcher,
         Map<TypedExtensionConfig, FilterDelegate> delegates, @Nullable Matcher matcherProto) {
       this.matcher = matcher;
-      this.delegates = delegates != null
-          ? Collections.unmodifiableMap(delegates) : Collections.emptyMap();
+      this.delegates = Collections.unmodifiableMap(delegates);
       this.matcherProto = matcherProto;
     }
 
@@ -415,7 +350,6 @@ final class CompositeFilter implements Filter {
       return TYPE_URL_EXTENSION_WITH_MATCHER;
     }
 
-    /** Every nested filter config in this composite filter tree, recursively. */
     @Override
     public List<NamedFilterConfig> nestedFilterConfigs() {
       List<NamedFilterConfig> nested = new ArrayList<>();
@@ -428,11 +362,6 @@ final class CompositeFilter implements Filter {
       return nested;
     }
 
-    /**
-     * Value equality, so that a control plane re-sending an unchanged resource does not look like
-     * a configuration change. The xDS client compares parsed resources to decide whether to notify
-     * watchers, and identity semantics here would wake every watcher on every LDS refresh.
-     */
     @Override
     public boolean equals(Object o) {
       if (this == o) {
@@ -441,18 +370,12 @@ final class CompositeFilter implements Filter {
       if (!(o instanceof CompositeFilterConfig)) {
         return false;
       }
-      CompositeFilterConfig that = (CompositeFilterConfig) o;
-      if (matcherProto != null || that.matcherProto != null) {
-        return Objects.equals(matcherProto, that.matcherProto);
-      }
-      // Neither was parsed from a proto: either both are the no-matcher passthrough, whose
-      // matcher is null, or both were hand-built. Fall back to matcher identity.
-      return matcher == that.matcher;
+      return Objects.equals(matcherProto, ((CompositeFilterConfig) o).matcherProto);
     }
 
     @Override
     public int hashCode() {
-      return matcherProto != null ? matcherProto.hashCode() : System.identityHashCode(matcher);
+      return Objects.hashCode(matcherProto);
     }
 
     @Override
@@ -496,8 +419,6 @@ final class CompositeFilter implements Filter {
           break;
         case UNRECOGNIZED:
         default:
-          // Guessing here would silently widen the sample: a numerator meant as a fraction of a
-          // denominator we do not know would be read as a percentage. Reject the config instead.
           throw new IllegalArgumentException(
               "Unknown denominator type: " + samplePercent.getDenominator());
       }
@@ -526,14 +447,6 @@ final class CompositeFilter implements Filter {
     }
   }
 
-  /**
-   * A {@link FilterDelegate} whose nested filter interceptors (or side-support failure status) have
-   * already been built at configuration time.
-   *
-   * <p>Per RPC we only need to evaluate {@link FilterDelegate#shouldExecute} and reuse the
-   * pre-built {@code interceptors} result; a side-support error is deliberately deferred to RPC
-   * time so that a delegate which is never sampled in never fails anything.
-   */
   private static final class ResolvedDelegate<I> {
     final FilterDelegate delegate;
     final StatusOr<List<I>> interceptors;
@@ -614,10 +527,6 @@ final class CompositeFilter implements Filter {
     };
   }
 
-  /**
-   * Whether any client-supported nested filter chain in the effective config reads request
-   * payloads, so {@code XdsNameResolver} can install {@code RawMessageClientInterceptor} per route.
-   */
   @Override
   public boolean requiresRequestPayloadAccess(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
@@ -625,7 +534,6 @@ final class CompositeFilter implements Filter {
         filter.requiresRequestPayloadAccess(nestedConfig, /* overrideConfig= */ null));
   }
 
-  /** As {@link #requiresRequestPayloadAccess}, for response payloads. */
   @Override
   public boolean requiresResponsePayloadAccess(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
@@ -641,14 +549,7 @@ final class CompositeFilter implements Filter {
       return false;
     }
     for (FilterDelegate delegate : effective.delegates.values()) {
-      boolean supportedOnClient = true;
-      for (NestedFilter nested : delegate.delegates) {
-        if (!nested.provider.isClientFilter()) {
-          supportedOnClient = false;
-          break;
-        }
-      }
-      if (!supportedOnClient) {
+      if (unsupportedSideError(delegate, /* isServer= */ false) != null) {
         continue;
       }
       for (NestedFilter nested : delegate.delegates) {
@@ -660,58 +561,54 @@ final class CompositeFilter implements Filter {
     return false;
   }
 
-  /**
-   * Builds nested interceptors once per configuration update, checking side support across the
-   * entire chain before building any child interceptor.
-   */
   private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> buildResolvedDelegates(
       CompositeFilterConfig effective,
       boolean isServer,
       BiFunction<Filter, FilterConfig, I> buildInterceptor) {
     Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new LinkedHashMap<>();
     for (Map.Entry<TypedExtensionConfig, FilterDelegate> entry : effective.delegates.entrySet()) {
-      FilterDelegate delegate = entry.getValue();
-      Status unsupportedError = null;
-      for (NestedFilter nested : delegate.delegates) {
-        boolean supported =
-            isServer ? nested.provider.isServerFilter() : nested.provider.isClientFilter();
-        if (!supported) {
-          String label = nested.config.name.isEmpty()
-              ? nested.config.filterConfig.typeUrl() : nested.config.name;
-          unsupportedError = Status.UNAVAILABLE.withDescription(
-              "Filter " + label + " is not supported on "
-                  + (isServer ? "server" : "client") + " side");
-          break;
-        }
-      }
-      if (unsupportedError != null) {
-        resolved.put(
-            entry.getKey(),
-            new ResolvedDelegate<>(delegate, StatusOr.fromStatus(unsupportedError)));
-        continue;
-      }
-      List<I> interceptors = new ArrayList<>(delegate.delegates.size());
-      for (NestedFilter nested : delegate.delegates) {
-        I interceptor =
-            buildInterceptor.apply(nestedFilter(nested.config), nested.config.filterConfig);
-        if (interceptor != null) {
-          interceptors.add(interceptor);
-        }
-      }
       resolved.put(
-          entry.getKey(),
-          new ResolvedDelegate<>(
-              delegate, StatusOr.fromValue(Collections.unmodifiableList(interceptors))));
+          entry.getKey(), resolveDelegate(entry.getValue(), isServer, buildInterceptor));
     }
     return Collections.unmodifiableMap(resolved);
   }
 
-  /**
-   * The nested filter instance for {@code nested}, obtained from the registry that owns every
-   * filter instance of this HCM. The registry creates it from {@link
-   * CompositeFilterConfig#nestedFilterConfigs()}, reuses it across updates so that state such as
-   * a cache or a side channel survives them, and closes it once no effective config uses it.
-   */
+  private <I> ResolvedDelegate<I> resolveDelegate(
+      FilterDelegate delegate,
+      boolean isServer,
+      BiFunction<Filter, FilterConfig, I> buildInterceptor) {
+    Status unsupportedError = unsupportedSideError(delegate, isServer);
+    if (unsupportedError != null) {
+      return new ResolvedDelegate<>(delegate, StatusOr.fromStatus(unsupportedError));
+    }
+    List<I> interceptors = new ArrayList<>(delegate.delegates.size());
+    for (NestedFilter nested : delegate.delegates) {
+      I interceptor =
+          buildInterceptor.apply(nestedFilter(nested.config), nested.config.filterConfig);
+      if (interceptor != null) {
+        interceptors.add(interceptor);
+      }
+    }
+    return new ResolvedDelegate<>(
+        delegate, StatusOr.fromValue(Collections.unmodifiableList(interceptors)));
+  }
+
+  @Nullable
+  private static Status unsupportedSideError(FilterDelegate delegate, boolean isServer) {
+    for (NestedFilter nested : delegate.delegates) {
+      boolean supported =
+          isServer ? nested.provider.isServerFilter() : nested.provider.isClientFilter();
+      if (!supported) {
+        String label = nested.config.name.isEmpty()
+            ? nested.config.filterConfig.typeUrl() : nested.config.name;
+        return Status.UNAVAILABLE.withDescription(
+            "Filter " + label + " is not supported on "
+                + (isServer ? "server" : "client") + " side");
+      }
+    }
+    return null;
+  }
+
   private Filter nestedFilter(NamedFilterConfig nested) {
     Function<NamedFilterConfig, Filter> lookup = Preconditions.checkNotNull(filterLookup,
         "CompositeFilter needs FilterContext.filterLookup() to build interceptors; instances "
@@ -720,20 +617,12 @@ final class CompositeFilter implements Filter {
         "No filter instance for nested filter %s", nested.filterStateKey());
   }
 
-  /**
-   * Evaluates {@code matcher} and {@link FilterDelegate#shouldExecute} for one RPC, returning the
-   * pre-built nested interceptors to run (empty when skipped or not sampled) or the {@link Status}
-   * to fail the RPC with. The nested filters and their interceptors were already built once at
-   * configuration time.
-   */
   private static <I> StatusOr<List<I>> selectInterceptors(
       UnifiedMatcher matcher,
       Map<TypedExtensionConfig, ResolvedDelegate<I>> delegatesMap,
       Metadata headers,
       String fullMethodName,
       @Nullable String host) {
-    // ":method" is the HTTP method, which is always POST for gRPC. The gRPC full method name is
-    // carried by ":path" alone.
     MatchContext context = MatchContext.newBuilder()
         .setMetadata(headers)
         .setMethod("POST")
@@ -749,17 +638,13 @@ final class CompositeFilter implements Filter {
           .withDescription("composite filter matcher evaluation failed")
           .withCause(e));
     }
-    if (matchResult == null || !matchResult.matched) {
+    if (!matchResult.matched) {
       logger.log(Level.FINE, "No match in composite filter matcher tree for {0}", fullMethodName);
       return StatusOr.fromStatus(
           Status.UNAVAILABLE.withDescription("no match found in composite filter"));
     }
-    if (matchResult.actions.size() != 1) {
-      return StatusOr.fromStatus(Status.INTERNAL.withDescription(
-          "composite filter matcher returned unexpected action count: "
-              + matchResult.actions.size()));
-    }
-    ResolvedDelegate<I> resolved = delegatesMap.get(matchResult.actions.get(0));
+    ResolvedDelegate<I> resolved = matchResult.actions.size() == 1
+        ? delegatesMap.get(matchResult.actions.get(0)) : null;
     if (resolved == null) {
       return StatusOr.fromStatus(Status.INTERNAL.withDescription(
           "no filter chain found for matched composite filter action"));
@@ -768,10 +653,6 @@ final class CompositeFilter implements Filter {
       logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
           fullMethodName);
       return StatusOr.fromValue(Collections.emptyList());
-    }
-    if (resolved.interceptors.hasValue() && logger.isLoggable(Level.FINE)) {
-      logger.log(Level.FINE, "Composite filter running {0} nested interceptor(s) for {1}",
-          new Object[] {resolved.interceptors.getValue().size(), fullMethodName});
     }
     return resolved.interceptors;
   }
@@ -789,11 +670,10 @@ final class CompositeFilter implements Filter {
     private final Channel next;
     private final UnifiedMatcher matcher;
     private final Map<TypedExtensionConfig, ResolvedDelegate<ClientInterceptor>> delegatesMap;
-    private final Context context = Context.current();
     // Null until start().
     private volatile ClientCall<ReqT, RespT> delegate;
     // cancel() is the only method allowed before start(); it is recorded and reported from start().
-    private volatile Status cancelledBeforeStart;
+    private Status cancelledBeforeStart;
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
         Channel next, UnifiedMatcher matcher,
@@ -841,12 +721,6 @@ final class CompositeFilter implements Filter {
     }
 
     @Override
-    public boolean isReady() {
-      ClientCall<ReqT, RespT> call = delegate;
-      return call != null && call.isReady();
-    }
-
-    @Override
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
       ClientCall<ReqT, RespT> call = delegate;
       if (call == null) {
@@ -860,8 +734,6 @@ final class CompositeFilter implements Filter {
     public void start(Listener<RespT> responseListener, Metadata headers) {
       Preconditions.checkState(delegate == null, "Already started");
       if (cancelledBeforeStart != null) {
-        // Never create the real call: it would only be cancelled, and an unstarted call holds no
-        // transport resources.
         failCall(responseListener, cancelledBeforeStart);
         return;
       }
@@ -875,40 +747,19 @@ final class CompositeFilter implements Filter {
         return;
       }
       List<ClientInterceptor> interceptors = selected.getValue();
-      // Restore the Context captured at interceptCall() time while creating and starting the
-      // deferred downstream call, matching Channel.newCall() / DelayedClientCall semantics.
-      Context previous = context.attach();
-      try {
-        // interceptForward, not intercept: A103 specifies filter_chain as "a chain of filters to
-        // call, in order", so the first entry has to run first. ClientInterceptors.intercept makes
-        // the *last* interceptor outermost, which would run the chain backwards.
-        ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
-            ? next.newCall(method, callOptions)
-            : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
-        // With a direct executor the transport may deliver onReady inside start(), and whatever the
-        // listener then sends must reach realCall.
-        delegate = realCall;
-        realCall.start(responseListener, headers);
-      } finally {
-        context.detach(previous);
-      }
+      // interceptForward, not intercept: A103 specifies filter_chain as "a chain of filters to
+      // call, in order", so the first entry has to run first. ClientInterceptors.intercept makes
+      // the *last* interceptor outermost, which would run the chain backwards.
+      ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
+          ? next.newCall(method, callOptions)
+          : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
+      delegate = realCall;
+      realCall.start(responseListener, headers);
     }
 
     private void failCall(Listener<RespT> responseListener, Status status) {
       delegate = noopCall();
-      Executor executor = callOptions.getExecutor();
-      if (executor == null) {
-        executor = MoreExecutors.directExecutor();
-      }
-      executor.execute(
-          () -> {
-            Context previous = context.attach();
-            try {
-              responseListener.onClose(status, new Metadata());
-            } finally {
-              context.detach(previous);
-            }
-          });
+      responseListener.onClose(status, new Metadata());
     }
 
     @Override

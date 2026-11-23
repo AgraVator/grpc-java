@@ -106,8 +106,7 @@ interface Filter extends Closeable {
             continue;
           }
           List<VirtualHost.Route.RouteAction.ClusterWeight> weights =
-              isClient && route.routeAction() != null
-                  ? route.routeAction().weightedClusters() : null;
+              isClient ? route.routeAction().weightedClusters() : null;
           for (VirtualHost.Route.RouteAction.ClusterWeight weight
               : weights != null && !weights.isEmpty()
                   ? weights

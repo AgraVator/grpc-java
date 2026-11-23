@@ -250,9 +250,7 @@ class XdsRouteConfigureResource extends XdsResourceType<RdsUpdate> {
             "FilterConfig [" + name + "] contains invalid proto: " + e);
       }
       Filter.Provider provider = filterRegistry.get(typeUrl);
-      // A filter supported on neither side, typically one behind an env flag that is off, is
-      // unsupported in this build. Parsing its override anyway would, for the composite, still
-      // have its nested filters instantiated.
+      // A filter disabled on both sides (e.g. behind an env flag that is off) is unsupported.
       if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
         if (isOptional) {
           continue;

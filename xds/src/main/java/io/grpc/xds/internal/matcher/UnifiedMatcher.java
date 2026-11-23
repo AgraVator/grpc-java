@@ -26,7 +26,7 @@ import javax.annotation.Nullable;
  */
 public abstract class UnifiedMatcher {
 
-  public static final int MAX_RECURSION_DEPTH = 16;
+  static final int MAX_RECURSION_DEPTH = 16;
  
   public abstract MatchResult match(MatchContext context);
 
@@ -45,7 +45,7 @@ public abstract class UnifiedMatcher {
    * @param proto the proto matcher
    * @param actionValidator a predicate that returns true if the action type URL is supported
    */
-  public static UnifiedMatcher fromProto(Matcher proto,
+  static UnifiedMatcher fromProto(Matcher proto,
       Predicate<String> actionValidator) {
     checkRecursionDepth(proto, 0);
     Matcher.OnMatch onNoMatch = proto.hasOnNoMatch() ? proto.getOnNoMatch() : null;

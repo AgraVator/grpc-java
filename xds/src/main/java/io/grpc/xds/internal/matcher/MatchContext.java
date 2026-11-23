@@ -22,18 +22,14 @@ import javax.annotation.Nullable;
 
 public final class MatchContext {
   private final Metadata metadata;
-  @Nullable
   private final String path;
-  @Nullable
   private final String host;
-  @Nullable
   private final String method;
-  @Nullable
   private final String id;
 
-  MatchContext(Metadata metadata, @Nullable String path,
-      @Nullable String host, @Nullable String method,
-      @Nullable String id) {
+  MatchContext(Metadata metadata, String path,
+      String host, String method,
+      String id) {
     this.metadata = Preconditions.checkNotNull(metadata, "metadata");
     this.path = path;
     this.host = host;
@@ -41,27 +37,23 @@ public final class MatchContext {
     this.id = id;
   }
 
-  public Metadata getMetadata() {
+  Metadata getMetadata() {
     return metadata;
   }
   
-  @Nullable
-  public String getPath() {
+  String getPath() {
     return path;
   }
   
-  @Nullable
-  public String getHost() {
+  String getHost() {
     return host;
   }
   
-  @Nullable
-  public String getMethod() {
+  String getMethod() {
     return method;
   }
   
-  @Nullable
-  public String getId() {
+  String getId() {
     return id;
   }
 
@@ -86,7 +78,7 @@ public final class MatchContext {
       return this;
     }
 
-    public Builder setHost(String host) {
+    public Builder setHost(@Nullable String host) {
       this.host = host;
       return this;
     }
@@ -96,7 +88,7 @@ public final class MatchContext {
       return this;
     }
 
-    public Builder setId(String id) {
+    Builder setId(String id) {
       this.id = id;
       return this;
     }

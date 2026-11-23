@@ -605,14 +605,13 @@ final class XdsServerWrapper extends Server {
       for (String chainToShutdown : removedChains) {
         HashMap<String, Filter> filtersToShutdown = activeFilters.get(chainToShutdown);
         checkNotNull(filtersToShutdown, "filtersToShutdown of chain %s", chainToShutdown);
-        closeFilters(filtersToShutdown, updateActiveFiltersForChain(filtersToShutdown, null));
+        updateActiveFiltersForChain(filtersToShutdown, null);
         activeFilters.remove(chainToShutdown);
       }
 
       // Default chain.
       if (defaultFilterChain == null) {
-        closeFilters(activeFiltersDefaultChain,
-            updateActiveFiltersForChain(activeFiltersDefaultChain, null));
+        updateActiveFiltersForChain(activeFiltersDefaultChain, null);
       }
     }
 
@@ -620,21 +619,15 @@ final class XdsServerWrapper extends Server {
     private void shutdownActiveFilters() {
       for (HashMap<String, Filter> chainFilters : activeFilters.values()) {
         checkNotNull(chainFilters, "chainFilters");
-        closeFilters(chainFilters, updateActiveFiltersForChain(chainFilters, null));
+        updateActiveFiltersForChain(chainFilters, null);
       }
       activeFilters.clear();
-      closeFilters(activeFiltersDefaultChain,
-          updateActiveFiltersForChain(activeFiltersDefaultChain, null));
+      updateActiveFiltersForChain(activeFiltersDefaultChain, null);
     }
 
-    /**
-     * Creates the instances in {@code filterConfigs}, top-level and nested alike, and returns the
-     * keys of the chain's instances that are no longer declared, for {@link #closeFilters}.
-     */
     // called in syncContext
-    private Set<String> updateActiveFiltersForChain(
-        Map<String, Filter> chainFilters,
-        @Nullable List<NamedFilterConfig> filterConfigs) {
+    private void updateActiveFiltersForChain(
+        Map<String, Filter> chainFilters, @Nullable List<NamedFilterConfig> filterConfigs) {
       if (filterConfigs == null) {
         filterConfigs = ImmutableList.of();
       }
@@ -653,11 +646,9 @@ final class XdsServerWrapper extends Server {
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
       }
-      return filtersToShutdown;
-    }
 
-    private void closeFilters(Map<String, Filter> chainFilters, Set<String> filterKeys) {
-      for (String filterKey : filterKeys) {
+      // Shutdown filters not present in current HCM.
+      for (String filterKey : filtersToShutdown) {
         Filter filterToShutdown = chainFilters.remove(filterKey);
         checkNotNull(filterToShutdown, "filterToShutdown %s", filterKey);
         filterToShutdown.close();
@@ -687,10 +678,9 @@ final class XdsServerWrapper extends Server {
             generatePerRouteInterceptors(hcm.httpFilterConfigs(), savedVhosts, chainFilters));
       } else {
         routingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
-        // No routes to build, so the chain keeps the filters the LDS declares.
-        closeFilters(chainFilters, updateActiveFiltersForChain(
+        updateActiveFiltersForChain(
             chainFilters,
-            Filter.collectAllFilterConfigs(hcm.httpFilterConfigs(), null, /* isClient= */ false)));
+            Filter.collectAllFilterConfigs(hcm.httpFilterConfigs(), null, /* isClient= */ false));
       }
       AtomicReference<ServerRoutingConfig> routingConfigRef = new AtomicReference<>(routingConfig);
       savedRdsRoutingConfigRef.put(filterChain, routingConfigRef);
@@ -704,7 +694,7 @@ final class XdsServerWrapper extends Server {
       syncContext.throwIfNotInThisSynchronizationContext();
 
       checkNotNull(chainFilters, "chainFilters");
-      Set<String> filtersToShutdown = updateActiveFiltersForChain(
+      updateActiveFiltersForChain(
           chainFilters,
           Filter.collectAllFilterConfigs(filterConfigs, virtualHosts, /* isClient= */ false));
       ImmutableMap.Builder<Route, ServerInterceptor> perRouteInterceptors =
@@ -741,9 +731,6 @@ final class XdsServerWrapper extends Server {
         }
       }
 
-      // Only now that every interceptor of this chain is built: if building one threw, the routes
-      // still serving would otherwise be left holding closed instances.
-      closeFilters(chainFilters, filtersToShutdown);
       return perRouteInterceptors.buildOrThrow();
     }
 
@@ -885,22 +872,11 @@ final class XdsServerWrapper extends Server {
             continue;
           }
 
-          // The chain is one the current selector serves, and may come from an LDS that a newer
-          // one with pending RDS has since replaced, so resolve its map through the selector: the
-          // default chain is the only served chain absent from its routing config map.
-          FilterChainSelector selector = filterChainSelectorManager.getSelectorToUpdateSelector();
-          Map<String, Filter> chainFilters =
-              (selector != null && selector.getRoutingConfigs().containsKey(filterChain))
-                  ? activeFilters.get(filterChain.name())
-                  : activeFiltersDefaultChain;
-          checkNotNull(chainFilters, "chainFilters of chain %s", filterChain.name());
-
           ServerRoutingConfig updatedRoutingConfig;
           if (savedVirtualHosts == null) {
-            // The chain keeps serving, it just fails every RPC. Nothing is built, so nothing is
-            // reconciled: the next valid update does.
             updatedRoutingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
           } else {
+            HashMap<String, Filter> chainFilters = activeFilters.get(filterChain.name());
             ImmutableMap<Route, ServerInterceptor> interceptors = generatePerRouteInterceptors(
                 hcm.httpFilterConfigs(), savedVirtualHosts, chainFilters);
             updatedRoutingConfig = ServerRoutingConfig.create(savedVirtualHosts, interceptors);

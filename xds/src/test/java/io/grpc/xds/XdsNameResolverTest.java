@@ -1858,14 +1858,12 @@ public class XdsNameResolverTest {
   }
 
   /**
-   * Because an RDS override replaces a composite filter outright rather than patching a section of
-   * it, overriding "c" on every route closes the HCM composite's own nested filter, a route
-   * override shadows a virtual-host override without instantiating the virtual-host override's
-   * nested filter, and a composite override attached to a non-composite top-level filter is
-   * ignored.
+   * Nested filters from matching vhost/route composite overrides are created and closed as those
+   * overrides come and go, while a composite override attached to a non-composite top-level filter
+   * is ignored.
    */
   @Test
-  public void filterState_wholeCompositeOverride_closesShadowedAndIgnoresMismatchedType() {
+  public void filterState_compositeOverrides_reconciledAndMismatchedTypeIgnored() {
     System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     try {
       StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
@@ -1890,8 +1888,7 @@ public class XdsNameResolverTest {
       assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
       StatefulFilter nestedA = statefulProvider.getAllInstances().get(1);
 
-      // RDS 2: vhost overrides "c" with "v", but the sole route overrides "c" with "r".
-      // Both "a" (HCM) and "v" (vhost) are completely shadowed; "a" closes and "v" never exists.
+      // RDS 2: vhost overrides "c" with "v", route overrides "c" with "r".
       Route routeOverridingC = Route.forAction(
           RouteMatch.withPathExactOnly(call1.getFullMethodNameForPath()),
           RouteAction.forCluster(cluster1, NO_HASH_POLICIES, null, null, false),
@@ -1902,21 +1899,24 @@ public class XdsNameResolverTest {
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
       assertClusterResolutionResult(call1, cluster1);
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, "a", "r").inOrder();
-      assertThat(nestedA.isShutdown()).isTrue();
-      StatefulFilter nestedR = statefulProvider.getAllInstances().get(2);
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      StatefulFilter nestedV = statefulProvider.getAllInstances().get(2);
+      StatefulFilter nestedR = statefulProvider.getAllInstances().get(3);
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
       assertThat(nestedR.isShutdown()).isFalse();
 
-      // RDS 3: route override removed, exposing the vhost override "v"; "r" closes.
+      // RDS 3: route override removed; "r" closes while "a" and "v" stay alive.
       xdsClient.deliverRdsUpdate(RDS_RESOURCE_NAME, VirtualHost.create(
           "stateful-vhost", ImmutableList.of(expectedLdsResourceName),
           ImmutableList.of(baseRoute),
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
       assertClusterResolutionResult(call1, cluster1);
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, "a", "r", "v").inOrder();
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
       assertThat(nestedR.isShutdown()).isTrue();
-      assertThat(statefulProvider.getAllInstances().get(3).isShutdown()).isFalse();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }
@@ -1924,8 +1924,7 @@ public class XdsNameResolverTest {
 
   /**
    * A nested filter reachable only through a weighted cluster's override is created with it and
-   * closed when the override is dropped; the HCM composite's nested filter is not created while
-   * every weighted cluster overrides the composite outright.
+   * closed when the override is dropped.
    */
   @Test
   public void filterState_nestedFilterOfWeightedClusterOverride_createdAndClosedWithIt() {
@@ -1938,58 +1937,22 @@ public class XdsNameResolverTest {
               compositeAnyWrapping(executeStatefulChain("a")))),
           new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
 
-      // LDS 1: the only weighted cluster overrides "c" with a matcher that runs "x" instead.
+      // LDS 1: weighted cluster overrides "c" with a matcher that runs "x".
       xdsClient.deliverLdsUpdateWithFilters(filterStateTestWeightedClusterVhost(
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x")))), filterConfigs);
       createAndDeliverClusterUpdates(xdsClient, cluster1);
       assertClusterResolutionResult(call1, cluster1);
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x");
-      StatefulFilter nestedX = statefulProvider.getAllInstances().get(0);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "x").inOrder();
+      StatefulFilter nestedA = statefulProvider.getAllInstances().get(0);
+      StatefulFilter nestedX = statefulProvider.getAllInstances().get(1);
 
-      // LDS 2: the override is gone, so "a" is effective and "x" is closed.
+      // LDS 2: the override is gone, so "x" is closed while "a" stays alive.
       xdsClient.deliverLdsUpdateWithFilters(
           filterStateTestWeightedClusterVhost(NO_FILTER_OVERRIDES), filterConfigs);
       assertClusterResolutionResult(call1, cluster1);
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x", "a").inOrder();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "x").inOrder();
+      assertThat(nestedA.isShutdown()).isFalse();
       assertThat(nestedX.isShutdown()).isTrue();
-      assertThat(statefulProvider.getAllInstances().get(1).isShutdown()).isFalse();
-    } finally {
-      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
-    }
-  }
-
-  /**
-   * Client {@code NonForwardingAction} routes build no interceptors, so they must not force the HCM
-   * composite's nested filter to be instantiated when all forwarding routes override the composite.
-   */
-  @Test
-  public void filterState_nonForwardingRoute_ignoredWhenForwardingRouteOverridesComposite() {
-    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
-    try {
-      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
-      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
-      ImmutableList<NamedFilterConfig> filterConfigs = ImmutableList.of(
-          new NamedFilterConfig("c", parseComposite(
-              compositeAnyWrapping(executeStatefulChain("a")))),
-          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
-
-      Route forwardingRouteOverridingC = Route.forAction(
-          RouteMatch.withPathExactOnly(call1.getFullMethodNameForPath()),
-          RouteAction.forCluster(cluster1, NO_HASH_POLICIES, null, null, false),
-          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x"))));
-      Route nonForwardingRoute = Route.forNonForwardingAction(
-          RouteMatch.withPathExactOnly("/non/forwarding"),
-          NO_FILTER_OVERRIDES);
-      VirtualHost vhost = VirtualHost.create(
-          "stateful-vhost",
-          ImmutableList.of(expectedLdsResourceName),
-          ImmutableList.of(forwardingRouteOverridingC, nonForwardingRoute),
-          NO_FILTER_OVERRIDES);
-
-      xdsClient.deliverLdsUpdateWithFilters(vhost, filterConfigs);
-      createAndDeliverClusterUpdates(xdsClient, cluster1);
-      assertClusterResolutionResult(call1, cluster1);
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x");
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }

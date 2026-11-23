@@ -679,8 +679,7 @@ final class XdsServerWrapper extends Server {
       } else {
         routingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
         updateActiveFiltersForChain(
-            chainFilters,
-            Filter.collectAllFilterConfigs(hcm.httpFilterConfigs(), null, /* isClient= */ false));
+            chainFilters, Filter.collectAllFilterConfigs(hcm.httpFilterConfigs(), null));
       }
       AtomicReference<ServerRoutingConfig> routingConfigRef = new AtomicReference<>(routingConfig);
       savedRdsRoutingConfigRef.put(filterChain, routingConfigRef);
@@ -695,8 +694,7 @@ final class XdsServerWrapper extends Server {
 
       checkNotNull(chainFilters, "chainFilters");
       updateActiveFiltersForChain(
-          chainFilters,
-          Filter.collectAllFilterConfigs(filterConfigs, virtualHosts, /* isClient= */ false));
+          chainFilters, Filter.collectAllFilterConfigs(filterConfigs, virtualHosts));
       ImmutableMap.Builder<Route, ServerInterceptor> perRouteInterceptors =
           new ImmutableMap.Builder<>();
 

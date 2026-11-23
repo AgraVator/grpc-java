@@ -16,7 +16,6 @@
 
 package io.grpc.xds;
 
-import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
 import com.google.common.annotations.VisibleForTesting;
@@ -188,60 +187,17 @@ final class CompositeFilter implements Filter {
             new CompositeFilterConfig(null, Collections.emptyMap(), /* matcherProto= */ null));
       }
       try {
-        // Compile the matcher first so its recursion depth check runs before parsing child filters.
-        UnifiedMatcher matcher = UnifiedMatcher.fromProto(matcherProto);
         Map<TypedExtensionConfig, FilterDelegate> delegates = new LinkedHashMap<>();
-        collectDelegates(matcherProto, delegates, context);
+        UnifiedMatcher matcher = UnifiedMatcher.fromProto(
+            matcherProto,
+            /* allowKeepMatching= */ false,
+            /* allowEmptyMatcher= */ false,
+            // Keyed by the action proto (not action.name, which is not unique across actions).
+            action -> delegates.computeIfAbsent(action, a -> createFilterDelegate(a, context)));
         return ConfigOrError.fromConfig(
             new CompositeFilterConfig(matcher, delegates, matcherProto));
       } catch (Exception e) {
         return ConfigOrError.fromError("Failed to create matcher: " + e.getMessage());
-      }
-    }
-
-    private void collectDelegates(
-        Matcher matcher, Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context) {
-      if (!matcher.hasMatcherList() && !matcher.hasMatcherTree()) {
-        throw new IllegalArgumentException(
-            "xds_matcher: no matcher_list or matcher_tree specified");
-      }
-      if (matcher.hasMatcherList()) {
-        for (Matcher.MatcherList.FieldMatcher fm : matcher.getMatcherList().getMatchersList()) {
-          if (fm.hasOnMatch()) {
-            collectOnMatch(fm.getOnMatch(), map, context);
-          }
-        }
-      } else if (matcher.hasMatcherTree()) {
-        Matcher.MatcherTree tree = matcher.getMatcherTree();
-        if (tree.hasExactMatchMap()) {
-          for (Matcher.OnMatch om : tree.getExactMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
-          }
-        } else if (tree.hasPrefixMatchMap()) {
-          for (Matcher.OnMatch om : tree.getPrefixMatchMap().getMapMap().values()) {
-            collectOnMatch(om, map, context);
-          }
-        }
-      }
-      if (matcher.hasOnNoMatch()) {
-        collectOnMatch(matcher.getOnNoMatch(), map, context);
-      }
-    }
-
-    private void collectOnMatch(
-        Matcher.OnMatch onMatch,
-        Map<TypedExtensionConfig, FilterDelegate> map,
-        FilterConfigParseContext context) {
-      if (onMatch.getKeepMatching()) {
-        throw new IllegalArgumentException(
-            "keep_matching is not permitted anywhere in the composite filter matcher tree");
-      }
-      if (onMatch.hasMatcher()) {
-        collectDelegates(onMatch.getMatcher(), map, context);
-      } else if (onMatch.hasAction()) {
-        // Keyed by the action proto (not action.name, which is not unique across actions).
-        map.computeIfAbsent(onMatch.getAction(), action -> createFilterDelegate(action, context));
       }
     }
 
@@ -258,7 +214,7 @@ final class CompositeFilter implements Filter {
         } catch (InvalidProtocolBufferException e) {
           throw new IllegalArgumentException("Could not parse SkipFilter action", e);
         }
-        return new FilterDelegate(Collections.emptyList(), null);
+        return new FilterDelegate(Collections.emptyList(), null, null, null);
       }
       if (!actionAny.is(ExecuteFilterAction.class)) {
         throw new IllegalArgumentException(
@@ -287,26 +243,18 @@ final class CompositeFilter implements Filter {
         throw new IllegalArgumentException(
             "ExecuteFilterAction must specify either typed_config or filter_chain");
       }
-      List<NestedFilter> delegates = new ArrayList<>(childConfigs.size());
+      List<NamedFilterConfig> configs = new ArrayList<>(childConfigs.size());
+      Status clientUnsupportedError = null;
+      Status serverUnsupportedError = null;
       for (io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig childFilterConfig
           : childConfigs) {
-        Any childAny = childFilterConfig.getTypedConfig();
-        String typeUrl = childAny.getTypeUrl();
-        Message rawConfig = childAny;
+        Filter.UnpackedFilterConfig unpacked;
         try {
-          if (childAny.is(TypedStruct.class)) {
-            TypedStruct typedStruct = childAny.unpack(TypedStruct.class);
-            typeUrl = typedStruct.getTypeUrl();
-            rawConfig = typedStruct.getValue();
-          } else if (childAny.is(com.github.xds.type.v3.TypedStruct.class)) {
-            com.github.xds.type.v3.TypedStruct typedStruct =
-                childAny.unpack(com.github.xds.type.v3.TypedStruct.class);
-            typeUrl = typedStruct.getTypeUrl();
-            rawConfig = typedStruct.getValue();
-          }
+          unpacked = Filter.unpackTypedStruct(childFilterConfig.getTypedConfig());
         } catch (InvalidProtocolBufferException e) {
           throw new IllegalArgumentException("Failed to unpack TypedStruct", e);
         }
+        String typeUrl = unpacked.typeUrl;
         Filter.Provider provider = registryLookup.apply(typeUrl);
         if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
           throw new IllegalArgumentException("Action filter not found: " + typeUrl);
@@ -315,7 +263,7 @@ final class CompositeFilter implements Filter {
         Filter.FilterConfigParseContext childContext =
             context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
         ConfigOrError<? extends FilterConfig> parsed =
-            provider.parseFilterConfig(rawConfig, childContext);
+            provider.parseFilterConfig(unpacked.rawConfig, childContext);
         if (parsed.errorDetail != null) {
           throw new IllegalArgumentException(
               "Failed to parse child filter: " + parsed.errorDetail);
@@ -324,10 +272,20 @@ final class CompositeFilter implements Filter {
           throw new IllegalArgumentException(
               "Nested filter cannot be a terminal filter: " + typeUrl);
         }
-        delegates.add(new NestedFilter(
-            new NamedFilterConfig(childFilterConfig.getName(), parsed.config), provider));
+        String childName = childFilterConfig.getName();
+        String label = childName.isEmpty() ? typeUrl : childName;
+        if (clientUnsupportedError == null && !provider.isClientFilter()) {
+          clientUnsupportedError = Status.UNAVAILABLE.withDescription(
+              "Filter " + label + " is not supported on client side");
+        }
+        if (serverUnsupportedError == null && !provider.isServerFilter()) {
+          serverUnsupportedError = Status.UNAVAILABLE.withDescription(
+              "Filter " + label + " is not supported on server side");
+        }
+        configs.add(new NamedFilterConfig(childName, parsed.config));
       }
-      return new FilterDelegate(delegates, samplePercent);
+      return new FilterDelegate(
+          configs, clientUnsupportedError, serverUnsupportedError, samplePercent);
     }
   }
 
@@ -354,9 +312,9 @@ final class CompositeFilter implements Filter {
     public List<NamedFilterConfig> nestedFilterConfigs() {
       List<NamedFilterConfig> nested = new ArrayList<>();
       for (FilterDelegate delegate : delegates.values()) {
-        for (NestedFilter nestedFilter : delegate.delegates) {
-          nested.add(nestedFilter.config);
-          nested.addAll(nestedFilter.config.filterConfig.nestedFilterConfigs());
+        for (NamedFilterConfig nestedConfig : delegate.configs) {
+          nested.add(nestedConfig);
+          nested.addAll(nestedConfig.filterConfig.nestedFilterConfigs());
         }
       }
       return nested;
@@ -386,19 +344,39 @@ final class CompositeFilter implements Filter {
   }
 
   static final class FilterDelegate {
-    final List<NestedFilter> delegates;
+    final List<NamedFilterConfig> configs;
+    @Nullable
+    final Status clientUnsupportedError;
+    @Nullable
+    final Status serverUnsupportedError;
     private final int ratePerMillion;
     private final ThreadSafeRandom random;
 
-    FilterDelegate(List<NestedFilter> delegates, @Nullable FractionalPercent samplePercent) {
-      this(delegates, samplePercent, ThreadSafeRandom.ThreadSafeRandomImpl.instance);
+    FilterDelegate(
+        List<NamedFilterConfig> configs,
+        @Nullable Status clientUnsupportedError,
+        @Nullable Status serverUnsupportedError,
+        @Nullable FractionalPercent samplePercent) {
+      this(configs, clientUnsupportedError, serverUnsupportedError, samplePercent,
+          ThreadSafeRandom.ThreadSafeRandomImpl.instance);
     }
 
-    FilterDelegate(List<NestedFilter> delegates, @Nullable FractionalPercent samplePercent,
+    FilterDelegate(
+        List<NamedFilterConfig> configs,
+        @Nullable Status clientUnsupportedError,
+        @Nullable Status serverUnsupportedError,
+        @Nullable FractionalPercent samplePercent,
         ThreadSafeRandom random) {
-      this.delegates = Collections.unmodifiableList(delegates);
+      this.configs = Collections.unmodifiableList(configs);
+      this.clientUnsupportedError = clientUnsupportedError;
+      this.serverUnsupportedError = serverUnsupportedError;
       this.ratePerMillion = calculateRatePerMillion(samplePercent);
       this.random = random;
+    }
+
+    @Nullable
+    Status unsupportedError(boolean isServer) {
+      return isServer ? serverUnsupportedError : clientUnsupportedError;
     }
 
     private static int calculateRatePerMillion(@Nullable FractionalPercent samplePercent) {
@@ -433,17 +411,6 @@ final class CompositeFilter implements Filter {
         return false;
       }
       return random.nextInt(1_000_000) < ratePerMillion;
-    }
-  }
-
-  /** A nested filter config and the provider that parsed it. */
-  static final class NestedFilter {
-    final NamedFilterConfig config;
-    final Filter.Provider provider;
-
-    NestedFilter(NamedFilterConfig config, Filter.Provider provider) {
-      this.config = config;
-      this.provider = provider;
     }
   }
 
@@ -549,11 +516,11 @@ final class CompositeFilter implements Filter {
       return false;
     }
     for (FilterDelegate delegate : effective.delegates.values()) {
-      if (unsupportedSideError(delegate, /* isServer= */ false) != null) {
+      if (delegate.clientUnsupportedError != null) {
         continue;
       }
-      for (NestedFilter nested : delegate.delegates) {
-        if (predicate.test(nestedFilter(nested.config), nested.config.filterConfig)) {
+      for (NamedFilterConfig nested : delegate.configs) {
+        if (predicate.test(nestedFilter(nested), nested.filterConfig)) {
           return true;
         }
       }
@@ -577,36 +544,19 @@ final class CompositeFilter implements Filter {
       FilterDelegate delegate,
       boolean isServer,
       BiFunction<Filter, FilterConfig, I> buildInterceptor) {
-    Status unsupportedError = unsupportedSideError(delegate, isServer);
+    Status unsupportedError = delegate.unsupportedError(isServer);
     if (unsupportedError != null) {
       return new ResolvedDelegate<>(delegate, StatusOr.fromStatus(unsupportedError));
     }
-    List<I> interceptors = new ArrayList<>(delegate.delegates.size());
-    for (NestedFilter nested : delegate.delegates) {
-      I interceptor =
-          buildInterceptor.apply(nestedFilter(nested.config), nested.config.filterConfig);
+    List<I> interceptors = new ArrayList<>(delegate.configs.size());
+    for (NamedFilterConfig nested : delegate.configs) {
+      I interceptor = buildInterceptor.apply(nestedFilter(nested), nested.filterConfig);
       if (interceptor != null) {
         interceptors.add(interceptor);
       }
     }
     return new ResolvedDelegate<>(
         delegate, StatusOr.fromValue(Collections.unmodifiableList(interceptors)));
-  }
-
-  @Nullable
-  private static Status unsupportedSideError(FilterDelegate delegate, boolean isServer) {
-    for (NestedFilter nested : delegate.delegates) {
-      boolean supported =
-          isServer ? nested.provider.isServerFilter() : nested.provider.isClientFilter();
-      if (!supported) {
-        String label = nested.config.name.isEmpty()
-            ? nested.config.filterConfig.typeUrl() : nested.config.name;
-        return Status.UNAVAILABLE.withDescription(
-            "Filter " + label + " is not supported on "
-                + (isServer ? "server" : "client") + " side");
-      }
-    }
-    return null;
   }
 
   private Filter nestedFilter(NamedFilterConfig nested) {

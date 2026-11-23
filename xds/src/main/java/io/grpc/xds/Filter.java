@@ -17,8 +17,11 @@
 package io.grpc.xds;
 
 
+import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.google.auto.value.AutoValue;
 import com.google.common.base.MoreObjects;
+import com.google.protobuf.Any;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.grpc.ClientInterceptor;
 import io.grpc.MetricRecorder;
@@ -28,11 +31,14 @@ import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import javax.annotation.Nullable;
 
@@ -82,50 +88,75 @@ interface Filter extends Closeable {
     return override != null || vhost == null ? override : vhost.filterConfigOverrides().get(name);
   }
 
+  /** Result of unwrapping a UDPA or xDS {@code TypedStruct} envelope, if present. */
+  static final class UnpackedFilterConfig {
+    final String typeUrl;
+    final Message rawConfig;
+
+    UnpackedFilterConfig(String typeUrl, Message rawConfig) {
+      this.typeUrl = typeUrl;
+      this.rawConfig = rawConfig;
+    }
+  }
+
   /**
-   * Collects every filter config that needs an instance: the HCM's top-level configs plus the
-   * nested configs of whichever config is effective on each route (or of the HCM configs when no
-   * routes are present). Because a composite per-route override replaces the whole composite filter
-   * rather than a section of it, an overridden composite config contributes no nested filters on
-   * that route.
+   * Unwraps a {@code udpa.type.v1.TypedStruct} or {@code xds.type.v3.TypedStruct} {@link Any} into
+   * its inner type URL and {@link com.google.protobuf.Struct} value; returns {@code any} as-is
+   * otherwise.
+   */
+  static UnpackedFilterConfig unpackTypedStruct(Any any) throws InvalidProtocolBufferException {
+    if (any.is(TypedStruct.class)) {
+      TypedStruct typedStruct = any.unpack(TypedStruct.class);
+      return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
+    }
+    if (any.is(com.github.xds.type.v3.TypedStruct.class)) {
+      com.github.xds.type.v3.TypedStruct typedStruct =
+          any.unpack(com.github.xds.type.v3.TypedStruct.class);
+      return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
+    }
+    return new UnpackedFilterConfig(any.getTypeUrl(), any);
+  }
+
+  /**
+   * Collects every filter config that needs an instance: the HCM's top-level configs, their nested
+   * configs, and the nested configs of any matching per-vhost, per-route, or per-cluster-weight
+   * override.
    */
   static List<NamedFilterConfig> collectAllFilterConfigs(
-      @Nullable List<NamedFilterConfig> hcmConfigs,
-      @Nullable List<VirtualHost> vhosts,
-      boolean isClient) {
+      @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
     List<NamedFilterConfig> result = new ArrayList<>();
     if (hcmConfigs == null) {
       return result;
     }
-    result.addAll(hcmConfigs);
-    Set<FilterConfig> effectiveConfigs = Collections.newSetFromMap(new IdentityHashMap<>());
+    Map<String, Class<? extends FilterConfig>> hcmConfigTypes = new HashMap<>();
+    for (NamedFilterConfig top : hcmConfigs) {
+      result.add(top);
+      result.addAll(top.filterConfig.nestedFilterConfigs());
+      hcmConfigTypes.put(top.name, top.filterConfig.getClass());
+    }
     if (vhosts != null) {
-      for (VirtualHost vhost : vhosts) {
-        for (VirtualHost.Route route : vhost.routes()) {
-          if (isClient && route.routeAction() == null) {
-            continue;
+      Set<FilterConfig> seenOverrides = Collections.newSetFromMap(new IdentityHashMap<>());
+      Consumer<Map<String, FilterConfig>> collectOverrides = overrides -> {
+        for (Map.Entry<String, FilterConfig> entry : overrides.entrySet()) {
+          FilterConfig override = entry.getValue();
+          if (hcmConfigTypes.get(entry.getKey()) == override.getClass()
+              && seenOverrides.add(override)) {
+            result.addAll(override.nestedFilterConfigs());
           }
-          List<VirtualHost.Route.RouteAction.ClusterWeight> weights =
-              isClient ? route.routeAction().weightedClusters() : null;
-          for (VirtualHost.Route.RouteAction.ClusterWeight weight
-              : weights != null && !weights.isEmpty()
-                  ? weights
-                  : Collections.<VirtualHost.Route.RouteAction.ClusterWeight>singletonList(null)) {
-            for (NamedFilterConfig top : hcmConfigs) {
-              effectiveConfigs.add(effectiveConfig(
-                  top.filterConfig, lookupOverride(top.name, vhost, route, weight)));
+        }
+      };
+      for (VirtualHost vhost : vhosts) {
+        collectOverrides.accept(vhost.filterConfigOverrides());
+        for (VirtualHost.Route route : vhost.routes()) {
+          collectOverrides.accept(route.filterConfigOverrides());
+          if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
+            for (VirtualHost.Route.RouteAction.ClusterWeight weight
+                : route.routeAction().weightedClusters()) {
+              collectOverrides.accept(weight.filterConfigOverrides());
             }
           }
         }
       }
-    }
-    if (effectiveConfigs.isEmpty()) {
-      for (NamedFilterConfig top : hcmConfigs) {
-        effectiveConfigs.add(top.filterConfig);
-      }
-    }
-    for (FilterConfig effective : effectiveConfigs) {
-      result.addAll(effective.nestedFilterConfigs());
     }
     return result;
   }

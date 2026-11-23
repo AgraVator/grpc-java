@@ -729,7 +729,7 @@ final class XdsNameResolver extends NameResolver {
         @Nullable List<NamedFilterConfig> filterConfigs, @Nullable List<VirtualHost> vhosts) {
       Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
       for (NamedFilterConfig namedFilter
-          : Filter.collectAllFilterConfigs(filterConfigs, vhosts, /* isClient= */ true)) {
+          : Filter.collectAllFilterConfigs(filterConfigs, vhosts)) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
         String filterKey = namedFilter.filterStateKey();
 

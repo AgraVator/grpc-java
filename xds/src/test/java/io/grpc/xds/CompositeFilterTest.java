@@ -1336,8 +1336,8 @@ public class CompositeFilterTest {
       // Every nested config is resolved through the lookup...
       for (CompositeFilter.FilterDelegate delegate
           : Iterables.concat(topLevel.delegates.values(), routeOverride.delegates.values())) {
-        for (CompositeFilter.NestedFilter nested : delegate.delegates) {
-          verify(lookup, atLeastOnce()).apply(nested.config);
+        for (NamedFilterConfig nested : delegate.configs) {
+          verify(lookup, atLeastOnce()).apply(nested);
         }
       }
       // ...and only through it: the composite neither creates nor retires nested instances, not
@@ -1360,7 +1360,7 @@ public class CompositeFilterTest {
               .setNumerator(500000)
               .setDenominator(FractionalPercent.DenominatorType.MILLION).build())) {
         CompositeFilter.FilterDelegate delegate = new CompositeFilter.FilterDelegate(
-            Collections.emptyList(), percent, mockRandom);
+            Collections.emptyList(), null, null, percent, mockRandom);
         when(mockRandom.nextInt(1_000_000)).thenReturn(400_000);
         assertThat(delegate.shouldExecute()).isTrue();
         when(mockRandom.nextInt(1_000_000)).thenReturn(600_000);
@@ -1677,7 +1677,7 @@ public class CompositeFilterTest {
       for (Matcher badMatcher : Arrays.asList(exactTree, prefixTree, onNoMatch, deeplyNested)) {
         assertThat(provider.parseFilterConfig(
             Any.pack(createExtensionWithMatcher(badMatcher)), getFilterContext()).errorDetail)
-            .contains("keep_matching is not permitted anywhere in the composite filter matcher");
+            .contains("keep_matching is not permitted");
       }
     }
 
@@ -1756,7 +1756,7 @@ public class CompositeFilterTest {
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
       assertThat(result.errorDetail).isNull();
-      assertThat(Iterables.getOnlyElement(result.config.delegates.values()).delegates).isEmpty();
+      assertThat(Iterables.getOnlyElement(result.config.delegates.values()).configs).isEmpty();
     }
 
     @Test
@@ -2038,7 +2038,7 @@ public class CompositeFilterTest {
           provider.parseFilterConfig(
               Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
       assertThat(res.errorDetail).isNull();
-      assertThat(Iterables.getOnlyElement(res.config.delegates.values()).delegates).hasSize(2);
+      assertThat(Iterables.getOnlyElement(res.config.delegates.values()).configs).hasSize(2);
     }
 
     /**

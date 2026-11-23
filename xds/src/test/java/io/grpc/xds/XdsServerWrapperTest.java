@@ -2107,14 +2107,12 @@ public class XdsServerWrapperTest {
   }
 
   /**
-   * Because an RDS override replaces a composite filter outright rather than patching a section of
-   * it, overriding "c" on every route closes the HCM composite's own nested filter, a route
-   * override shadows a virtual-host override without instantiating the virtual-host override's
-   * nested filter, and a composite override attached to a non-composite top-level filter is
-   * ignored.
+   * Nested filters from matching vhost/route composite overrides are created and closed as those
+   * overrides come and go, while a composite override attached to a non-composite top-level filter
+   * is ignored.
    */
   @Test
-  public void filterState_wholeCompositeOverride_closesShadowedAndIgnoresMismatchedType()
+  public void filterState_compositeOverrides_reconciledAndMismatchedTypeIgnored()
       throws Exception {
     System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
     try {
@@ -2144,8 +2142,7 @@ public class XdsServerWrapperTest {
       assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
       StatefulFilter nestedA = statefulProvider.getAllInstances().get(1);
 
-      // RDS 2: vhost overrides "c" with "v", but the sole route overrides "c" with "r".
-      // Both "a" (HCM) and "v" (vhost) are completely shadowed; "a" closes and "v" never exists.
+      // RDS 2: vhost overrides "c" with "v", route overrides "c" with "r".
       Route routeOverridingC = filterStateTestRoute(
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("r"))));
       xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
@@ -2153,20 +2150,23 @@ public class XdsServerWrapperTest {
           ImmutableList.of(routeOverridingC),
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, "a", "r").inOrder();
-      assertThat(nestedA.isShutdown()).isTrue();
-      StatefulFilter nestedR = statefulProvider.getAllInstances().get(2);
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      StatefulFilter nestedV = statefulProvider.getAllInstances().get(2);
+      StatefulFilter nestedR = statefulProvider.getAllInstances().get(3);
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
       assertThat(nestedR.isShutdown()).isFalse();
 
-      // RDS 3: route override removed, exposing the vhost override "v"; "r" closes.
+      // RDS 3: route override removed; "r" closes while "a" and "v" stay alive.
       xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
           "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
           ImmutableList.of(baseRoute),
           ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
       assertThat(statefulFilterNames(statefulProvider))
-          .containsExactly(STATEFUL_1, "a", "r", "v").inOrder();
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
       assertThat(nestedR.isShutdown()).isTrue();
-      assertThat(statefulProvider.getAllInstances().get(3).isShutdown()).isFalse();
       assertThat(severeLogs).isEmpty();
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
@@ -2409,7 +2409,7 @@ public class XdsServerWrapperTest {
           new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
       verifyServerStarted(serverStart);
       assertThat(severeLogs).isEmpty();
-      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a");
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "w");
     } finally {
       System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
     }

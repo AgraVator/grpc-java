@@ -32,11 +32,9 @@ import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -57,22 +55,14 @@ interface Filter extends Closeable {
     String typeUrl();
 
     /**
-     * Filter configs this config runs as nested filters. Each needs an instance, shared by
+     * Transitive filter configs this config runs as nested filters (including configs nested inside
+     * child composite filters). Each needs an instance, shared by
      * {@link NamedFilterConfig#filterStateKey()} with every other config that declares the same
      * name and type.
      */
     default List<NamedFilterConfig> nestedFilterConfigs() {
       return Collections.emptyList();
     }
-  }
-
-  /**
-   * Returns {@code overrideConfig} when it is of the same config type as {@code config} (replacing
-   * it outright on a route), or {@code config} otherwise.
-   */
-  static FilterConfig effectiveConfig(FilterConfig config, @Nullable FilterConfig overrideConfig) {
-    return overrideConfig != null && overrideConfig.getClass() == config.getClass()
-        ? overrideConfig : config;
   }
 
   @Nullable
@@ -105,16 +95,17 @@ interface Filter extends Closeable {
    * otherwise.
    */
   static UnpackedFilterConfig unpackTypedStruct(Any any) throws InvalidProtocolBufferException {
-    if (any.is(TypedStruct.class)) {
+    String typeUrl = any.getTypeUrl();
+    if ("type.googleapis.com/udpa.type.v1.TypedStruct".equals(typeUrl)) {
       TypedStruct typedStruct = any.unpack(TypedStruct.class);
       return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
     }
-    if (any.is(com.github.xds.type.v3.TypedStruct.class)) {
+    if ("type.googleapis.com/xds.type.v3.TypedStruct".equals(typeUrl)) {
       com.github.xds.type.v3.TypedStruct typedStruct =
           any.unpack(com.github.xds.type.v3.TypedStruct.class);
       return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
     }
-    return new UnpackedFilterConfig(any.getTypeUrl(), any);
+    return new UnpackedFilterConfig(typeUrl, any);
   }
 
   /**
@@ -135,12 +126,10 @@ interface Filter extends Closeable {
       hcmConfigTypes.put(top.name, top.filterConfig.getClass());
     }
     if (vhosts != null) {
-      Set<FilterConfig> seenOverrides = Collections.newSetFromMap(new IdentityHashMap<>());
       Consumer<Map<String, FilterConfig>> collectOverrides = overrides -> {
         for (Map.Entry<String, FilterConfig> entry : overrides.entrySet()) {
           FilterConfig override = entry.getValue();
-          if (hcmConfigTypes.get(entry.getKey()) == override.getClass()
-              && seenOverrides.add(override)) {
+          if (hcmConfigTypes.get(entry.getKey()) == override.getClass()) {
             result.addAll(override.nestedFilterConfigs());
           }
         }

@@ -572,7 +572,7 @@ class XdsListenerResource extends XdsResourceType<LdsUpdate> {
   }
 
   // hard-coded: currently router config is the only terminal filter.
-  private static boolean isTerminalFilter(Filter.FilterConfig filterConfig) {
+  static boolean isTerminalFilter(Filter.FilterConfig filterConfig) {
     return RouterFilter.ROUTER_CONFIG.equals(filterConfig);
   }
 

@@ -614,7 +614,7 @@ final class XdsNameResolver extends NameResolver {
     }
   }
 
-  private static ClientInterceptor combineInterceptors(final List<ClientInterceptor> interceptors) {
+  static ClientInterceptor combineInterceptors(final List<ClientInterceptor> interceptors) {
     if (interceptors.size() == 0) {
       return new PassthroughClientInterceptor();
     }

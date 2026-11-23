@@ -36,7 +36,7 @@ public class MatcherTreeTest {
   public void matcherTree_missingInput_throws() {
     Matcher.MatcherTree proto = Matcher.MatcherTree.newBuilder().build();
     try {
-      new MatcherTree(proto, null, s -> true);
+      new MatcherTree(proto, null, true, true, a -> { });
       Assert.fail("Should have thrown IllegalArgumentException");
     } catch (IllegalArgumentException e) {
       assertThat(e).hasMessageThat().contains("MatcherTree must have input");
@@ -51,7 +51,7 @@ public class MatcherTreeTest {
                 .getDefaultInstance())))
         .build();
     try {
-      new MatcherTree(proto, null, s -> true);
+      new MatcherTree(proto, null, true, true, a -> { });
       Assert.fail("Should have thrown IllegalArgumentException");
     } catch (IllegalArgumentException e) {
       assertThat(e).hasMessageThat()
@@ -68,7 +68,7 @@ public class MatcherTreeTest {
         .setExactMatchMap(Matcher.MatcherTree.MatchMap.getDefaultInstance())
         .build();
     try {
-      new MatcherTree(proto, null, s -> true);
+      new MatcherTree(proto, null, true, true, a -> { });
       Assert.fail("Should have thrown IllegalArgumentException");
     } catch (IllegalArgumentException e) {
       assertThat(e).hasMessageThat()
@@ -91,7 +91,7 @@ public class MatcherTreeTest {
     MatcherTree tree = new MatcherTree(proto, 
         Matcher.OnMatch.newBuilder()
             .setAction(TypedExtensionConfig.newBuilder().setName("fallback")).build(), 
-        s -> true);
+        true, true, a -> { });
 
     MatchContext context = MatchContext.newBuilder()
         .setMetadata(new Metadata())
@@ -117,7 +117,7 @@ public class MatcherTreeTest {
     Matcher.OnMatch onNoMatch = Matcher.OnMatch.newBuilder()
         .setAction(TypedExtensionConfig.newBuilder().setName("fallback"))
         .build();
-    MatcherTree tree = new MatcherTree(proto, onNoMatch, s -> true);
+    MatcherTree tree = new MatcherTree(proto, onNoMatch, true, true, a -> { });
 
     Metadata metadata = new Metadata();
     metadata.put(Metadata.Key.of("foo", Metadata.ASCII_STRING_MARSHALLER), "other");
@@ -156,7 +156,7 @@ public class MatcherTreeTest {
         .setAction(TypedExtensionConfig.newBuilder().setName("should-not-be-called"))
         .build();
         
-    MatcherTree tree = new MatcherTree(proto, onNoMatch, s -> true);
+    MatcherTree tree = new MatcherTree(proto, onNoMatch, true, true, a -> { });
     
     Metadata metadata = new Metadata();
     metadata.put(Metadata.Key.of("path", Metadata.ASCII_STRING_MARSHALLER),
@@ -356,7 +356,7 @@ public class MatcherTreeTest {
     MatchContext context = MatchContext.newBuilder()
         .setMetadata(metadataWith("path", "/abc"))
         .build();
-    UnifiedMatcher matcher = UnifiedMatcher.fromProto(proto, (t) -> true);
+    UnifiedMatcher matcher = UnifiedMatcher.fromProto(proto);
     MatchResult result = matcher.match(context);
 
     assertThat(result.matched).isTrue();
@@ -386,7 +386,7 @@ public class MatcherTreeTest {
                         .setHeaderName("x-user-segment").build())))
             .setPrefixMatchMap(map))
         .build();
-    UnifiedMatcher matcher = UnifiedMatcher.fromProto(proto, (t) -> true);
+    UnifiedMatcher matcher = UnifiedMatcher.fromProto(proto);
     
     MatchContext context = MatchContext.newBuilder()
         .setMetadata(metadataWith("x-user-segment", "grpc.channelz.v1.Channelz/GetTopChannels"))
@@ -431,7 +431,7 @@ public class MatcherTreeTest {
         .build();
     Matcher.OnMatch onNoMatch = Matcher.OnMatch.newBuilder()
         .setAction(TypedExtensionConfig.newBuilder().setName("actionB")).build();
-    MatcherTree tree = new MatcherTree(proto, onNoMatch, s -> true);
+    MatcherTree tree = new MatcherTree(proto, onNoMatch, true, true, a -> { });
 
     Metadata metadata = new Metadata();
     metadata.put(

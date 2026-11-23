@@ -1013,8 +1013,9 @@ public class CompositeFilterTest {
         assertThat(e.getMessage()).isEqualTo("Not started");
       }
 
-      // Cancel before start is allowed and records cancel status
+      // Cancel before start is allowed; a second cancel preserves the first reason.
       call.cancel("cancelled before start", null);
+      call.cancel("second cancel", null);
 
       ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
       call.start(listener, new Metadata());
@@ -1726,7 +1727,7 @@ public class CompositeFilterTest {
                   .setName("child")
                   .setTypedConfig(Any.newBuilder().setTypeUrl(FAKE_FAILING_PARSE_TYPE_URL)))
               .build()),
-          "Child filter config parsing failed intentionally"
+          "Failed to parse child filter [child]: Child filter config parsing failed intentionally"
         },
       };
       for (Object[] c : cases) {

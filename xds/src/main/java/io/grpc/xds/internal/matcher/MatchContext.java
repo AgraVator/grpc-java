@@ -62,14 +62,14 @@ public final class MatchContext {
   }
 
   public static final class Builder {
-    private Metadata metadata = new Metadata();
+    @Nullable private Metadata metadata;
     private String path;
     private String host;
     private String method;
     private String id;
 
     public Builder setMetadata(Metadata metadata) {
-      this.metadata = metadata;
+      this.metadata = Preconditions.checkNotNull(metadata, "metadata");
       return this;
     }
 
@@ -94,7 +94,8 @@ public final class MatchContext {
     }
 
     public MatchContext build() {
-      return new MatchContext(metadata, path, host, method, id);
+      return new MatchContext(
+          metadata != null ? metadata : new Metadata(), path, host, method, id);
     }
   }
 }

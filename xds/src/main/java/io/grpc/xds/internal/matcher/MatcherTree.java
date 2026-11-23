@@ -24,7 +24,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
-import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 final class MatcherTree extends UnifiedMatcher {
@@ -37,12 +36,6 @@ final class MatcherTree extends UnifiedMatcher {
   private final PrefixTrie prefixTrie;
   @Nullable 
   private final OnMatch onNoMatch;
-
-  MatcherTree(Matcher.MatcherTree proto, @Nullable Matcher.OnMatch onNoMatchProto,
-      Predicate<String> actionValidator) {
-    this(proto, onNoMatchProto, /* allowKeepMatching= */ true, /* allowEmptyMatcher= */ true,
-        UnifiedMatcher.toActionConsumer(actionValidator));
-  }
 
   MatcherTree(Matcher.MatcherTree proto, @Nullable Matcher.OnMatch onNoMatchProto,
       boolean allowKeepMatching, boolean allowEmptyMatcher,

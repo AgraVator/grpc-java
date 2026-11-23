@@ -19,7 +19,6 @@ package io.grpc.xds.internal.matcher;
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
 import java.util.function.Consumer;
-import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 /**
@@ -44,18 +43,8 @@ public abstract class UnifiedMatcher {
    * Parses a proto Matcher into a UnifiedMatcher, allowing all actions.
    */
   public static UnifiedMatcher fromProto(Matcher proto) {
-    return fromProto(proto, (typeUrl) -> true);
-  }
-
-  /**
-   * Parses a proto Matcher into a UnifiedMatcher.
-   *
-   * @param proto the proto matcher
-   * @param actionValidator a predicate that returns true if the action type URL is supported
-   */
-  static UnifiedMatcher fromProto(Matcher proto, Predicate<String> actionValidator) {
     return fromProto(proto, /* allowKeepMatching= */ true, /* allowEmptyMatcher= */ true,
-        toActionConsumer(actionValidator));
+        action -> { });
   }
 
   /**
@@ -75,15 +64,6 @@ public abstract class UnifiedMatcher {
       Consumer<TypedExtensionConfig> actionConsumer) {
     checkRecursionDepth(proto, 0);
     return fromProtoInternal(proto, allowKeepMatching, allowEmptyMatcher, actionConsumer);
-  }
-
-  static Consumer<TypedExtensionConfig> toActionConsumer(Predicate<String> actionValidator) {
-    return action -> {
-      String typeUrl = action.getTypedConfig().getTypeUrl();
-      if (!actionValidator.test(typeUrl)) {
-        throw new IllegalArgumentException("Unsupported action type: " + typeUrl);
-      }
-    };
   }
 
   static UnifiedMatcher fromProtoInternal(

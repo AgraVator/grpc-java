@@ -24,6 +24,7 @@ import com.google.common.base.Preconditions;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
+import com.google.re2j.PatternSyntaxException;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
 import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute;
 import io.envoyproxy.envoy.extensions.filters.common.matcher.action.v3.SkipFilter;
@@ -34,9 +35,7 @@ import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
-import io.grpc.ClientInterceptors;
 import io.grpc.ForwardingClientCall;
-import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.ServerCall;
@@ -196,8 +195,9 @@ final class CompositeFilter implements Filter {
             action -> delegates.computeIfAbsent(action, a -> createFilterDelegate(a, context)));
         return ConfigOrError.fromConfig(
             new CompositeFilterConfig(matcher, delegates, matcherProto));
-      } catch (Exception e) {
-        return ConfigOrError.fromError("Failed to create matcher: " + e.getMessage());
+      } catch (IllegalArgumentException | PatternSyntaxException e) {
+        String detail = e.getMessage() != null ? e.getMessage() : e.toString();
+        return ConfigOrError.fromError("Failed to create matcher: " + detail);
       }
     }
 
@@ -214,7 +214,7 @@ final class CompositeFilter implements Filter {
         } catch (InvalidProtocolBufferException e) {
           throw new IllegalArgumentException("Could not parse SkipFilter action", e);
         }
-        return new FilterDelegate(Collections.emptyList(), null, null, null);
+        return FilterDelegate.SKIP;
       }
       if (!actionAny.is(ExecuteFilterAction.class)) {
         throw new IllegalArgumentException(
@@ -243,6 +243,8 @@ final class CompositeFilter implements Filter {
         throw new IllegalArgumentException(
             "ExecuteFilterAction must specify either typed_config or filter_chain");
       }
+      Filter.FilterConfigParseContext childContext =
+          context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
       List<NamedFilterConfig> configs = new ArrayList<>(childConfigs.size());
       Status clientUnsupportedError = null;
       Status serverUnsupportedError = null;
@@ -260,20 +262,18 @@ final class CompositeFilter implements Filter {
           throw new IllegalArgumentException("Action filter not found: " + typeUrl);
         }
 
-        Filter.FilterConfigParseContext childContext =
-            context.toBuilder().recursionDepth(context.recursionDepth() + 1).build();
+        String childName = childFilterConfig.getName();
+        String label = childName.isEmpty() ? typeUrl : childName;
         ConfigOrError<? extends FilterConfig> parsed =
             provider.parseFilterConfig(unpacked.rawConfig, childContext);
         if (parsed.errorDetail != null) {
           throw new IllegalArgumentException(
-              "Failed to parse child filter: " + parsed.errorDetail);
+              "Failed to parse child filter [" + label + "]: " + parsed.errorDetail);
         }
-        if (parsed.config == RouterFilter.ROUTER_CONFIG) {
+        if (XdsListenerResource.isTerminalFilter(parsed.config)) {
           throw new IllegalArgumentException(
               "Nested filter cannot be a terminal filter: " + typeUrl);
         }
-        String childName = childFilterConfig.getName();
-        String label = childName.isEmpty() ? typeUrl : childName;
         if (clientUnsupportedError == null && !provider.isClientFilter()) {
           clientUnsupportedError = Status.UNAVAILABLE.withDescription(
               "Filter " + label + " is not supported on client side");
@@ -344,6 +344,9 @@ final class CompositeFilter implements Filter {
   }
 
   static final class FilterDelegate {
+    static final FilterDelegate SKIP =
+        new FilterDelegate(Collections.emptyList(), null, null, null);
+
     final List<NamedFilterConfig> configs;
     @Nullable
     final Status clientUnsupportedError;
@@ -361,6 +364,7 @@ final class CompositeFilter implements Filter {
           ThreadSafeRandom.ThreadSafeRandomImpl.instance);
     }
 
+    @VisibleForTesting
     FilterDelegate(
         List<NamedFilterConfig> configs,
         @Nullable Status clientUnsupportedError,
@@ -416,20 +420,25 @@ final class CompositeFilter implements Filter {
 
   private static final class ResolvedDelegate<I> {
     final FilterDelegate delegate;
-    final StatusOr<List<I>> interceptors;
+    final StatusOr<I> interceptor;
 
-    ResolvedDelegate(FilterDelegate delegate, StatusOr<List<I>> interceptors) {
+    ResolvedDelegate(FilterDelegate delegate, StatusOr<I> interceptor) {
       this.delegate = delegate;
-      this.interceptors = interceptors;
+      this.interceptor = interceptor;
     }
+  }
+
+  private static CompositeFilterConfig effectiveConfig(
+      FilterConfig config, @Nullable FilterConfig overrideConfig) {
+    return overrideConfig instanceof CompositeFilterConfig
+        ? (CompositeFilterConfig) overrideConfig : (CompositeFilterConfig) config;
   }
 
   @Override
   public ClientInterceptor buildClientInterceptor(FilterConfig config,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
     Preconditions.checkNotNull(config, "config");
-    CompositeFilterConfig effective =
-        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
+    CompositeFilterConfig effective = effectiveConfig(config, overrideConfig);
     if (effective.matcher == null) {
       return null;
     }
@@ -439,7 +448,8 @@ final class CompositeFilter implements Filter {
             effective,
             /* isServer= */ false,
             (filter, childCfg) ->
-                filter.buildClientInterceptor(childCfg, /* overrideConfig= */ null, scheduler));
+                filter.buildClientInterceptor(childCfg, /* overrideConfig= */ null, scheduler),
+            XdsNameResolver::combineInterceptors);
 
     return new ClientInterceptor() {
       @Override
@@ -456,8 +466,7 @@ final class CompositeFilter implements Filter {
   public ServerInterceptor buildServerInterceptor(
       FilterConfig config, @Nullable FilterConfig overrideConfig) {
     Preconditions.checkNotNull(config, "config");
-    CompositeFilterConfig effective =
-        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
+    CompositeFilterConfig effective = effectiveConfig(config, overrideConfig);
     if (effective.matcher == null) {
       return null;
     }
@@ -467,13 +476,14 @@ final class CompositeFilter implements Filter {
             effective,
             /* isServer= */ true,
             (filter, childCfg) ->
-                filter.buildServerInterceptor(childCfg, /* overrideConfig= */ null));
+                filter.buildServerInterceptor(childCfg, /* overrideConfig= */ null),
+            XdsServerWrapper::combineInterceptors);
 
     return new ServerInterceptor() {
       @Override
       public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
           ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-        StatusOr<List<ServerInterceptor>> selected = selectInterceptors(
+        StatusOr<ServerInterceptor> selected = selectInterceptor(
             effective.matcher,
             resolvedDelegates,
             headers,
@@ -483,13 +493,10 @@ final class CompositeFilter implements Filter {
           call.close(selected.getStatus(), new Metadata());
           return new ServerCall.Listener<ReqT>() {};
         }
-        List<ServerInterceptor> interceptors = selected.getValue();
-        ServerCallHandler<ReqT, RespT> wrapped = next;
-        for (int i = interceptors.size() - 1; i >= 0; i--) {
-          wrapped = InternalServerInterceptors.interceptCallHandlerCreate(
-              interceptors.get(i), wrapped);
-        }
-        return wrapped.startCall(call, headers);
+        ServerInterceptor interceptor = selected.getValue();
+        return interceptor == null
+            ? next.startCall(call, headers)
+            : interceptor.interceptCall(call, headers, next);
       }
     };
   }
@@ -508,10 +515,11 @@ final class CompositeFilter implements Filter {
         filter.requiresResponsePayloadAccess(nestedConfig, /* overrideConfig= */ null));
   }
 
+  // Client-only: called from XdsNameResolver to decide whether to install
+  // RawMessageClientInterceptor.
   private boolean anyNestedFilter(FilterConfig config, @Nullable FilterConfig overrideConfig,
       BiPredicate<Filter, FilterConfig> predicate) {
-    CompositeFilterConfig effective =
-        (CompositeFilterConfig) Filter.effectiveConfig(config, overrideConfig);
+    CompositeFilterConfig effective = effectiveConfig(config, overrideConfig);
     if (effective.matcher == null) {
       return false;
     }
@@ -531,11 +539,13 @@ final class CompositeFilter implements Filter {
   private <I> Map<TypedExtensionConfig, ResolvedDelegate<I>> buildResolvedDelegates(
       CompositeFilterConfig effective,
       boolean isServer,
-      BiFunction<Filter, FilterConfig, I> buildInterceptor) {
+      BiFunction<Filter, FilterConfig, I> buildInterceptor,
+      Function<List<I>, I> combineInterceptors) {
     Map<TypedExtensionConfig, ResolvedDelegate<I>> resolved = new LinkedHashMap<>();
     for (Map.Entry<TypedExtensionConfig, FilterDelegate> entry : effective.delegates.entrySet()) {
       resolved.put(
-          entry.getKey(), resolveDelegate(entry.getValue(), isServer, buildInterceptor));
+          entry.getKey(),
+          resolveDelegate(entry.getValue(), isServer, buildInterceptor, combineInterceptors));
     }
     return Collections.unmodifiableMap(resolved);
   }
@@ -543,7 +553,8 @@ final class CompositeFilter implements Filter {
   private <I> ResolvedDelegate<I> resolveDelegate(
       FilterDelegate delegate,
       boolean isServer,
-      BiFunction<Filter, FilterConfig, I> buildInterceptor) {
+      BiFunction<Filter, FilterConfig, I> buildInterceptor,
+      Function<List<I>, I> combineInterceptors) {
     Status unsupportedError = delegate.unsupportedError(isServer);
     if (unsupportedError != null) {
       return new ResolvedDelegate<>(delegate, StatusOr.fromStatus(unsupportedError));
@@ -555,8 +566,8 @@ final class CompositeFilter implements Filter {
         interceptors.add(interceptor);
       }
     }
-    return new ResolvedDelegate<>(
-        delegate, StatusOr.fromValue(Collections.unmodifiableList(interceptors)));
+    I combined = interceptors.isEmpty() ? null : combineInterceptors.apply(interceptors);
+    return new ResolvedDelegate<>(delegate, StatusOr.fromValue(combined));
   }
 
   private Filter nestedFilter(NamedFilterConfig nested) {
@@ -567,7 +578,7 @@ final class CompositeFilter implements Filter {
         "No filter instance for nested filter %s", nested.filterStateKey());
   }
 
-  private static <I> StatusOr<List<I>> selectInterceptors(
+  private static <I> StatusOr<I> selectInterceptor(
       UnifiedMatcher matcher,
       Map<TypedExtensionConfig, ResolvedDelegate<I>> delegatesMap,
       Metadata headers,
@@ -584,6 +595,7 @@ final class CompositeFilter implements Filter {
     try {
       matchResult = matcher.match(context);
     } catch (RuntimeException e) {
+      logger.log(Level.FINE, "Composite filter matcher evaluation failed for " + fullMethodName, e);
       return StatusOr.fromStatus(Status.UNAVAILABLE
           .withDescription("composite filter matcher evaluation failed")
           .withCause(e));
@@ -602,9 +614,9 @@ final class CompositeFilter implements Filter {
     if (!resolved.delegate.shouldExecute()) {
       logger.log(Level.FINE, "Matched action not sampled, skipping nested filters for {0}",
           fullMethodName);
-      return StatusOr.fromValue(Collections.emptyList());
+      return StatusOr.fromValue(null);
     }
-    return resolved.interceptors;
+    return resolved.interceptor;
   }
 
   /**
@@ -623,7 +635,7 @@ final class CompositeFilter implements Filter {
     // Null until start().
     private volatile ClientCall<ReqT, RespT> delegate;
     // cancel() is the only method allowed before start(); it is recorded and reported from start().
-    private Status cancelledBeforeStart;
+    private volatile Status cancelledBeforeStart;
 
     CompositeClientCall(MethodDescriptor<ReqT, RespT> method, CallOptions callOptions,
         Channel next, UnifiedMatcher matcher,
@@ -674,7 +686,9 @@ final class CompositeFilter implements Filter {
     public void cancel(@Nullable String message, @Nullable Throwable cause) {
       ClientCall<ReqT, RespT> call = delegate;
       if (call == null) {
-        cancelledBeforeStart = Status.CANCELLED.withDescription(message).withCause(cause);
+        if (cancelledBeforeStart == null) {
+          cancelledBeforeStart = Status.CANCELLED.withDescription(message).withCause(cause);
+        }
         return;
       }
       call.cancel(message, cause);
@@ -690,19 +704,16 @@ final class CompositeFilter implements Filter {
 
       String host = callOptions.getAuthority() != null
           ? callOptions.getAuthority() : next.authority();
-      StatusOr<List<ClientInterceptor>> selected =
-          selectInterceptors(matcher, delegatesMap, headers, method.getFullMethodName(), host);
+      StatusOr<ClientInterceptor> selected =
+          selectInterceptor(matcher, delegatesMap, headers, method.getFullMethodName(), host);
       if (!selected.hasValue()) {
         failCall(responseListener, selected.getStatus());
         return;
       }
-      List<ClientInterceptor> interceptors = selected.getValue();
-      // interceptForward, not intercept: A103 specifies filter_chain as "a chain of filters to
-      // call, in order", so the first entry has to run first. ClientInterceptors.intercept makes
-      // the *last* interceptor outermost, which would run the chain backwards.
-      ClientCall<ReqT, RespT> realCall = interceptors.isEmpty()
+      ClientInterceptor interceptor = selected.getValue();
+      ClientCall<ReqT, RespT> realCall = interceptor == null
           ? next.newCall(method, callOptions)
-          : ClientInterceptors.interceptForward(next, interceptors).newCall(method, callOptions);
+          : interceptor.interceptCall(method, callOptions, next);
       delegate = realCall;
       realCall.start(responseListener, headers);
     }

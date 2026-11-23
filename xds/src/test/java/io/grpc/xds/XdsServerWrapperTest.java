@@ -2501,6 +2501,46 @@ public class XdsServerWrapperTest {
   }
 
   /**
+   * Server route resolution always evaluates per-route overrides with {@code weight = null}, so a
+   * route with {@code weighted_clusters} where every {@code ClusterWeight} overrides the composite
+   * must still keep the HCM composite's nested filter alive on the server.
+   */
+  @Test
+  public void filterState_serverIgnoresWeightedClusterOverrides_instantiatesHcmNestedFilter()
+      throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      VirtualHost.Route.RouteAction.ClusterWeight weightOverridingC =
+          VirtualHost.Route.RouteAction.ClusterWeight.create(
+              "cluster-a", 100,
+              ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("w"))));
+      Route weightedRoute = Route.forAction(
+          RouteMatch.withPathExactOnly("/grpc.test.HelloService/SayHello"),
+          VirtualHost.Route.RouteAction.forWeightedClusters(
+              ImmutableList.of(weightOverridingC), ImmutableList.of(), null, null, false),
+          NO_FILTER_OVERRIDES);
+      VirtualHost vhost = VirtualHost.create(
+          "stateful-vhost",
+          ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(weightedRoute),
+          NO_FILTER_OVERRIDES);
+
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcm(vhost, ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("a")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+      verifyServerStarted(serverStart);
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
    * Starts the server with a registry holding StatefulFilter, the composite filter and the router.
    * The composite resolves nested filter types through that same registry.
    */

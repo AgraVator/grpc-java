@@ -74,6 +74,7 @@ import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
+import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -103,12 +104,15 @@ import io.grpc.xds.client.EnvoyProtoData;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.matcher.MatchResult;
 import io.grpc.xds.internal.matcher.UnifiedMatcher;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -2950,7 +2954,9 @@ public class CompositeFilterTest {
       assertThat(handBuilt1.equals(handBuiltDifferent)).isFalse();
       assertThat(handBuilt1.equals(cfg)).isFalse();
       assertThat(cfg.equals(handBuilt1)).isFalse();
-      assertThat(handBuilt1.toString()).contains("matcher=none");
+      assertThat(handBuilt1.toString()).contains("matcher=set");
+      assertThat(new CompositeFilter.CompositeFilterConfig(null, null).toString())
+          .contains("matcher=none");
     }
 
     @Test
@@ -3532,6 +3538,133 @@ public class CompositeFilterTest {
       assertThat(result.config).isNull();
       assertThat(result.errorDetail).contains("Matcher tree depth exceeds limit of 16");
       verify(fakeProvider, never()).parseFilterConfig(any(), any());
+    }
+
+    @Test
+    public void parseFilterConfig_extensionConfigWrappedInTypedStruct_succeeds() {
+      Matcher matcher = matcherFallingThroughTo(
+          Matcher.OnMatch.newBuilder()
+              .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                  .setName("skip")
+                  .setTypedConfig(Any.pack(SkipFilter.getDefaultInstance())))
+              .build())
+          .build();
+
+      ExtensionWithMatcher udpaWrapped = ExtensionWithMatcher.newBuilder()
+          .setExtensionConfig(TypedExtensionConfig.newBuilder()
+              .setName("composite")
+              .setTypedConfig(Any.pack(TypedStruct.newBuilder()
+                  .setTypeUrl(CompositeFilter.TYPE_URL_COMPOSITE)
+                  .build())))
+          .setXdsMatcher(matcher)
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> udpaResult =
+          provider.parseFilterConfig(Any.pack(udpaWrapped), getFilterContext());
+      assertThat(udpaResult.errorDetail).isNull();
+      assertThat(udpaResult.config).isNotNull();
+
+      ExtensionWithMatcher xdsWrapped = ExtensionWithMatcher.newBuilder()
+          .setExtensionConfig(TypedExtensionConfig.newBuilder()
+              .setName("composite")
+              .setTypedConfig(Any.pack(com.github.xds.type.v3.TypedStruct.newBuilder()
+                  .setTypeUrl(CompositeFilter.TYPE_URL_COMPOSITE)
+                  .build())))
+          .setXdsMatcher(matcher)
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> xdsResult =
+          provider.parseFilterConfig(Any.pack(xdsWrapped), getFilterContext());
+      assertThat(xdsResult.errorDetail).isNull();
+      assertThat(xdsResult.config).isNotNull();
+
+      ExtensionWithMatcher wrongInner = ExtensionWithMatcher.newBuilder()
+          .setExtensionConfig(TypedExtensionConfig.newBuilder()
+              .setName("composite")
+              .setTypedConfig(Any.pack(TypedStruct.newBuilder()
+                  .setTypeUrl(RouterFilter.TYPE_URL)
+                  .build())))
+          .setXdsMatcher(matcher)
+          .build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> wrongResult =
+          provider.parseFilterConfig(Any.pack(wrongInner), getFilterContext());
+      assertThat(wrongResult.config).isNull();
+      assertThat(wrongResult.errorDetail).contains("empty Composite proto");
+    }
+
+    @Test
+    public void failCall_dispatchesOnCallOptionsExecutorWithContextAndIsReadyFalse() {
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcherNeverMatching())), getFilterContext());
+      assertThat(parsed.errorDetail).isNull();
+
+      CompositeFilter filter = newFilter("composite");
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          parsed.config, null, mock(ScheduledExecutorService.class));
+
+      Queue<Runnable> tasks = new ArrayDeque<>();
+      Context.Key<String> ctxKey = Context.key("composite-test-ctx");
+      CallOptions callOptions = CallOptions.DEFAULT.withExecutor(tasks::add);
+      Context callCtx = Context.current().withValue(ctxKey, "propagated");
+      ClientCall<Void, Void> call;
+      Context prev = callCtx.attach();
+      try {
+        call = interceptor.interceptCall(createMockMethod(), callOptions, mock(Channel.class));
+      } finally {
+        callCtx.detach(prev);
+      }
+      assertThat(call.isReady()).isFalse();
+
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      AtomicReference<String> observedCtx = new AtomicReference<>();
+      org.mockito.Mockito.doAnswer(invocation -> {
+        observedCtx.set(ctxKey.get());
+        return null;
+      }).when(listener).onClose(any(Status.class), any(Metadata.class));
+
+      call.start(listener, new Metadata());
+
+      assertThat(call.isReady()).isFalse();
+      verify(listener, never()).onClose(any(), any());
+      assertThat(tasks).hasSize(1);
+      tasks.remove().run();
+
+      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(observedCtx.get()).isEqualTo("propagated");
+    }
+
+    @Test
+    public void emptyNameUnsupportedSideAndPayloadAccess_usesTypeUrlAndSkipsUnsupportedDelegate() {
+      Matcher matcher = matcherFallingThroughTo(
+          executeNestedFilter("", FAKE_UNSUPPORTED_TYPE_URL)).build();
+      ConfigOrError<CompositeFilter.CompositeFilterConfig> parsed =
+          provider.parseFilterConfig(
+              Any.pack(createExtensionWithMatcher(matcher)), getFilterContext());
+      assertThat(parsed.errorDetail).isNull();
+
+      CompositeFilter filter = newFilter("composite");
+      assertThat(filter.requiresRequestPayloadAccess(parsed.config, null)).isFalse();
+      assertThat(filter.requiresResponsePayloadAccess(parsed.config, null)).isFalse();
+      verify(fakeUnsupportedProvider, never()).newInstance(any(FilterContext.class));
+
+      ClientInterceptor interceptor = filter.buildClientInterceptor(
+          parsed.config, null, mock(ScheduledExecutorService.class));
+      ClientCall<Void, Void> call =
+          interceptor.interceptCall(createMockMethod(), CallOptions.DEFAULT, mock(Channel.class));
+      ClientCall.Listener<Void> listener = mock(ClientCall.Listener.class);
+      call.start(listener, new Metadata());
+
+      ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+      verify(listener).onClose(statusCaptor.capture(), any(Metadata.class));
+      assertThat(statusCaptor.getValue().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(statusCaptor.getValue().getDescription())
+          .isEqualTo("Filter " + FAKE_UNSUPPORTED_TYPE_URL + " is not supported on client side");
+
+      CompositeFilter.CompositeFilterConfig directConfig =
+          new CompositeFilter.CompositeFilterConfig(
+              parsed.config.matcher, Collections.emptyMap());
+      assertThat(directConfig.toString()).contains("matcher=set");
     }
 
     @Test
@@ -4302,6 +4435,32 @@ public class CompositeFilterTest {
       assertThat(e3.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
     }
 
+    @Test
+    public void perRouteOverride_replacesTopLevelMatcherOnServer() {
+      Matcher topLevelMatcher = matcherOnMatchHeader(skipAction());
+      Matcher routeOverrideMatcher = Matcher.newBuilder()
+          .setMatcherList(Matcher.MatcherList.newBuilder()
+              .addMatchers(serverFieldMatcher("override-allow", skipAction()))
+              .addMatchers(serverFieldMatcher("override-deny", executeRbacAction())))
+          .build();
+      pushServerCompositeMatcher(topLevelMatcher, routeOverrideMatcher);
+      awaitCompositeFilterActive();
+
+      // Top-level matcher ("run" -> SkipFilter) was replaced wholesale by the route override.
+      StatusRuntimeException replaced = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("run"));
+      assertThat(replaced.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(replaced.getStatus().getDescription())
+          .contains("no match found in composite filter");
+
+      assertThat(callWithMatchHeaderValue("override-allow")).isEqualTo(EXPECTED_RESPONSE);
+
+      // Nested RBAC filter declared only in the route override is instantiated and enforced.
+      StatusRuntimeException denied = assertThrows(StatusRuntimeException.class,
+          () -> callWithMatchHeaderValue("override-deny"));
+      assertThat(denied.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
@@ -4370,6 +4529,10 @@ public class CompositeFilterTest {
     }
 
     private void pushServerCompositeMatcher(Matcher matcher) {
+      pushServerCompositeMatcher(matcher, null);
+    }
+
+    private void pushServerCompositeMatcher(Matcher matcher, Matcher routeOverrideMatcher) {
       ExtensionWithMatcher compositeConfig = ExtensionWithMatcher.newBuilder()
           .setExtensionConfig(TypedExtensionConfig.newBuilder()
               .setName(COMPOSITE_FILTER_NAME)
@@ -4387,13 +4550,21 @@ public class CompositeFilterTest {
           .setIsOptional(true)
           .build();
 
+      Route.Builder routeBuilder = Route.newBuilder()
+          .setMatch(RouteMatch.newBuilder().setPrefix("/"))
+          .setNonForwardingAction(NonForwardingAction.getDefaultInstance());
+      if (routeOverrideMatcher != null) {
+        routeBuilder.putTypedPerFilterConfig(
+            COMPOSITE_FILTER_NAME,
+            Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+                .setXdsMatcher(routeOverrideMatcher)
+                .build()));
+      }
       RouteConfiguration routeConfig = RouteConfiguration.newBuilder()
           .addVirtualHosts(VirtualHost.newBuilder()
               .setName("virtual-host-0")
               .addDomains("*")
-              .addRoutes(Route.newBuilder()
-                  .setMatch(RouteMatch.newBuilder().setPrefix("/"))
-                  .setNonForwardingAction(NonForwardingAction.getDefaultInstance())))
+              .addRoutes(routeBuilder))
           .build();
 
       io.envoyproxy.envoy.config.listener.v3.Filter networkFilter =

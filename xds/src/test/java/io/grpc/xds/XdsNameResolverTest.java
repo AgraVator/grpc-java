@@ -1961,6 +1961,43 @@ public class XdsNameResolverTest {
   }
 
   /**
+   * Client {@code NonForwardingAction} routes build no interceptors, so they must not force the HCM
+   * composite's nested filter to be instantiated when all forwarding routes override the composite.
+   */
+  @Test
+  public void filterState_nonForwardingRoute_ignoredWhenForwardingRouteOverridesComposite() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = filterStateTestSetupResolverWithComposite();
+      FakeXdsClient xdsClient = (FakeXdsClient) resolver.getXdsClient();
+      ImmutableList<NamedFilterConfig> filterConfigs = ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("a")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
+
+      Route forwardingRouteOverridingC = Route.forAction(
+          RouteMatch.withPathExactOnly(call1.getFullMethodNameForPath()),
+          RouteAction.forCluster(cluster1, NO_HASH_POLICIES, null, null, false),
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x"))));
+      Route nonForwardingRoute = Route.forNonForwardingAction(
+          RouteMatch.withPathExactOnly("/non/forwarding"),
+          NO_FILTER_OVERRIDES);
+      VirtualHost vhost = VirtualHost.create(
+          "stateful-vhost",
+          ImmutableList.of(expectedLdsResourceName),
+          ImmutableList.of(forwardingRouteOverridingC, nonForwardingRoute),
+          NO_FILTER_OVERRIDES);
+
+      xdsClient.deliverLdsUpdateWithFilters(vhost, filterConfigs);
+      createAndDeliverClusterUpdates(xdsClient, cluster1);
+      assertClusterResolutionResult(call1, cluster1);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("x");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
    * "g" is both a top-level filter and nested in "c": one instance, alive as long as either
    * reaches it. Here the top-level one goes first.
    */

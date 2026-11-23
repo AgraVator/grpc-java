@@ -90,7 +90,9 @@ interface Filter extends Closeable {
    * that route.
    */
   static List<NamedFilterConfig> collectAllFilterConfigs(
-      @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
+      @Nullable List<NamedFilterConfig> hcmConfigs,
+      @Nullable List<VirtualHost> vhosts,
+      boolean isClient) {
     List<NamedFilterConfig> result = new ArrayList<>();
     if (hcmConfigs == null) {
       return result;
@@ -100,8 +102,12 @@ interface Filter extends Closeable {
     if (vhosts != null) {
       for (VirtualHost vhost : vhosts) {
         for (VirtualHost.Route route : vhost.routes()) {
+          if (isClient && route.routeAction() == null) {
+            continue;
+          }
           List<VirtualHost.Route.RouteAction.ClusterWeight> weights =
-              route.routeAction() != null ? route.routeAction().weightedClusters() : null;
+              isClient && route.routeAction() != null
+                  ? route.routeAction().weightedClusters() : null;
           for (VirtualHost.Route.RouteAction.ClusterWeight weight
               : weights != null && !weights.isEmpty()
                   ? weights

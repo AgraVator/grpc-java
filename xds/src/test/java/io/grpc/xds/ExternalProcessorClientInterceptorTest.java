@@ -112,6 +112,7 @@ import org.mockito.Mockito;
  * Unit tests for {@link ExternalProcessorFilter}.
  */
 @RunWith(JUnit4.class)
+@SuppressWarnings("deprecation") // request_drain, replaced by request_drain_requests/responses.
 public class ExternalProcessorClientInterceptorTest {
   private static final String INSECURE_CREDENTIALS_TYPE_URL =
       "type.googleapis.com/envoy.extensions.grpc_service."
@@ -22056,7 +22057,7 @@ public class ExternalProcessorClientInterceptorTest {
     ExternalProcessorFilterConfig filterConfig =
         provider.parseFilterConfig(Any.pack(proto), filterContext).config;
 
-    String longValue = new String(new char[16385]).replace('\0', 'v');
+    String longValue = new String(new char[32769]).replace('\0', 'v');
 
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
         new ExternalProcessorGrpc.ExternalProcessorImplBase() {
@@ -22165,8 +22166,8 @@ public class ExternalProcessorClientInterceptorTest {
     ExternalProcessorFilterConfig filterConfig =
         provider.parseFilterConfig(Any.pack(proto), filterContext).config;
 
-    // Create a value that is 16385 characters long (exceeding 16384 limit)
-    String longValue = new String(new char[16385]).replace('\0', 'v');
+    // Create a value that is 32769 characters long (exceeding 32768 limit)
+    String longValue = new String(new char[32769]).replace('\0', 'v');
 
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
         new ExternalProcessorGrpc.ExternalProcessorImplBase() {

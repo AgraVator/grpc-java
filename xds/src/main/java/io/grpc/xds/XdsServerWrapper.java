@@ -129,11 +129,42 @@ final class XdsServerWrapper extends Server {
 
   // Must be accessed in syncContext.
   // Filter instances are unique per Server, per FilterChain, and per filter's name+typeUrl.
-  // FilterChain.name -> <NamedFilterConfig.filterStateKey -> filter_instance>.
+  // Top-level and nested filters alike live in the chain's map, so the same name+typeUrl
+  // anywhere in the chain's HCM is one instance.
+  // FilterChain.name -> NamedFilterConfig.filterStateKey -> filter_instance.
   private final HashMap<String, HashMap<String, Filter>> activeFilters = new HashMap<>();
   // Default filter chain Filter instances are unique per Server, and per filter's name+typeUrl.
   // NamedFilterConfig.filterStateKey -> filter_instance.
   private final HashMap<String, Filter> activeFiltersDefaultChain = new HashMap<>();
+
+  private static final ServerInterceptor NOOP_SERVER_INTERCEPTOR = new ServerInterceptor() {
+    @Override
+    public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+        Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+      return next.startCall(call, headers);
+    }
+  };
+
+  static ServerInterceptor combineInterceptors(final List<ServerInterceptor> interceptors) {
+    if (interceptors.isEmpty()) {
+      return NOOP_SERVER_INTERCEPTOR;
+    }
+    if (interceptors.size() == 1) {
+      return interceptors.get(0);
+    }
+    return new ServerInterceptor() {
+      @Override
+      public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+          Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        // intercept forward
+        for (int i = interceptors.size() - 1; i >= 0; i--) {
+          next = InternalServerInterceptors.interceptCallHandlerCreate(
+              interceptors.get(i), next);
+        }
+        return next.startCall(call, headers);
+      }
+    };
+  }
 
   private final ChannelConfigurator channelConfigurator;
 
@@ -407,15 +438,8 @@ final class XdsServerWrapper extends Server {
     @Nullable
     private FilterChain defaultFilterChain;
     private boolean stopped;
-    private final Map<FilterChain, AtomicReference<ServerRoutingConfig>> savedRdsRoutingConfigRef 
+    private final Map<FilterChain, AtomicReference<ServerRoutingConfig>> savedRdsRoutingConfigRef
         = new HashMap<>();
-    private final ServerInterceptor noopInterceptor = new ServerInterceptor() {
-      @Override
-      public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
-          Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-        return next.startCall(call, headers);
-      }
-    };
 
     private DiscoveryState(String resourceName) {
       this.resourceName = checkNotNull(resourceName, "resourceName");
@@ -465,7 +489,6 @@ final class XdsServerWrapper extends Server {
 
       filterChains = ldsUpdate.listener().filterChains();
       defaultFilterChain = ldsUpdate.listener().defaultFilterChain();
-      updateActiveFilters();
 
       List<FilterChain> allFilterChains = filterChains;
       if (defaultFilterChain != null) {
@@ -548,6 +571,8 @@ final class XdsServerWrapper extends Server {
     }
 
     private void updateSelector() {
+      // The chains removed by the LDS were serving until now; close their filters only here.
+      updateActiveFilters();
       // This is regenerated in generateRoutingConfig() calls below.
       savedRdsRoutingConfigRef.clear();
 
@@ -586,14 +611,16 @@ final class XdsServerWrapper extends Server {
       startDelegateServer();
     }
 
+    /**
+     * Adds the maps of chains new to the LDS and closes the filters of chains it dropped. The
+     * filters of each remaining chain are reconciled when its routes are built.
+     */
     // called in syncContext
     private void updateActiveFilters() {
       Set<String> removedChains = new HashSet<>(activeFilters.keySet());
       for (FilterChain filterChain: filterChains) {
         removedChains.remove(filterChain.name());
-        updateActiveFiltersForChain(
-            activeFilters.computeIfAbsent(filterChain.name(), k -> new HashMap<>()),
-            filterChain.httpConnectionManager().httpFilterConfigs());
+        activeFilters.computeIfAbsent(filterChain.name(), k -> new HashMap<>());
       }
 
       // Shutdown all filters of chains missing from the LDS.
@@ -605,11 +632,9 @@ final class XdsServerWrapper extends Server {
       }
 
       // Default chain.
-      ImmutableList<NamedFilterConfig> defaultChainConfigs = null;
-      if (defaultFilterChain != null) {
-        defaultChainConfigs = defaultFilterChain.httpConnectionManager().httpFilterConfigs();
+      if (defaultFilterChain == null) {
+        updateActiveFiltersForChain(activeFiltersDefaultChain, null);
       }
-      updateActiveFiltersForChain(activeFiltersDefaultChain, defaultChainConfigs);
     }
 
     // called in syncContext
@@ -637,8 +662,9 @@ final class XdsServerWrapper extends Server {
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
         Filter filter = chainFilters.computeIfAbsent(
-            filterKey, k -> provider.newInstance(
-                FilterContext.create(namedFilter.name, new MetricRecorder() {})));
+            filterKey, k -> provider.newInstance(FilterContext.create(
+                namedFilter.name, new MetricRecorder() {},
+                cfg -> chainFilters.get(cfg.filterStateKey()))));
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
       }
@@ -674,6 +700,8 @@ final class XdsServerWrapper extends Server {
             generatePerRouteInterceptors(hcm.httpFilterConfigs(), savedVhosts, chainFilters));
       } else {
         routingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
+        updateActiveFiltersForChain(
+            chainFilters, Filter.collectAllFilterConfigs(hcm.httpFilterConfigs(), null));
       }
       AtomicReference<ServerRoutingConfig> routingConfigRef = new AtomicReference<>(routingConfig);
       savedRdsRoutingConfigRef.put(filterChain, routingConfigRef);
@@ -687,6 +715,8 @@ final class XdsServerWrapper extends Server {
       syncContext.throwIfNotInThisSynchronizationContext();
 
       checkNotNull(chainFilters, "chainFilters");
+      updateActiveFiltersForChain(
+          chainFilters, Filter.collectAllFilterConfigs(filterConfigs, virtualHosts));
       ImmutableMap.Builder<Route, ServerInterceptor> perRouteInterceptors =
           new ImmutableMap.Builder<>();
 
@@ -694,22 +724,16 @@ final class XdsServerWrapper extends Server {
         for (Route route : virtualHost.routes()) {
           // Short circuit.
           if (filterConfigs == null) {
-            perRouteInterceptors.put(route, noopInterceptor);
+            perRouteInterceptors.put(route, NOOP_SERVER_INTERCEPTOR);
             continue;
           }
-
-          // Override vhost filter configs with more specific per-route configs.
-          Map<String, FilterConfig> perRouteOverrides = ImmutableMap.<String, FilterConfig>builder()
-              .putAll(virtualHost.filterConfigOverrides())
-              .putAll(route.filterConfigOverrides())
-              .buildKeepingLast();
 
           // Interceptors for this vhost/route combo.
           List<ServerInterceptor> interceptors = new ArrayList<>(filterConfigs.size());
           for (NamedFilterConfig namedFilter : filterConfigs) {
             String name = namedFilter.name;
             FilterConfig config = namedFilter.filterConfig;
-            FilterConfig overrideConfig = perRouteOverrides.get(name);
+            FilterConfig overrideConfig = Filter.lookupOverride(name, virtualHost, route, null);
             String filterKey = namedFilter.filterStateKey();
 
             Filter filter = chainFilters.get(filterKey);
@@ -728,27 +752,6 @@ final class XdsServerWrapper extends Server {
       }
 
       return perRouteInterceptors.buildOrThrow();
-    }
-
-    private ServerInterceptor combineInterceptors(final List<ServerInterceptor> interceptors) {
-      if (interceptors.isEmpty()) {
-        return noopInterceptor;
-      }
-      if (interceptors.size() == 1) {
-        return interceptors.get(0);
-      }
-      return new ServerInterceptor() {
-        @Override
-        public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
-            Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-          // intercept forward
-          for (int i = interceptors.size() - 1; i >= 0; i--) {
-            next = InternalServerInterceptors.interceptCallHandlerCreate(
-                interceptors.get(i), next);
-          }
-          return next.startCall(call, headers);
-        }
-      };
     }
 
     private void handleConfigNotFoundOrMismatch(StatusException exception) {
@@ -870,6 +873,8 @@ final class XdsServerWrapper extends Server {
 
           ServerRoutingConfig updatedRoutingConfig;
           if (savedVirtualHosts == null) {
+            // Intentionally keep chainFilters intact across transient RDS outages; LDS updates
+            // reconcile against HCM configs in generateRoutingConfig().
             updatedRoutingConfig = ServerRoutingConfig.FAILING_ROUTING_CONFIG;
           } else {
             HashMap<String, Filter> chainFilters = activeFilters.get(filterChain.name());

@@ -134,7 +134,8 @@ final class XdsNameResolver extends NameResolver {
   private final long randomChannelId;
   private final Args nameResolverArgs;
   // Must be accessed in syncContext.
-  // Filter instances are unique per channel, and per filter (name+typeUrl).
+  // Filter instances are unique per channel, and per filter (name+typeUrl). Top-level and nested
+  // filters alike live here, so the same name+typeUrl anywhere in the HCM is one instance.
   // NamedFilterConfig.filterStateKey -> filter_instance.
   private final HashMap<String, Filter> activeFilters = new HashMap<>();
 
@@ -613,7 +614,7 @@ final class XdsNameResolver extends NameResolver {
     }
   }
 
-  private static ClientInterceptor combineInterceptors(final List<ClientInterceptor> interceptors) {
+  static ClientInterceptor combineInterceptors(final List<ClientInterceptor> interceptors) {
     if (interceptors.size() == 0) {
       return new PassthroughClientInterceptor();
     }
@@ -688,7 +689,7 @@ final class XdsNameResolver extends NameResolver {
 
       stopped = true;
       xdsDependencyManager.shutdown();
-      updateActiveFilters(null);
+      updateActiveFilters(null, null);
     }
 
     @Override
@@ -700,7 +701,7 @@ final class XdsNameResolver extends NameResolver {
 
       lastConfigOrStatus = updateOrStatus;
       if (!updateOrStatus.hasValue()) {
-        updateActiveFilters(null);
+        updateActiveFilters(null, null);
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -710,7 +711,7 @@ final class XdsNameResolver extends NameResolver {
       HttpConnectionManager httpConnectionManager = update.getListener().httpConnectionManager();
       if (httpConnectionManager == null) {
         logger.log(XdsLogLevel.INFO, "API Listener: httpConnectionManager does not exist.");
-        updateActiveFilters(null);
+        updateActiveFilters(null, null);
         cleanUpRoutes(updateOrStatus.getStatus());
         return;
       }
@@ -719,26 +720,25 @@ final class XdsNameResolver extends NameResolver {
       ImmutableList<NamedFilterConfig> filterConfigs = httpConnectionManager.httpFilterConfigs();
       long streamDurationNano = httpConnectionManager.httpMaxStreamDurationNano();
 
-      updateActiveFilters(filterConfigs);
+      updateActiveFilters(filterConfigs, Collections.singletonList(virtualHost));
       updateRoutes(update, virtualHost, streamDurationNano, filterConfigs);
     }
 
     // called in syncContext
-    private void updateActiveFilters(@Nullable List<NamedFilterConfig> filterConfigs) {
-      if (filterConfigs == null) {
-        filterConfigs = ImmutableList.of();
-      }
+    private void updateActiveFilters(
+        @Nullable List<NamedFilterConfig> filterConfigs, @Nullable List<VirtualHost> vhosts) {
       Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
-      for (NamedFilterConfig namedFilter : filterConfigs) {
+      for (NamedFilterConfig namedFilter
+          : Filter.collectAllFilterConfigs(filterConfigs, vhosts)) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
         String filterKey = namedFilter.filterStateKey();
 
         Filter.Provider provider = filterRegistry.get(typeUrl);
         checkNotNull(provider, "provider %s", typeUrl);
         Filter filter = activeFilters.computeIfAbsent(
-            filterKey, k -> provider.newInstance(
-                FilterContext.create(
-                    namedFilter.name, nameResolverArgs.getMetricRecorder())));
+            filterKey, k -> provider.newInstance(FilterContext.create(
+                namedFilter.name, nameResolverArgs.getMetricRecorder(),
+                cfg -> activeFilters.get(cfg.filterStateKey()))));
         checkNotNull(filter, "filter %s", filterKey);
         filtersToShutdown.remove(filterKey);
       }
@@ -888,20 +888,14 @@ final class XdsNameResolver extends NameResolver {
         return new PassthroughClientInterceptor();
       }
 
-      Map<String, FilterConfig> selectedOverrideConfigs =
-          new HashMap<>(virtualHost.filterConfigOverrides());
-      selectedOverrideConfigs.putAll(route.filterConfigOverrides());
-      if (weightedCluster != null) {
-        selectedOverrideConfigs.putAll(weightedCluster.filterConfigOverrides());
-      }
-
       boolean anyFilterRequiresRequestPayload = false;
       boolean anyFilterRequiresResponsePayload = false;
       ImmutableList.Builder<ClientInterceptor> filterInterceptors = ImmutableList.builder();
       for (NamedFilterConfig namedFilter : filterConfigs) {
         String name = namedFilter.name;
         FilterConfig config = namedFilter.filterConfig;
-        FilterConfig overrideConfig = selectedOverrideConfigs.get(name);
+        FilterConfig overrideConfig =
+            Filter.lookupOverride(name, virtualHost, route, weightedCluster);
         String filterKey = namedFilter.filterStateKey();
 
         Filter filter = activeFilters.get(filterKey);

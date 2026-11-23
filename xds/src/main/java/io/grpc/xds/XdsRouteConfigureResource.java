@@ -233,24 +233,18 @@ class XdsRouteConfigureResource extends XdsResourceType<RdsUpdate> {
         anyConfig = filterConfig.getConfig();
         typeUrl = anyConfig.getTypeUrl();
       }
-      Message rawConfig = anyConfig;
+      Filter.UnpackedFilterConfig unpacked;
       try {
-        if (typeUrl.equals(TYPE_URL_TYPED_STRUCT_UDPA)) {
-          TypedStruct typedStruct = anyConfig.unpack(TypedStruct.class);
-          typeUrl = typedStruct.getTypeUrl();
-          rawConfig = typedStruct.getValue();
-        } else if (typeUrl.equals(TYPE_URL_TYPED_STRUCT)) {
-          com.github.xds.type.v3.TypedStruct newTypedStruct =
-              anyConfig.unpack(com.github.xds.type.v3.TypedStruct.class);
-          typeUrl = newTypedStruct.getTypeUrl();
-          rawConfig = newTypedStruct.getValue();
-        }
+        unpacked = Filter.unpackTypedStruct(anyConfig);
       } catch (InvalidProtocolBufferException e) {
         return StructOrError.fromError(
             "FilterConfig [" + name + "] contains invalid proto: " + e);
       }
+      typeUrl = unpacked.typeUrl;
+      Message rawConfig = unpacked.rawConfig;
       Filter.Provider provider = filterRegistry.get(typeUrl);
-      if (provider == null) {
+      // A filter disabled on both sides (e.g. behind an env flag that is off) is unsupported.
+      if (provider == null || (!provider.isClientFilter() && !provider.isServerFilter())) {
         if (isOptional) {
           continue;
         }

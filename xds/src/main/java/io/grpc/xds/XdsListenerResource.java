@@ -21,7 +21,6 @@ import static io.grpc.xds.XdsClusterResource.validateCommonTlsContext;
 import static io.grpc.xds.XdsRouteConfigureResource.extractVirtualHosts;
 import static io.grpc.xds.client.XdsClient.ResourceUpdate;
 
-import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.google.auto.value.AutoValue;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
@@ -573,7 +572,7 @@ class XdsListenerResource extends XdsResourceType<LdsUpdate> {
   }
 
   // hard-coded: currently router config is the only terminal filter.
-  private static boolean isTerminalFilter(Filter.FilterConfig filterConfig) {
+  static boolean isTerminalFilter(Filter.FilterConfig filterConfig) {
     return RouterFilter.ROUTER_CONFIG.equals(filterConfig);
   }
 
@@ -589,24 +588,15 @@ class XdsListenerResource extends XdsResourceType<LdsUpdate> {
       return isOptional ? null : StructOrError.fromError(
           "HttpFilter [" + filterName + "] is not optional and has no typed config");
     }
-    Message rawConfig = httpFilter.getTypedConfig();
-    String typeUrl = httpFilter.getTypedConfig().getTypeUrl();
-
+    Filter.UnpackedFilterConfig unpacked;
     try {
-      if (typeUrl.equals(TYPE_URL_TYPED_STRUCT_UDPA)) {
-        TypedStruct typedStruct = httpFilter.getTypedConfig().unpack(TypedStruct.class);
-        typeUrl = typedStruct.getTypeUrl();
-        rawConfig = typedStruct.getValue();
-      } else if (typeUrl.equals(TYPE_URL_TYPED_STRUCT)) {
-        com.github.xds.type.v3.TypedStruct newTypedStruct =
-            httpFilter.getTypedConfig().unpack(com.github.xds.type.v3.TypedStruct.class);
-        typeUrl = newTypedStruct.getTypeUrl();
-        rawConfig = newTypedStruct.getValue();
-      }
+      unpacked = Filter.unpackTypedStruct(httpFilter.getTypedConfig());
     } catch (InvalidProtocolBufferException e) {
       return StructOrError.fromError(
           "HttpFilter [" + filterName + "] contains invalid proto: " + e);
     }
+    String typeUrl = unpacked.typeUrl;
+    Message rawConfig = unpacked.rawConfig;
 
     Filter.Provider provider = filterRegistry.get(typeUrl);
     if (provider == null

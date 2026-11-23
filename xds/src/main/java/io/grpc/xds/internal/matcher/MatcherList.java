@@ -20,7 +20,7 @@ import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Predicate;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 final class MatcherList extends UnifiedMatcher {
@@ -29,23 +29,26 @@ final class MatcherList extends UnifiedMatcher {
   private final OnMatch onNoMatch;
 
   MatcherList(Matcher.MatcherList proto, @Nullable Matcher.OnMatch onNoMatchProto,
-      Predicate<String> actionValidator) {
+      boolean allowKeepMatching, boolean allowEmptyMatcher,
+      Consumer<TypedExtensionConfig> actionConsumer) {
     if (proto.getMatchersCount() == 0) {
       throw new IllegalArgumentException("MatcherList must contain at least one FieldMatcher");
     }
     this.matchers = new ArrayList<>(proto.getMatchersCount());
     for (Matcher.MatcherList.FieldMatcher fm : proto.getMatchersList()) {
-      matchers.add(new FieldMatcher(fm, actionValidator));
+      matchers.add(
+          new FieldMatcher(fm, allowKeepMatching, allowEmptyMatcher, actionConsumer));
     }
     if (onNoMatchProto != null) {
-      this.onNoMatch = new OnMatch(onNoMatchProto, actionValidator);
+      this.onNoMatch = new OnMatch(
+          onNoMatchProto, allowKeepMatching, allowEmptyMatcher, actionConsumer);
     } else {
       this.onNoMatch = null;
     }
   }
 
   @Override
-  MatchResult match(MatchContext context) {
+  public MatchResult match(MatchContext context) {
     List<TypedExtensionConfig> accumulated = new ArrayList<>();
     for (FieldMatcher matcher : matchers) {
       if (matcher.matches(context)) {
@@ -74,10 +77,12 @@ final class MatcherList extends UnifiedMatcher {
     private final PredicateEvaluator predicate;
     private final OnMatch onMatch;
     
-    FieldMatcher(Matcher.MatcherList.FieldMatcher proto, 
-        Predicate<String> actionValidator) {
+    FieldMatcher(Matcher.MatcherList.FieldMatcher proto,
+        boolean allowKeepMatching, boolean allowEmptyMatcher,
+        Consumer<TypedExtensionConfig> actionConsumer) {
       this.predicate = PredicateEvaluator.fromProto(proto.getPredicate());
-      this.onMatch = new OnMatch(proto.getOnMatch(), actionValidator);
+      this.onMatch = new OnMatch(
+          proto.getOnMatch(), allowKeepMatching, allowEmptyMatcher, actionConsumer);
     }
     
     boolean matches(MatchContext context) {

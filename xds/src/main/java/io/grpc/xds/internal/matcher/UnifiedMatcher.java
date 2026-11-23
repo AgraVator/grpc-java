@@ -18,17 +18,17 @@ package io.grpc.xds.internal.matcher;
 
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
-import java.util.function.Predicate;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 /**
  * Represents a compiled xDS Matcher.
  */
-abstract class UnifiedMatcher {
+public abstract class UnifiedMatcher {
 
   static final int MAX_RECURSION_DEPTH = 16;
  
-  abstract MatchResult match(MatchContext context);
+  public abstract MatchResult match(MatchContext context);
 
   static MatchInput resolveInput(TypedExtensionConfig config) {
     String typeUrl = config.getTypedConfig().getTypeUrl();
@@ -40,28 +40,49 @@ abstract class UnifiedMatcher {
   }
 
   /**
-   * Parses a proto Matcher into a UnifiedMatcher.
-   *
-   * @param proto the proto matcher
-   * @param actionValidator a predicate that returns true if the action type URL is supported
+   * Parses a proto Matcher into a UnifiedMatcher, allowing all actions.
    */
-  static UnifiedMatcher fromProto(Matcher proto,
-      Predicate<String> actionValidator) {
-    checkRecursionDepth(proto, 0);
-    Matcher.OnMatch onNoMatch = proto.hasOnNoMatch() ? proto.getOnNoMatch() : null;
-    if (proto.hasMatcherList()) {
-      return new MatcherList(proto.getMatcherList(), onNoMatch, actionValidator);
-    } else if (proto.hasMatcherTree()) {
-      return new MatcherTree(proto.getMatcherTree(), onNoMatch, actionValidator);
-    }
-    return new NoOpMatcher(onNoMatch, actionValidator);
+  public static UnifiedMatcher fromProto(Matcher proto) {
+    return fromProto(proto, /* allowKeepMatching= */ true, /* allowEmptyMatcher= */ true,
+        action -> { });
   }
 
   /**
-   * Parses a proto Matcher into a UnifiedMatcher, allowing all actions.
+   * Parses a proto Matcher into a UnifiedMatcher, invoking {@code actionConsumer} for each leaf
+   * action in the tree.
+   *
+   * @param proto the proto matcher
+   * @param allowKeepMatching whether {@code keep_matching=true} is permitted
+   * @param allowEmptyMatcher whether a matcher without {@code matcher_list} or {@code matcher_tree}
+   *     is permitted
+   * @param actionConsumer invoked once per leaf action (may throw to reject unsupported actions)
    */
-  static UnifiedMatcher fromProto(Matcher proto) {
-    return fromProto(proto, (typeUrl) -> true);
+  public static UnifiedMatcher fromProto(
+      Matcher proto,
+      boolean allowKeepMatching,
+      boolean allowEmptyMatcher,
+      Consumer<TypedExtensionConfig> actionConsumer) {
+    checkRecursionDepth(proto, 0);
+    return fromProtoInternal(proto, allowKeepMatching, allowEmptyMatcher, actionConsumer);
+  }
+
+  static UnifiedMatcher fromProtoInternal(
+      Matcher proto,
+      boolean allowKeepMatching,
+      boolean allowEmptyMatcher,
+      Consumer<TypedExtensionConfig> actionConsumer) {
+    Matcher.OnMatch onNoMatch = proto.hasOnNoMatch() ? proto.getOnNoMatch() : null;
+    if (proto.hasMatcherList()) {
+      return new MatcherList(
+          proto.getMatcherList(), onNoMatch, allowKeepMatching, allowEmptyMatcher, actionConsumer);
+    } else if (proto.hasMatcherTree()) {
+      return new MatcherTree(
+          proto.getMatcherTree(), onNoMatch, allowKeepMatching, allowEmptyMatcher, actionConsumer);
+    }
+    if (!allowEmptyMatcher) {
+      throw new IllegalArgumentException("xds_matcher: no matcher_list or matcher_tree specified");
+    }
+    return new NoOpMatcher(onNoMatch, allowKeepMatching, allowEmptyMatcher, actionConsumer);
   }
 
   private static void checkRecursionDepth(Matcher proto, int currentDepth) {
@@ -101,16 +122,18 @@ abstract class UnifiedMatcher {
     private final OnMatch onNoMatch;
     
     NoOpMatcher(@Nullable Matcher.OnMatch onNoMatchProto,
-        Predicate<String> actionValidator) {
+        boolean allowKeepMatching, boolean allowEmptyMatcher,
+        Consumer<TypedExtensionConfig> actionConsumer) {
       if (onNoMatchProto != null) {
-        this.onNoMatch = new OnMatch(onNoMatchProto, actionValidator);
+        this.onNoMatch = new OnMatch(
+            onNoMatchProto, allowKeepMatching, allowEmptyMatcher, actionConsumer);
       } else {
         this.onNoMatch = null;
       }
     }
 
     @Override
-    MatchResult match(MatchContext context) {
+    public MatchResult match(MatchContext context) {
       if (onNoMatch != null) {
         return onNoMatch.evaluate(context);
       }

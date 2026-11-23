@@ -23,7 +23,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Predicate;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 final class MatcherTree extends UnifiedMatcher {
@@ -36,9 +36,10 @@ final class MatcherTree extends UnifiedMatcher {
   private final PrefixTrie prefixTrie;
   @Nullable 
   private final OnMatch onNoMatch;
-  
+
   MatcherTree(Matcher.MatcherTree proto, @Nullable Matcher.OnMatch onNoMatchProto,
-      Predicate<String> actionValidator) {
+      boolean allowKeepMatching, boolean allowEmptyMatcher,
+      Consumer<TypedExtensionConfig> actionConsumer) {
     if (!proto.hasInput()) {
       throw new IllegalArgumentException("MatcherTree must have input");
     }
@@ -64,7 +65,7 @@ final class MatcherTree extends UnifiedMatcher {
       for (Map.Entry<String, Matcher.OnMatch> entry : 
           matchMap.getMapMap().entrySet()) {
         this.exactMatchMap.put(entry.getKey(),
-            new OnMatch(entry.getValue(), actionValidator));
+            new OnMatch(entry.getValue(), allowKeepMatching, allowEmptyMatcher, actionConsumer));
       }
       this.prefixTrie = null;
     } else if (proto.hasPrefixMatchMap()) {
@@ -77,7 +78,7 @@ final class MatcherTree extends UnifiedMatcher {
       for (Map.Entry<String, Matcher.OnMatch> entry : 
           matchMap.getMapMap().entrySet()) {
         this.prefixTrie.insert(entry.getKey(),
-            new OnMatch(entry.getValue(), actionValidator));
+            new OnMatch(entry.getValue(), allowKeepMatching, allowEmptyMatcher, actionConsumer));
       }
       this.exactMatchMap = null;
     } else {
@@ -85,14 +86,15 @@ final class MatcherTree extends UnifiedMatcher {
           "MatcherTree must have either exact_match_map or prefix_match_map");
     }
     if (onNoMatchProto != null) {
-      this.onNoMatch = new OnMatch(onNoMatchProto, actionValidator);
+      this.onNoMatch = new OnMatch(
+          onNoMatchProto, allowKeepMatching, allowEmptyMatcher, actionConsumer);
     } else {
       this.onNoMatch = null;
     }
   }
 
   @Override
-  MatchResult match(MatchContext context) {
+  public MatchResult match(MatchContext context) {
 
     Object valueObj = input.apply(context);
     if (!(valueObj instanceof String)) {

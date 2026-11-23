@@ -26,9 +26,9 @@ import java.util.List;
 /**
  * Result of a matching operation.
  */
-final class MatchResult {
-  final List<TypedExtensionConfig> actions;
-  final boolean matched;
+public final class MatchResult {
+  public final List<TypedExtensionConfig> actions;
+  public final boolean matched;
 
   private MatchResult(
       List<TypedExtensionConfig> actions,

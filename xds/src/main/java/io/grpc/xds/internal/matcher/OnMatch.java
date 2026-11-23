@@ -18,7 +18,7 @@ package io.grpc.xds.internal.matcher;
 
 import com.github.xds.core.v3.TypedExtensionConfig;
 import com.github.xds.type.matcher.v3.Matcher;
-import java.util.function.Predicate;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 /**
@@ -28,19 +28,21 @@ final class OnMatch {
   @Nullable private final UnifiedMatcher nestedMatcher;
   @Nullable private final TypedExtensionConfig action;
   final boolean keepMatching;
-  
-  OnMatch(Matcher.OnMatch proto, Predicate<String> actionValidator) {
+
+  OnMatch(Matcher.OnMatch proto, boolean allowKeepMatching, boolean allowEmptyMatcher,
+      Consumer<TypedExtensionConfig> actionConsumer) {
     this.keepMatching = proto.getKeepMatching();
+    if (!allowKeepMatching && this.keepMatching) {
+      throw new IllegalArgumentException("keep_matching is not permitted");
+    }
     if (proto.hasMatcher()) {
-      this.nestedMatcher = UnifiedMatcher.fromProto(proto.getMatcher(), actionValidator);
+      this.nestedMatcher = UnifiedMatcher.fromProtoInternal(
+          proto.getMatcher(), allowKeepMatching, allowEmptyMatcher, actionConsumer);
       this.action = null;
     } else if (proto.hasAction()) {
       this.nestedMatcher = null;
       this.action = proto.getAction();
-      String typeUrl = this.action.getTypedConfig().getTypeUrl();
-      if (!actionValidator.test(typeUrl)) {
-        throw new IllegalArgumentException("Unsupported action type: " + typeUrl);
-      }
+      actionConsumer.accept(this.action);
     } else {
       throw new IllegalArgumentException("OnMatch must have either matcher or action");
     }

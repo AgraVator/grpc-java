@@ -42,7 +42,13 @@ public class UnifiedMatcherValidationTest {
     String supportedType = 
         "type.googleapis.com/xds.type.matcher.v3.HttpAttributesCelMatchInput";
 
-    UnifiedMatcher.fromProto(proto, (type) -> type.equals(supportedType));
+    UnifiedMatcher.fromProto(proto, /* allowKeepMatching= */ true, /* allowEmptyMatcher= */ true,
+        action -> {
+          String typeUrl = action.getTypedConfig().getTypeUrl();
+          if (!typeUrl.equals(supportedType)) {
+            throw new IllegalArgumentException("Unsupported action type: " + typeUrl);
+          }
+        });
   }
 
   @Test
@@ -57,7 +63,11 @@ public class UnifiedMatcherValidationTest {
         .build();
     
     try {
-      UnifiedMatcher.fromProto(proto, (type) -> false);
+      UnifiedMatcher.fromProto(proto, /* allowKeepMatching= */ true, /* allowEmptyMatcher= */ true,
+          action -> {
+            throw new IllegalArgumentException(
+                "Unsupported action type: " + action.getTypedConfig().getTypeUrl());
+          });
       fail("Should have thrown IllegalArgumentException");
     } catch (IllegalArgumentException e) {
       assertThat(e).hasMessageThat().contains("Unsupported action type");
@@ -444,7 +454,7 @@ public class UnifiedMatcherValidationTest {
           .build();
     }
     // This should not throw any exception as the depth (5) is within the limit (16).
-    UnifiedMatcher.fromProto(current, (type) -> true);
+    UnifiedMatcher.fromProto(current);
   }
 
   @Test

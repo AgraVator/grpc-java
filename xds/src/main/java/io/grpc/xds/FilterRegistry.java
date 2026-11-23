@@ -40,7 +40,8 @@ final class FilterRegistry {
               new RbacFilter.Provider(),
               new GcpAuthenticationFilter.Provider(),
               new ExternalProcessorFilter.Provider(),
-              new ExtAuthzFilter.Provider());
+              new ExtAuthzFilter.Provider(),
+              new CompositeFilter.Provider());
     }
     return instance;
   }

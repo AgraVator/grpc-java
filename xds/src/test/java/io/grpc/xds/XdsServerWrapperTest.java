@@ -37,7 +37,14 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.net.InetAddresses;
 import com.google.common.util.concurrent.SettableFuture;
+import com.google.protobuf.Any;
 import io.envoyproxy.envoy.config.core.v3.SocketAddress.Protocol;
+import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcher;
+import io.envoyproxy.envoy.extensions.common.matching.v3.ExtensionWithMatcherPerRoute;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.Composite;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.ExecuteFilterAction;
+import io.envoyproxy.envoy.extensions.filters.http.composite.v3.FilterChainConfiguration;
+import io.envoyproxy.envoy.type.matcher.v3.HttpRequestHeaderMatchInput;
 import io.grpc.Attributes;
 import io.grpc.ChannelConfigurator;
 import io.grpc.InsecureChannelCredentials;
@@ -89,11 +96,16 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -132,11 +144,30 @@ public class XdsServerWrapperTest {
   private FakeXdsClient xdsClient = new FakeXdsClient();
   private FilterRegistry filterRegistry = FilterRegistry.getDefaultRegistry();
   private XdsServerWrapper xdsServerWrapper;
+  private CompositeFilter.Provider compositeProvider;
   private ServerRoutingConfig noopConfig = ServerRoutingConfig.create(
       ImmutableList.<VirtualHost>of(), ImmutableMap.<Route, ServerInterceptor>of());
+  // XdsServerWrapper's syncContext swallows exceptions thrown by an update and logs them at
+  // SEVERE, so tests that must not tolerate one watch the log.
+  private final List<LogRecord> severeLogs = new CopyOnWriteArrayList<>();
+  private final Handler severeLogHandler = new Handler() {
+    @Override
+    public void publish(LogRecord record) {
+      if (record.getLevel().intValue() >= Level.SEVERE.intValue()) {
+        severeLogs.add(record);
+      }
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
+  };
 
   @Before
   public void setup() {
+    Logger.getLogger(XdsServerWrapper.class.getName()).addHandler(severeLogHandler);
     when(mockBuilder.build()).thenReturn(mockServer);
     xdsServerWrapper = new XdsServerWrapper("0.0.0.0:1", mockBuilder, listener,
             selectorManager, new FakeXdsClientPoolFactory(xdsClient),
@@ -146,6 +177,7 @@ public class XdsServerWrapperTest {
 
   @After
   public void tearDown() {
+    Logger.getLogger(XdsServerWrapper.class.getName()).removeHandler(severeLogHandler);
     xdsServerWrapper.shutdownNow();
   }
 
@@ -1670,13 +1702,9 @@ public class XdsServerWrapperTest {
     xdsClient.deliverLdsUpdate(fc1, null);
     xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
     verify(listener, never()).onServing();
-    // Server didn't start, but filter instances should have already been created.
-    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("LDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
-    // Naming: lds<LDS#>Filter<name#>
-    StatefulFilter lds1Filter1 = lds1Snapshot.get(0);
-    StatefulFilter lds1Filter2 = lds1Snapshot.get(1);
-    assertThat(lds1Filter1).isNotSameInstanceAs(lds1Filter2);
+    // Filter instances are created with the first selector, once the RDS arrives.
+    assertWithMessage("LDS 1: no filter instances before RDS")
+        .that(statefulFilterProvider.getAllInstances()).isEmpty();
 
     // RDS 1.
     VirtualHost vhost1 = filterStateTestVhost();
@@ -1684,10 +1712,12 @@ public class XdsServerWrapperTest {
     verifyServerStarted(serverStart);
     assertThat(getSelectorRoutingConfigs()).hasSize(1);
     assertThat(getSelectorVhosts(fc1)).containsExactly(vhost1);
-    // Initial RDS update should not generate Filter instances.
-    ImmutableList<StatefulFilter> rds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("RDS 1: Expected Filter instances to be reused across RDS route updates")
-        .that(rds1Snapshot).isEqualTo(lds1Snapshot);
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("RDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
+    // Naming: lds<LDS#>Filter<name#>
+    StatefulFilter lds1Filter1 = lds1Snapshot.get(0);
+    StatefulFilter lds1Filter2 = lds1Snapshot.get(1);
+    assertThat(lds1Filter1).isNotSameInstanceAs(lds1Filter2);
 
     // RDS 2: exactly the same as RDS 1.
     xdsClient.deliverRdsUpdate(rdsName, vhost1);
@@ -1980,22 +2010,533 @@ public class XdsServerWrapperTest {
     xdsClient.deliverLdsUpdate(chainA, chainDefault);
     xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
     verify(listener, never()).onServing();
-    // Server didn't start, but filter instances should have already been created.
-    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
-    assertWithMessage("LDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
-    // Naming: lds<LDS#>Chain<name>Filter<name#>
-    StatefulFilter lds1ChainAFilter1 = lds1Snapshot.get(0);
-    StatefulFilter lds1ChainDefaultFilter2 = lds1Snapshot.get(1);
+    // Filter instances are created with the first selector, once the RDS arrives.
+    assertWithMessage("LDS 1: no filter instances before RDS")
+        .that(statefulFilterProvider.getAllInstances()).isEmpty();
 
     // RDS 1: Standard vhost with a route.
     xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
     verifyServerStarted(serverStart);
-    assertThat(statefulFilterProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+    ImmutableList<StatefulFilter> lds1Snapshot = statefulFilterProvider.getAllInstances();
+    assertWithMessage("RDS 1: expected to create filter instances").that(lds1Snapshot).hasSize(2);
+    // Naming: lds<LDS#>Chain<name>Filter<name#>
+    StatefulFilter lds1ChainAFilter1 = lds1Snapshot.get(0);
+    StatefulFilter lds1ChainDefaultFilter2 = lds1Snapshot.get(1);
 
     // RDS 2: RDS_RESOURCE_NAME not found.
     xdsClient.deliverRdsResourceNotFound(rdsName);
     assertThat(lds1ChainAFilter1.isShutdown()).isFalse();
     assertThat(lds1ChainDefaultFilter2.isShutdown()).isFalse();
+  }
+
+  /**
+   * Across filter chains: a nested filter reachable only through an RDS override is created when
+   * the override arrives and closed, once, when a later RDS drops it; nothing else is touched; and
+   * an RDS error, which builds nothing, closes nothing.
+   */
+  @Test
+  public void filterState_nestedFilterOfRdsOverride_createdAndClosedWithIt() throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      CompositeFilter.CompositeFilterConfig nestingA =
+          parseComposite(compositeAnyWrapping(executeStatefulChain("a")));
+
+      xdsClient.deliverLdsUpdate(ImmutableList.of(
+          createFilterChain("chain_a", createHcmForRds(rdsName, ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+              new NamedFilterConfig("c", nestingA),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG))),
+              createMatchSrcIp("3fff:a::/32")),
+          createFilterChain("chain_b", createHcmForRds(rdsName, ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_2, new StatefulFilter.Config(STATEFUL_2)),
+              new NamedFilterConfig("c", nestingA),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG))),
+              createMatchSrcIp("3fff:b::/32"))), null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+      // Nothing exists before the first selector is built.
+      assertThat(statefulFilterNames(statefulProvider)).isEmpty();
+
+      // RDS 1: two routes, no overrides. Each chain creates its top-level and nested filters.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
+      verifyServerStarted(serverStart);
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", STATEFUL_2, "a").inOrder();
+      ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
+
+      // RDS 2: the second route overrides "c" with a matcher that runs "x" instead.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("x")))));
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", STATEFUL_2, "a", "x", "x").inOrder();
+      ImmutableList<StatefulFilter> rds2Snapshot = statefulProvider.getAllInstances();
+      for (StatefulFilter filter : rds2Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+
+      // RDS 3: the override is gone, so each chain's "x" is unreachable and closed exactly once:
+      // StatefulFilter throws on a second close, which the update would log at SEVERE.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds2Snapshot);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+      assertThat(rds2Snapshot.get(4).isShutdown()).isTrue();
+      assertThat(rds2Snapshot.get(5).isShutdown()).isTrue();
+      assertThat(severeLogs).isEmpty();
+
+      // RDS 4: resource not found. Nothing is built, so nothing is swept.
+      xdsClient.deliverRdsResourceNotFound(rdsName);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+
+      // RDS 5: the resource is back. The nested instances kept through the error are reused.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestTwoRouteVhost(NO_FILTER_OVERRIDES));
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds2Snapshot);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+      assertThat(severeLogs).isEmpty();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * Nested filters from matching vhost/route composite overrides are created and closed as those
+   * overrides come and go, while a composite override attached to a non-composite top-level filter
+   * is ignored.
+   */
+  @Test
+  public void filterState_compositeOverrides_reconciledAndMismatchedTypeIgnored()
+      throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      CompositeFilter.CompositeFilterConfig nestingA =
+          parseComposite(compositeAnyWrapping(executeStatefulChain("a")));
+
+      xdsClient.deliverLdsUpdate(
+          createFilterChain("chain_a", createHcmForRds(rdsName, ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+              new NamedFilterConfig("c", nestingA),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))),
+          null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+
+      Route baseRoute = filterStateTestRoute(
+          ImmutableMap.of(STATEFUL_1, parseCompositeOverride(executeStatefulChain("ignored"))));
+
+      // RDS 1: composite override under non-composite STATEFUL_1 is ignored; "c" runs "a".
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(baseRoute), NO_FILTER_OVERRIDES));
+      verifyServerStarted(serverStart);
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
+      StatefulFilter nestedA = statefulProvider.getAllInstances().get(1);
+
+      // RDS 2: vhost overrides "c" with "v", route overrides "c" with "r".
+      Route routeOverridingC = filterStateTestRoute(
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("r"))));
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(routeOverridingC),
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      StatefulFilter nestedV = statefulProvider.getAllInstances().get(2);
+      StatefulFilter nestedR = statefulProvider.getAllInstances().get(3);
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
+      assertThat(nestedR.isShutdown()).isFalse();
+
+      // RDS 3: route override removed; "r" closes while "a" and "v" stay alive.
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create(
+          "stateful-vhost", ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(baseRoute),
+          ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("v")))));
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, "a", "v", "r").inOrder();
+      assertThat(nestedA.isShutdown()).isFalse();
+      assertThat(nestedV.isShutdown()).isFalse();
+      assertThat(nestedR.isShutdown()).isTrue();
+      assertThat(severeLogs).isEmpty();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * While a new chain's RDS is pending, the selector still holds the previous LDS's chains, and a
+   * re-sent RDS rebuilds their routing configs with the previous HCM's filter set. Such a stale
+   * rebuild must not leave the chain without a filter the new LDS added, or the selector update
+   * that follows the pending RDS fails.
+   */
+  @Test
+  public void filterState_staleRdsRebuildWhileNewChainRdsPending_selectorUpdated()
+      throws Exception {
+    StatefulFilter.Provider statefulFilterProvider = new StatefulFilter.Provider();
+    FilterRegistry filterRegistry = filterStateTestFilterRegistry(statefulFilterProvider);
+    SettableFuture<Server> serverStart = filterStateTestStartServer(filterRegistry);
+    VirtualHost vhost = filterStateTestVhost();
+    FilterChainMatch matchA = createMatchSrcIp("3fff:a::/32");
+    FilterChainMatch matchB = createMatchSrcIp("3fff:b::/32");
+
+    // LDS 1: chain A with STATEFUL_1, routes from rds_a.
+    xdsClient.deliverLdsUpdate(createFilterChain("chain_a",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1)), matchA), null);
+    xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+    xdsClient.deliverRdsUpdate("rds_a", vhost);
+    verifyServerStarted(serverStart);
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
+
+    // LDS 2: chain A gains STATEFUL_2, and a new chain B is served by rds_b, which stays pending.
+    FilterChain lds2ChainA = createFilterChain("chain_a",
+        createHcmForRds("rds_a", filterStateTestConfigs(STATEFUL_1, STATEFUL_2)), matchA);
+    FilterChain lds2ChainB = createFilterChain("chain_b",
+        createHcmForRds("rds_b", filterStateTestConfigs(STATEFUL_1)), matchB);
+    xdsClient.deliverLdsUpdate(ImmutableList.of(lds2ChainA, lds2ChainB), null);
+    // LDS 2 is not applied until rds_b arrives, so it creates nothing yet.
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
+
+    // rds_a re-sent: rebuilds chain A's routing config as of LDS 1, then rds_b arrives.
+    xdsClient.deliverRdsUpdate("rds_a", vhost);
+    assertThat(statefulFilterNames(statefulFilterProvider)).containsExactly(STATEFUL_1);
+    xdsClient.deliverRdsUpdate("rds_b", vhost);
+    assertThat(severeLogs).isEmpty();
+    assertThat(getSelectorRoutingConfigs().keySet()).containsExactly(lds2ChainA, lds2ChainB);
+    assertThat(getSelectorVhosts(lds2ChainA)).containsExactly(vhost);
+    assertThat(getSelectorVhosts(lds2ChainB)).containsExactly(vhost);
+    // Chain A gained STATEFUL_2 and chain B its own STATEFUL_1; nothing was closed.
+    assertThat(statefulFilterNames(statefulFilterProvider))
+        .containsExactly(STATEFUL_1, STATEFUL_2, STATEFUL_1).inOrder();
+    for (StatefulFilter filter : statefulFilterProvider.getAllInstances()) {
+      assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+    }
+  }
+
+  /** An RDS whose virtual host has no routes must not close the chain's top-level filters. */
+  @Test
+  public void filterState_rdsWithNoRoutes_keepsTopLevelFilters() throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(
+              new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1)),
+              new NamedFilterConfig("c", parseComposite(
+                  compositeAnyWrapping(executeStatefulChain("a")))),
+              new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))),
+          null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+
+      // RDS 1: a route, so the nested "a" is created too.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly(STATEFUL_1, "a").inOrder();
+      StatefulFilter topLevel = rds1Snapshot.get(0);
+
+      // RDS 2: the virtual host has no routes. The top-level filter is still in the HCM.
+      xdsClient.deliverRdsUpdate(rdsName, VirtualHost.create("stateful-vhost",
+          ImmutableList.of("stateful.test.example.com"), ImmutableList.of(), NO_FILTER_OVERRIDES));
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
+      assertThat(topLevel.isShutdown()).isFalse();
+
+      // RDS 3: routes are back; the top-level instance is reused.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulProvider.getAllInstances().get(0)).isSameInstanceAs(topLevel);
+      assertThat(topLevel.isShutdown()).isFalse();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * An RDS error closes nothing, but an LDS update processed while the chain's RDS is still
+   * unavailable reconciles the chain to the filters the LDS declares right away: what the LDS
+   * dropped is closed, and the nested instances the LDS still declares are kept.
+   */
+  @Test
+  public void filterState_ldsWhileRdsNotFound_reconcilesToLdsFilters() throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      String rdsName = "rds.example.com";
+      NamedFilterConfig nestingA = new NamedFilterConfig("c", parseComposite(
+          compositeAnyWrapping(executeStatefulChain("a"))));
+      NamedFilterConfig stateful1 =
+          new NamedFilterConfig(STATEFUL_1, new StatefulFilter.Config(STATEFUL_1));
+      NamedFilterConfig stateful2 =
+          new NamedFilterConfig(STATEFUL_2, new StatefulFilter.Config(STATEFUL_2));
+      NamedFilterConfig router =
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG);
+
+      // LDS 1 + RDS 1: everything is created.
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(stateful1, stateful2, nestingA, router))), null);
+      xdsClient.awaitRds(FakeXdsClient.DEFAULT_TIMEOUT);
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> rds1Snapshot = statefulProvider.getAllInstances();
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly(STATEFUL_1, STATEFUL_2, "a").inOrder();
+
+      // RDS 2: resource not found. Nothing is built, so nothing is swept.
+      xdsClient.deliverRdsResourceNotFound(rdsName);
+      for (StatefulFilter filter : rds1Snapshot) {
+        assertWithMessage("%s", filter).that(filter.isShutdown()).isFalse();
+      }
+
+      // LDS 2: STATEFUL_2 dropped while RDS is still unavailable. The chain is reconciled to the
+      // LDS filters: STATEFUL_2 is closed now; the nested "a" is still declared and kept.
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcmForRds(rdsName,
+          ImmutableList.of(stateful1, nestingA, router))), null);
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
+      assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(rds1Snapshot.get(1).isShutdown()).isTrue();
+      assertThat(rds1Snapshot.get(2).isShutdown()).isFalse();
+
+      // RDS 3: the resource is back. STATEFUL_1 and "a" are reused.
+      xdsClient.deliverRdsUpdate(rdsName, filterStateTestVhost());
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(rds1Snapshot);
+      assertThat(rds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(rds1Snapshot.get(2).isShutdown()).isFalse();
+      assertThat(severeLogs).isEmpty();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * On a named chain and on the default chain alike: outer{inner{a,b}} -> outer{inner{a}} closes
+   * b and reuses a; removing the chain closes its nested instances along with the rest.
+   */
+  @Test
+  public void filterState_nestedComposite_dropsUnreachedGrandchild_chainRemovalClosesNested() {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      VirtualHost vhost = filterStateTestVhost();
+
+      // LDS 1.
+      ImmutableList<NamedFilterConfig> lds1Configs = ImmutableList.of(
+          new NamedFilterConfig("outer", parseComposite(compositeAnyWrapping(executeOnMatch(
+              "inner", compositeAnyWrapping(executeStatefulChain("a", "b")))))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
+      xdsClient.deliverLdsUpdate(
+          createFilterChain("chain_a", createHcm(vhost, lds1Configs)),
+          createFilterChain("chain_default", createHcm(vhost, lds1Configs)));
+      verifyServerStarted(serverStart);
+      ImmutableList<StatefulFilter> lds1Snapshot = statefulProvider.getAllInstances();
+      // Naming: chain_a's a, b; then chain_default's a, b.
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly("a", "b", "a", "b").inOrder();
+
+      // LDS 2: inner no longer runs b.
+      ImmutableList<NamedFilterConfig> lds2Configs = ImmutableList.of(
+          new NamedFilterConfig("outer", parseComposite(compositeAnyWrapping(executeOnMatch(
+              "inner", compositeAnyWrapping(executeStatefulChain("a")))))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG));
+      xdsClient.deliverLdsUpdate(
+          createFilterChain("chain_a", createHcm(vhost, lds2Configs)),
+          createFilterChain("chain_default", createHcm(vhost, lds2Configs)));
+      assertThat(statefulProvider.getAllInstances()).isEqualTo(lds1Snapshot);
+      assertThat(lds1Snapshot.get(0).isShutdown()).isFalse();
+      assertThat(lds1Snapshot.get(1).isShutdown()).isTrue();
+      assertThat(lds1Snapshot.get(2).isShutdown()).isFalse();
+      assertThat(lds1Snapshot.get(3).isShutdown()).isTrue();
+
+      // LDS 3: both chains are gone, replaced by one with no composite.
+      xdsClient.deliverLdsUpdate(
+          createFilterChain("chain_b", createHcm(vhost, filterStateTestConfigs(STATEFUL_1))), null);
+      assertThat(statefulFilterNames(statefulProvider))
+          .containsExactly("a", "b", "a", "b", STATEFUL_1).inOrder();
+      assertThat(lds1Snapshot.get(0).isShutdown()).isTrue();
+      assertThat(lds1Snapshot.get(2).isShutdown()).isTrue();
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * Server route resolution always evaluates per-route overrides with {@code weight = null}, so a
+   * route with {@code weighted_clusters} where every {@code ClusterWeight} overrides the composite
+   * must still keep the HCM composite's nested filter alive on the server.
+   */
+  @Test
+  public void filterState_serverIgnoresWeightedClusterOverrides_instantiatesHcmNestedFilter()
+      throws Exception {
+    System.setProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER", "true");
+    try {
+      StatefulFilter.Provider statefulProvider = new StatefulFilter.Provider();
+      SettableFuture<Server> serverStart =
+          filterStateTestStartServerWithComposite(statefulProvider);
+      VirtualHost.Route.RouteAction.ClusterWeight weightOverridingC =
+          VirtualHost.Route.RouteAction.ClusterWeight.create(
+              "cluster-a", 100,
+              ImmutableMap.of("c", parseCompositeOverride(executeStatefulChain("w"))));
+      Route weightedRoute = Route.forAction(
+          RouteMatch.withPathExactOnly("/grpc.test.HelloService/SayHello"),
+          VirtualHost.Route.RouteAction.forWeightedClusters(
+              ImmutableList.of(weightOverridingC), ImmutableList.of(), null, null, false),
+          NO_FILTER_OVERRIDES);
+      VirtualHost vhost = VirtualHost.create(
+          "stateful-vhost",
+          ImmutableList.of("stateful.test.example.com"),
+          ImmutableList.of(weightedRoute),
+          NO_FILTER_OVERRIDES);
+
+      xdsClient.deliverLdsUpdate(createFilterChain("chain_a", createHcm(vhost, ImmutableList.of(
+          new NamedFilterConfig("c", parseComposite(
+              compositeAnyWrapping(executeStatefulChain("a")))),
+          new NamedFilterConfig(ROUTER_FILTER_INSTANCE_NAME, RouterFilter.ROUTER_CONFIG)))), null);
+      verifyServerStarted(serverStart);
+      assertThat(severeLogs).isEmpty();
+      assertThat(statefulFilterNames(statefulProvider)).containsExactly("a", "w");
+    } finally {
+      System.clearProperty("GRPC_EXPERIMENTAL_XDS_COMPOSITE_FILTER");
+    }
+  }
+
+  /**
+   * Starts the server with a registry holding StatefulFilter, the composite filter and the router.
+   * The composite resolves nested filter types through that same registry.
+   */
+  private SettableFuture<Server> filterStateTestStartServerWithComposite(
+      StatefulFilter.Provider statefulProvider) {
+    FilterRegistry filterRegistry = FilterRegistry.newRegistry();
+    compositeProvider = new CompositeFilter.Provider(filterRegistry::get);
+    filterRegistry.register(statefulProvider, compositeProvider, ROUTER_FILTER_PROVIDER);
+    return filterStateTestStartServer(filterRegistry);
+  }
+
+  private static ImmutableList<String> statefulFilterNames(StatefulFilter.Provider provider) {
+    ImmutableList.Builder<String> names = ImmutableList.builder();
+    for (StatefulFilter f : provider.getAllInstances()) {
+      names.add(f.name);
+    }
+    return names.build();
+  }
+
+  private CompositeFilter.CompositeFilterConfig parseComposite(Any compositeAny) {
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        compositeProvider.parseFilterConfig(compositeAny, compositeParseContext());
+    assertThat(result.errorDetail).isNull();
+    return result.config;
+  }
+
+  /** Parses an ExtensionWithMatcherPerRoute override whose matcher always runs {@code onMatch}. */
+  private CompositeFilter.CompositeFilterConfig parseCompositeOverride(
+      com.github.xds.type.matcher.v3.Matcher.OnMatch onMatch) {
+    ConfigOrError<CompositeFilter.CompositeFilterConfig> result =
+        compositeProvider.parseFilterConfigOverride(
+            Any.pack(ExtensionWithMatcherPerRoute.newBuilder()
+                .setXdsMatcher(matcherFallingThroughTo(onMatch))
+                .build()),
+            compositeParseContext());
+    assertThat(result.errorDetail).isNull();
+    return result.config;
+  }
+
+  /** An ExecuteFilterAction running the named StatefulFilters as a filter_chain, in order. */
+  private static com.github.xds.type.matcher.v3.Matcher.OnMatch executeStatefulChain(
+      String... nestedNames) {
+    FilterChainConfiguration.Builder chain = FilterChainConfiguration.newBuilder();
+    for (String name : nestedNames) {
+      chain.addTypedConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+          .setName(name)
+          .setTypedConfig(Any.newBuilder().setTypeUrl(StatefulFilter.DEFAULT_TYPE_URL).build()));
+    }
+    return com.github.xds.type.matcher.v3.Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_" + String.join("_", nestedNames))
+            .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                .setFilterChain(chain)
+                .build()))
+            .build())
+        .build();
+  }
+
+  /** Wraps {@code childAny} in an ExecuteFilterAction reached through a matcher's on_no_match. */
+  private static com.github.xds.type.matcher.v3.Matcher.OnMatch executeOnMatch(
+      String childName, Any childAny) {
+    return com.github.xds.type.matcher.v3.Matcher.OnMatch.newBuilder()
+        .setAction(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("action_" + childName)
+            .setTypedConfig(Any.pack(ExecuteFilterAction.newBuilder()
+                .setTypedConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+                    .setName(childName)
+                    .setTypedConfig(childAny)
+                    .build())
+                .build()))
+            .build())
+        .build();
+  }
+
+  private static Any compositeAnyWrapping(
+      com.github.xds.type.matcher.v3.Matcher.OnMatch onMatch) {
+    return Any.pack(ExtensionWithMatcher.newBuilder()
+        .setExtensionConfig(io.envoyproxy.envoy.config.core.v3.TypedExtensionConfig.newBuilder()
+            .setName("composite")
+            .setTypedConfig(Any.pack(Composite.getDefaultInstance()))
+            .build())
+        .setXdsMatcher(matcherFallingThroughTo(onMatch))
+        .build());
+  }
+
+  /**
+   * A Matcher must have a matcher_list or matcher_tree (A106). This one's single field matcher
+   * keys on a header no test sends, so {@code onNoMatch} is what always runs.
+   */
+  private static com.github.xds.type.matcher.v3.Matcher matcherFallingThroughTo(
+      com.github.xds.type.matcher.v3.Matcher.OnMatch onNoMatch) {
+    return com.github.xds.type.matcher.v3.Matcher.newBuilder()
+        .setMatcherList(com.github.xds.type.matcher.v3.Matcher.MatcherList.newBuilder()
+            .addMatchers(com.github.xds.type.matcher.v3.Matcher.MatcherList.FieldMatcher
+                .newBuilder()
+                .setPredicate(com.github.xds.type.matcher.v3.Matcher.MatcherList.Predicate
+                    .newBuilder()
+                    .setSinglePredicate(com.github.xds.type.matcher.v3.Matcher.MatcherList
+                        .Predicate.SinglePredicate.newBuilder()
+                        .setInput(com.github.xds.core.v3.TypedExtensionConfig.newBuilder()
+                            .setName("request_headers")
+                            .setTypedConfig(Any.pack(HttpRequestHeaderMatchInput.newBuilder()
+                                .setHeaderName("x-never-sent")
+                                .build())))
+                        .setValueMatch(com.github.xds.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("never"))))
+                .setOnMatch(onNoMatch)))
+        .setOnNoMatch(onNoMatch)
+        .build();
+  }
+
+  private static Filter.FilterConfigParseContext compositeParseContext() {
+    return Filter.FilterConfigParseContext.builder()
+        .bootstrapInfo(Bootstrapper.BootstrapInfo.builder()
+            .servers(Collections.singletonList(
+                Bootstrapper.ServerInfo.create("test_target", Collections.emptyMap())))
+            .node(EnvoyProtoData.Node.newBuilder().build())
+            .build())
+        .serverInfo(Bootstrapper.ServerInfo.create(
+            "test_target", Collections.emptyMap(), false, true, false, false))
+        .build();
   }
 
   private FilterRegistry filterStateTestFilterRegistry(
@@ -2042,6 +2583,19 @@ public class XdsServerWrapperTest {
         name,
         ImmutableList.of("stateful.test.example.com"),
         ImmutableList.of(filterStateTestRoute(perRouteOverrides)),
+        NO_FILTER_OVERRIDES);
+  }
+
+  /** A vhost with one route with no overrides and a second one with {@code route2Overrides}. */
+  private static VirtualHost filterStateTestTwoRouteVhost(
+      ImmutableMap<String, FilterConfig> route2Overrides) {
+    return VirtualHost.create(
+        "stateful-vhost",
+        ImmutableList.of("stateful.test.example.com"),
+        ImmutableList.of(
+            filterStateTestRoute(NO_FILTER_OVERRIDES),
+            Route.forAction(RouteMatch.withPathExactOnly("/grpc.test.HelloService/SayBye"), null,
+                route2Overrides)),
         NO_FILTER_OVERRIDES);
   }
 

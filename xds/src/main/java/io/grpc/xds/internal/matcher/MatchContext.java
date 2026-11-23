@@ -18,8 +18,9 @@ package io.grpc.xds.internal.matcher;
 
 import com.google.common.base.Preconditions;
 import io.grpc.Metadata;
+import javax.annotation.Nullable;
 
-final class MatchContext {
+public final class MatchContext {
   private final Metadata metadata;
   private final String path;
   private final String host;
@@ -56,33 +57,33 @@ final class MatchContext {
     return id;
   }
 
-  static Builder newBuilder() {
+  public static Builder newBuilder() {
     return new Builder();
   }
 
-  static final class Builder {
-    private Metadata metadata = new Metadata();
+  public static final class Builder {
+    @Nullable private Metadata metadata;
     private String path;
     private String host;
     private String method;
     private String id;
 
-    Builder setMetadata(Metadata metadata) {
-      this.metadata = metadata;
+    public Builder setMetadata(Metadata metadata) {
+      this.metadata = Preconditions.checkNotNull(metadata, "metadata");
       return this;
     }
 
-    Builder setPath(String path) {
+    public Builder setPath(String path) {
       this.path = path;
       return this;
     }
 
-    Builder setHost(String host) {
+    public Builder setHost(@Nullable String host) {
       this.host = host;
       return this;
     }
 
-    Builder setMethod(String method) {
+    public Builder setMethod(String method) {
       this.method = method;
       return this;
     }
@@ -92,8 +93,9 @@ final class MatchContext {
       return this;
     }
 
-    MatchContext build() {
-      return new MatchContext(metadata, path, host, method, id);
+    public MatchContext build() {
+      return new MatchContext(
+          metadata != null ? metadata : new Metadata(), path, host, method, id);
     }
   }
 }

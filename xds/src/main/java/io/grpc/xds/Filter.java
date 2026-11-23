@@ -17,8 +17,11 @@
 package io.grpc.xds;
 
 
+import com.github.udpa.udpa.type.v1.TypedStruct;
 import com.google.auto.value.AutoValue;
 import com.google.common.base.MoreObjects;
+import com.google.protobuf.Any;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import io.grpc.ClientInterceptor;
 import io.grpc.MetricRecorder;
@@ -26,8 +29,15 @@ import io.grpc.ServerInterceptor;
 import io.grpc.xds.client.Bootstrapper.BootstrapInfo;
 import io.grpc.xds.client.Bootstrapper.ServerInfo;
 import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 
 /**
@@ -43,6 +53,101 @@ interface Filter extends Closeable {
   /** Represents an opaque data structure holding configuration for a filter. */
   interface FilterConfig {
     String typeUrl();
+
+    /**
+     * Transitive filter configs this config runs as nested filters (including configs nested inside
+     * child composite filters). Each needs an instance, shared by
+     * {@link NamedFilterConfig#filterStateKey()} with every other config that declares the same
+     * name and type.
+     */
+    default List<NamedFilterConfig> nestedFilterConfigs() {
+      return Collections.emptyList();
+    }
+  }
+
+  @Nullable
+  static FilterConfig lookupOverride(
+      String name,
+      @Nullable VirtualHost vhost,
+      @Nullable VirtualHost.Route route,
+      @Nullable VirtualHost.Route.RouteAction.ClusterWeight weight) {
+    FilterConfig override = weight != null ? weight.filterConfigOverrides().get(name) : null;
+    if (override == null && route != null) {
+      override = route.filterConfigOverrides().get(name);
+    }
+    return override != null || vhost == null ? override : vhost.filterConfigOverrides().get(name);
+  }
+
+  /** Result of unwrapping a UDPA or xDS {@code TypedStruct} envelope, if present. */
+  static final class UnpackedFilterConfig {
+    final String typeUrl;
+    final Message rawConfig;
+
+    UnpackedFilterConfig(String typeUrl, Message rawConfig) {
+      this.typeUrl = typeUrl;
+      this.rawConfig = rawConfig;
+    }
+  }
+
+  /**
+   * Unwraps a {@code udpa.type.v1.TypedStruct} or {@code xds.type.v3.TypedStruct} {@link Any} into
+   * its inner type URL and {@link com.google.protobuf.Struct} value; returns {@code any} as-is
+   * otherwise.
+   */
+  static UnpackedFilterConfig unpackTypedStruct(Any any) throws InvalidProtocolBufferException {
+    String typeUrl = any.getTypeUrl();
+    if ("type.googleapis.com/udpa.type.v1.TypedStruct".equals(typeUrl)) {
+      TypedStruct typedStruct = any.unpack(TypedStruct.class);
+      return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
+    }
+    if ("type.googleapis.com/xds.type.v3.TypedStruct".equals(typeUrl)) {
+      com.github.xds.type.v3.TypedStruct typedStruct =
+          any.unpack(com.github.xds.type.v3.TypedStruct.class);
+      return new UnpackedFilterConfig(typedStruct.getTypeUrl(), typedStruct.getValue());
+    }
+    return new UnpackedFilterConfig(typeUrl, any);
+  }
+
+  /**
+   * Collects every filter config that needs an instance: the HCM's top-level configs, their nested
+   * configs, and the nested configs of any matching per-vhost, per-route, or per-cluster-weight
+   * override.
+   */
+  static List<NamedFilterConfig> collectAllFilterConfigs(
+      @Nullable List<NamedFilterConfig> hcmConfigs, @Nullable List<VirtualHost> vhosts) {
+    List<NamedFilterConfig> result = new ArrayList<>();
+    if (hcmConfigs == null) {
+      return result;
+    }
+    Map<String, Class<? extends FilterConfig>> hcmConfigTypes = new HashMap<>();
+    for (NamedFilterConfig top : hcmConfigs) {
+      result.add(top);
+      result.addAll(top.filterConfig.nestedFilterConfigs());
+      hcmConfigTypes.put(top.name, top.filterConfig.getClass());
+    }
+    if (vhosts != null) {
+      Consumer<Map<String, FilterConfig>> collectOverrides = overrides -> {
+        for (Map.Entry<String, FilterConfig> entry : overrides.entrySet()) {
+          FilterConfig override = entry.getValue();
+          if (hcmConfigTypes.get(entry.getKey()) == override.getClass()) {
+            result.addAll(override.nestedFilterConfigs());
+          }
+        }
+      };
+      for (VirtualHost vhost : vhosts) {
+        collectOverrides.accept(vhost.filterConfigOverrides());
+        for (VirtualHost.Route route : vhost.routes()) {
+          collectOverrides.accept(route.filterConfigOverrides());
+          if (route.routeAction() != null && route.routeAction().weightedClusters() != null) {
+            for (VirtualHost.Route.RouteAction.ClusterWeight weight
+                : route.routeAction().weightedClusters()) {
+              collectOverrides.accept(weight.filterConfigOverrides());
+            }
+          }
+        }
+      }
+    }
+    return result;
   }
 
   /**
@@ -82,15 +187,19 @@ interface Filter extends Closeable {
      * <p>For xDS gRPC clients, new filter instances are created per combination of:
      * <ol>
      *   <li><code>XdsNameResolver</code> instance,</li>
-     *   <li>Filter name+typeUrl in HttpConnectionManager (HCM) http_filters.</li>
+     *   <li>Filter name+typeUrl anywhere in the HttpConnectionManager (HCM) filter configs.</li>
      * </ol>
      *
      * <p>For xDS-enabled gRPC servers, new filter instances are created per combination of:
      * <ol>
      *   <li>Server instance,</li>
      *   <li>FilterChain name,</li>
-     *   <li>Filter name+typeUrl in FilterChain's HCM.http_filters.</li>
+     *   <li>Filter name+typeUrl anywhere in the FilterChain's HCM filter configs.</li>
      * </ol>
+     *
+     * <p>"Anywhere" covers the HCM's http_filters as well as the filters nested in them (see
+     * {@link FilterConfig#nestedFilterConfigs()}), including ones declared only by per-route
+     * typed_per_filter_config overrides delivered via RDS.
      */
     Filter newInstance(FilterContext context);
 
@@ -153,12 +262,32 @@ interface Filter extends Closeable {
   /** Context carrying dynamic metadata for a filter. */
   @AutoValue
   abstract static class FilterConfigParseContext {
+    /**
+     * The maximum value {@link #recursionDepth} may reach, imposed by gRFC A103 to avoid stack
+     * overflows while parsing HTTP filter configs.
+     *
+     * <p>The depth is a single budget shared by every filter that nests other filters' configs,
+     * so the bound on it lives here rather than in any one filter. A filter that parses another
+     * filter's config must reject a context that has already reached this depth, and must pass
+     * its child a context with the depth incremented.
+     */
+    static final int MAX_RECURSION_DEPTH = 8;
+
     abstract BootstrapInfo bootstrapInfo();
 
     abstract ServerInfo serverInfo();
 
+    /**
+     * How many enclosing filter configs this config is nested inside. Zero for a filter config
+     * parsed directly from a listener or a route; incremented by filters that parse other filters'
+     * configs, so that they can bound recursion at {@link #MAX_RECURSION_DEPTH}.
+     */
+    abstract int recursionDepth();
+
+    abstract Builder toBuilder();
+
     static Builder builder() {
-      return new AutoValue_Filter_FilterConfigParseContext.Builder();
+      return new AutoValue_Filter_FilterConfigParseContext.Builder().recursionDepth(0);
     }
 
     @AutoValue.Builder
@@ -166,6 +295,8 @@ interface Filter extends Closeable {
       abstract Builder bootstrapInfo(BootstrapInfo info);
 
       abstract Builder serverInfo(ServerInfo info);
+
+      abstract Builder recursionDepth(int depth);
 
       abstract FilterConfigParseContext build();
     }
@@ -178,8 +309,21 @@ interface Filter extends Closeable {
 
     abstract MetricRecorder metricsRecorder();
 
+    /**
+     * Looks up the shared instance of a config from {@link FilterConfig#nestedFilterConfigs}.
+     * Only for filters that run other filters; only valid inside {@code build*Interceptor}; null
+     * when the instance was not created by the xDS resolver/server.
+     */
+    @Nullable
+    abstract Function<NamedFilterConfig, Filter> filterLookup();
+
     static FilterContext create(String filterName, MetricRecorder metricsRecorder) {
-      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder);
+      return create(filterName, metricsRecorder, null);
+    }
+
+    static FilterContext create(String filterName, MetricRecorder metricsRecorder,
+        @Nullable Function<NamedFilterConfig, Filter> filterLookup) {
+      return new AutoValue_Filter_FilterContext(filterName, metricsRecorder, filterLookup);
     }
   }
 

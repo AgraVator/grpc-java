@@ -44,17 +44,29 @@ class StatefulFilter implements Filter {
   private final AtomicBoolean shutdown = new AtomicBoolean();
 
   final int idx;
+
+  /**
+   * The xDS instance name this filter was created for, taken from {@link
+   * Filter.FilterContext#filterName()}. Filters nested inside another filter's config must receive
+   * their <em>own</em> name, not their parent's; this field is what lets tests assert that.
+   */
+  @Nullable final String name;
+
   private final boolean requiresRequestPayloadAccess;
   private final boolean requiresResponsePayloadAccess;
   @Nullable volatile String lastCfg = null;
 
   public StatefulFilter(int idx) {
-    this(idx, false, false);
+    this(idx, null, false, false);
   }
 
   public StatefulFilter(
-      int idx, boolean requiresRequestPayloadAccess, boolean requiresResponsePayloadAccess) {
+      int idx,
+      @Nullable String name,
+      boolean requiresRequestPayloadAccess,
+      boolean requiresResponsePayloadAccess) {
     this.idx = idx;
+    this.name = name;
     this.requiresRequestPayloadAccess = requiresRequestPayloadAccess;
     this.requiresResponsePayloadAccess = requiresResponsePayloadAccess;
   }
@@ -113,6 +125,9 @@ class StatefulFilter implements Filter {
   public String toString() {
     StringBuilder sb = new StringBuilder().append("StatefulFilter{")
         .append("idx=").append(idx);
+    if (name != null) {
+      sb.append(", filterName=").append(name);
+    }
     if (lastCfg != null) {
       sb.append(", name=").append(lastCfg);
     }
@@ -166,8 +181,8 @@ class StatefulFilter implements Filter {
 
     @Override
     public synchronized StatefulFilter newInstance(FilterContext context) {
-      StatefulFilter filter = new StatefulFilter(
-          counter++, requiresRequestPayloadAccess, requiresResponsePayloadAccess);
+      StatefulFilter filter = new StatefulFilter(counter++, context.filterName(),
+          requiresRequestPayloadAccess, requiresResponsePayloadAccess);
       instances.put(filter.idx, filter);
       return filter;
     }

@@ -82,6 +82,7 @@ envoy/extensions/filters/http/ext_proc/v3/processing_mode.proto
 envoy/extensions/common/matching/v3/extension_matcher.proto
 envoy/extensions/filters/http/fault/v3/fault.proto
 envoy/extensions/filters/http/composite/v3/composite.proto
+envoy/extensions/filters/common/matcher/action/v3/skip_action.proto
 envoy/extensions/filters/http/rate_limit_quota/v3/rate_limit_quota.proto
 envoy/extensions/filters/http/gcp_authn/v3/gcp_authn.proto
 envoy/extensions/filters/http/rbac/v3/rbac.proto

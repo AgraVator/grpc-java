@@ -92,7 +92,7 @@ final class MatcherTree extends UnifiedMatcher {
   }
 
   @Override
-  MatchResult match(MatchContext context) {
+  public MatchResult match(MatchContext context) {
 
     Object valueObj = input.apply(context);
     if (!(valueObj instanceof String)) {
